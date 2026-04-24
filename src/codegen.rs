@@ -14,18 +14,20 @@ struct Ctx {
     ref_self: bool,
     /// Maps variable names to their struct/enum type name, for method call resolution.
     type_env: HashMap<String, String>,
+    /// Maps variable names to their type, for printf format specifier selection.
+    var_types: HashMap<String, Ty>,
     /// Return type of the current function, used to hint tuple literal emission.
     return_ty: Option<Ty>,
 }
 
 impl Ctx {
-    fn new() -> Self { Self { impl_type: None, ref_self: false, type_env: HashMap::new(), return_ty: None } }
+    fn new() -> Self { Self { impl_type: None, ref_self: false, type_env: HashMap::new(), var_types: HashMap::new(), return_ty: None } }
 
     fn for_method(impl_type: &str, receiver: &Receiver, params_type_env: HashMap<String, String>) -> Self {
         let ref_self = matches!(receiver, Receiver::Ref | Receiver::RefMut);
         let mut type_env = params_type_env;
         type_env.insert("self".to_string(), impl_type.to_string());
-        Self { impl_type: Some(impl_type.to_string()), ref_self, type_env, return_ty: None }
+        Self { impl_type: Some(impl_type.to_string()), ref_self, type_env, var_types: HashMap::new(), return_ty: None }
     }
 }
 
@@ -257,6 +259,8 @@ impl Codegen {
                 let c_ty = ty.as_ref().map(|t| ty_str(t)).unwrap_or_else(|| "int64_t".to_string());
                 // Track named types for method resolution
                 if let Some(Ty::Named(n)) = ty { ctx.type_env.insert(name.clone(), n.clone()); }
+                // Track all types for printf format specifier selection
+                if let Some(t) = ty { ctx.var_types.insert(name.clone(), t.clone()); }
                 // Don't add `const` prefix for pointer/ref types — constness lives in the type already
                 let is_ptr = matches!(ty, Some(Ty::Ref(_) | Ty::RefMut(_) | Ty::RawConst(_) | Ty::RawMut(_)));
                 let kw = if *mutable || is_ptr { "" } else { "const " };
@@ -270,6 +274,14 @@ impl Codegen {
             }
 
             Stmt::Return(expr) => match expr {
+                Some(Expr::Tuple(elems)) if elems.is_empty() => {
+                    // unit () return - emit bare return if function returns void
+                    if ctx.return_ty == Some(Ty::Unit) {
+                        self.out.push_str(&format!("{p}return;\n"));
+                    } else {
+                        self.out.push_str(&format!("{p}return 0;\n"));
+                    }
+                }
                 Some(e) => {
                     let hint = ctx.return_ty.clone();
                     let s = self.emit_expr_hint(e, ctx, hint.as_ref());
@@ -456,9 +468,15 @@ impl Codegen {
     fn emit_expr(&self, expr: &Expr, ctx: &mut Ctx) -> String {
         match expr {
             Expr::Int(n)  => format!("INT64_C({n})"),
+            Expr::Float(f) => {
+                // Emit with enough precision; always include decimal point
+                if f.fract() == 0.0 { format!("{f:.1}") } else { format!("{f}") }
+            }
+            Expr::Char(c) => format!("UINT32_C({c})"),
             Expr::Bool(b) => if *b { "true".to_string() } else { "false".to_string() },
             Expr::Var(name) => name.clone(),
 
+            Expr::Tuple(elems) if elems.is_empty() => "/* () */0".to_string(),
             Expr::Tuple(_) => self.emit_expr_hint(expr, ctx, None),
 
             Expr::StructLit { name, fields } => {
@@ -621,12 +639,21 @@ impl Codegen {
     }
 
     fn emit_println(&self, format: &str, args: &[Expr], ctx: &mut Ctx) -> String {
+        let mut fmt_parts: Vec<String> = Vec::new();
         let mut fmt_c = String::new();
         let mut chars = format.chars().peekable();
+        let mut arg_idx = 0usize;
         while let Some(ch) = chars.next() {
             if ch == '{' && chars.peek() == Some(&'}') {
                 chars.next();
-                fmt_c.push_str("%lld");
+                let spec = if let Some(arg) = args.get(arg_idx) {
+                    printf_spec(arg, ctx)
+                } else {
+                    "%lld".to_string()
+                };
+                fmt_c.push_str(&spec);
+                fmt_parts.push(spec);
+                arg_idx += 1;
             } else {
                 match ch {
                     '"'  => fmt_c.push_str("\\\""),
@@ -640,17 +667,39 @@ impl Codegen {
         if args.is_empty() {
             format!("printf(\"{fmt_c}\\n\");")
         } else {
-            let args_s: Vec<String> = args.iter()
-                .map(|a| format!("(long long)({})", self.emit_expr(a, ctx)))
+            let args_s: Vec<String> = args.iter().enumerate()
+                .map(|(i, a)| {
+                    let spec = fmt_parts.get(i).map(|s| s.as_str()).unwrap_or("%lld");
+                    let e = self.emit_expr(a, ctx);
+                    if spec == "%f" {
+                        format!("(double)({e})")
+                    } else if spec == "%u" {
+                        format!("(unsigned int)({e})")
+                    } else {
+                        format!("(long long)({e})")
+                    }
+                })
                 .collect();
             format!("printf(\"{fmt_c}\\n\", {});", args_s.join(", "))
         }
     }
 }
 
-// ---------------------------------------------------------------------------
-// Tuple typedef collection (pre-scan)
-// ---------------------------------------------------------------------------
+/// Choose printf format specifier and cast for an expression.
+fn printf_spec(expr: &Expr, ctx: &Ctx) -> String {
+    match expr {
+        Expr::Float(_) => "%f".to_string(),
+        Expr::Char(_)  => "%u".to_string(),
+        Expr::Cast { ty: Ty::F32, .. } | Expr::Cast { ty: Ty::F64, .. } => "%f".to_string(),
+        Expr::Cast { ty: Ty::Char, .. } => "%u".to_string(),
+        Expr::Var(name) => match ctx.var_types.get(name) {
+            Some(Ty::F32) | Some(Ty::F64) => "%f".to_string(),
+            Some(Ty::Char) => "%u".to_string(),
+            _ => "%lld".to_string(),
+        },
+        _ => "%lld".to_string(),
+    }
+}
 
 fn collect_tuple_types(file: &File) -> Vec<Vec<Ty>> {
     let mut found: Vec<Vec<Ty>> = Vec::new();
@@ -760,7 +809,9 @@ fn ty_str(ty: &Ty) -> String {
         Ty::I32   => "int32_t".into(),  Ty::I64  => "int64_t".into(),  Ty::Isize => "intptr_t".into(),
         Ty::U8    => "uint8_t".into(),  Ty::U16  => "uint16_t".into(),
         Ty::U32   => "uint32_t".into(), Ty::U64  => "uint64_t".into(), Ty::Usize => "uintptr_t".into(),
+        Ty::F32   => "float".into(),    Ty::F64  => "double".into(),
         Ty::Bool  => "bool".into(),
+        Ty::Char  => "uint32_t".into(),
         Ty::Unit  => "void".into(),
         Ty::Named(n) => n.clone(),
         Ty::Tuple(tys) => tuple_typedef_name(tys),
@@ -777,7 +828,8 @@ fn ty_key(ty: &Ty) -> String {
         Ty::I32   => "i32".into(),  Ty::I64  => "i64".into(),  Ty::Isize => "isize".into(),
         Ty::U8    => "u8".into(),   Ty::U16  => "u16".into(),
         Ty::U32   => "u32".into(),  Ty::U64  => "u64".into(),  Ty::Usize => "usize".into(),
-        Ty::Bool  => "bool".into(), Ty::Unit => "unit".into(),
+        Ty::F32   => "f32".into(),  Ty::F64  => "f64".into(),
+        Ty::Bool  => "bool".into(), Ty::Char => "char".into(), Ty::Unit => "unit".into(),
         Ty::Named(n) => n.clone(),
         Ty::Tuple(tys)      => format!("({})", tys.iter().map(ty_key).collect::<Vec<_>>().join("_")),
         Ty::Ref(inner)      => format!("ref_{}", ty_key(inner)),
