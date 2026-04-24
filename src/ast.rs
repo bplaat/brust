@@ -228,6 +228,11 @@ pub enum ExprKind {
         expr: Box<Expr>,
         index: Box<Expr>,
     },
+    /// `lo..hi`, `lo..`, `..hi`, or `..` -- range expression
+    Range {
+        start: Option<Box<Expr>>,
+        end: Option<Box<Expr>>,
+    },
     /// `(expr0, expr1, ...)`
     Tuple(Vec<Expr>),
     /// `Type { field: expr, ... }` -- struct literal

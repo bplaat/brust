@@ -978,7 +978,46 @@ impl Parser {
     }
 
     fn parse_expr(&mut self) -> Result<Expr, Error> {
-        self.parse_or()
+        self.parse_range()
+    }
+
+    /// Parse a range expression: `lo..hi`, `lo..`, `..hi`, `..`
+    /// This is the lowest-precedence binary form (below `||`).
+    fn parse_range(&mut self) -> Result<Expr, Error> {
+        // Leading `..` with optional end.
+        if self.peek().kind == TokenKind::DotDot {
+            let loc = self.loc();
+            self.advance();
+            let end = if self.peek().kind != TokenKind::RBracket
+                && self.peek().kind != TokenKind::Semicolon
+                && self.peek().kind != TokenKind::Comma
+                && self.peek().kind != TokenKind::RBrace
+                && self.peek().kind != TokenKind::RParen
+            {
+                Some(Box::new(self.parse_or()?))
+            } else {
+                None
+            };
+            return Ok(Expr { kind: ExprKind::Range { start: None, end }, loc });
+        }
+        let lhs = self.parse_or()?;
+        if self.peek().kind == TokenKind::DotDot {
+            let loc = lhs.loc;
+            self.advance();
+            // Optional end expression (absent in `lo..`).
+            let end = if self.peek().kind != TokenKind::RBracket
+                && self.peek().kind != TokenKind::Semicolon
+                && self.peek().kind != TokenKind::Comma
+                && self.peek().kind != TokenKind::RBrace
+                && self.peek().kind != TokenKind::RParen
+            {
+                Some(Box::new(self.parse_or()?))
+            } else {
+                None
+            };
+            return Ok(Expr { kind: ExprKind::Range { start: Some(Box::new(lhs)), end }, loc });
+        }
+        Ok(lhs)
     }
 
     fn parse_or(&mut self) -> Result<Expr, Error> {
