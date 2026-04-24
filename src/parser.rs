@@ -90,13 +90,37 @@ impl Parser {
 
     fn parse_stmt(&mut self) -> Result<Stmt, Error> {
         let tok = self.peek().clone();
-        // println! macro call
-        if let TokenKind::Ident(name) = &tok.kind {
-            if name == "println" {
-                return self.parse_println();
-            }
+        match &tok.kind {
+            TokenKind::Let => self.parse_let(),
+            // Identifier: could be `println!` or an assignment `name = expr;`
+            TokenKind::Ident(name) if name == "println" => self.parse_println(),
+            TokenKind::Ident(_) => self.parse_assign(),
+            _ => Err(Error::new(tok.line, tok.col,
+                format!("unexpected token in statement: {:?}", tok.kind))),
         }
-        Err(Error::new(tok.line, tok.col, format!("unexpected token in statement: {:?}", tok.kind)))
+    }
+
+    fn parse_let(&mut self) -> Result<Stmt, Error> {
+        self.expect(&TokenKind::Let)?;
+        let mutable = if self.peek().kind == TokenKind::Mut {
+            self.advance();
+            true
+        } else {
+            false
+        };
+        let name = self.expect_ident()?;
+        self.expect(&TokenKind::Eq)?;
+        let expr = self.parse_expr()?;
+        self.expect(&TokenKind::Semicolon)?;
+        Ok(Stmt::Let { name, mutable, expr })
+    }
+
+    fn parse_assign(&mut self) -> Result<Stmt, Error> {
+        let name = self.expect_ident()?;
+        self.expect(&TokenKind::Eq)?;
+        let expr = self.parse_expr()?;
+        self.expect(&TokenKind::Semicolon)?;
+        Ok(Stmt::Assign { name, expr })
     }
 
     fn parse_println(&mut self) -> Result<Stmt, Error> {
@@ -182,6 +206,11 @@ impl Parser {
                 let n = *n;
                 self.advance();
                 Ok(Expr::Int(n))
+            }
+            TokenKind::Ident(name) => {
+                let name = name.clone();
+                self.advance();
+                Ok(Expr::Var(name))
             }
             TokenKind::LParen => {
                 self.advance();
