@@ -12,6 +12,9 @@ pub enum TokenKind {
     While,
     True,
     False,
+    Struct,
+    Impl,
+    SelfKw, // `self`
     // Identifiers and literals
     Ident(String),
     IntLit(i64),
@@ -46,7 +49,9 @@ pub enum TokenKind {
     RBrace,
     Semicolon,
     Comma,
+    Dot,
     Colon,
+    ColonColon,
     Eq,
     Arrow, // ->
     Bang,
@@ -136,7 +141,12 @@ impl<'a> Lexer<'a> {
             b'}' => { self.advance(); TokenKind::RBrace }
             b';' => { self.advance(); TokenKind::Semicolon }
             b',' => { self.advance(); TokenKind::Comma }
-            b':' => { self.advance(); TokenKind::Colon }
+            b'.' => { self.advance(); TokenKind::Dot }
+            b':' => {
+                self.advance();
+                if self.peek() == Some(b':') { self.advance(); TokenKind::ColonColon }
+                else { TokenKind::Colon }
+            }
             b'=' => {
                 self.advance();
                 if self.peek() == Some(b'=') { self.advance(); TokenKind::EqEq } else { TokenKind::Eq }
@@ -267,6 +277,9 @@ impl<'a> Lexer<'a> {
             "while"  => TokenKind::While,
             "true"   => TokenKind::True,
             "false"  => TokenKind::False,
+            "struct" => TokenKind::Struct,
+            "impl"   => TokenKind::Impl,
+            "self"   => TokenKind::SelfKw,
             _ => TokenKind::Ident(name),
         }
     }
