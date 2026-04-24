@@ -1,0 +1,145 @@
+use crate::error::Error;
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum TokenKind {
+    // Keywords
+    Fn,
+    // Identifiers and literals
+    Ident(String),
+    StringLit(String),
+    // Punctuation
+    LParen,
+    RParen,
+    LBrace,
+    RBrace,
+    Semicolon,
+    Bang,
+    Eof,
+}
+
+#[derive(Debug, Clone)]
+pub struct Token {
+    pub kind: TokenKind,
+    pub line: usize,
+    pub col: usize,
+}
+
+pub struct Lexer<'a> {
+    src: &'a [u8],
+    pos: usize,
+    line: usize,
+    col: usize,
+}
+
+impl<'a> Lexer<'a> {
+    pub fn new(src: &'a str) -> Self {
+        Self { src: src.as_bytes(), pos: 0, line: 1, col: 1 }
+    }
+
+    pub fn tokenize(mut self) -> Result<Vec<Token>, Error> {
+        let mut tokens = Vec::new();
+        loop {
+            let tok = self.next_token()?;
+            let done = tok.kind == TokenKind::Eof;
+            tokens.push(tok);
+            if done {
+                break;
+            }
+        }
+        Ok(tokens)
+    }
+
+    fn peek(&self) -> Option<u8> {
+        self.src.get(self.pos).copied()
+    }
+
+    fn advance(&mut self) -> Option<u8> {
+        let ch = self.src.get(self.pos).copied()?;
+        self.pos += 1;
+        if ch == b'\n' {
+            self.line += 1;
+            self.col = 1;
+        } else {
+            self.col += 1;
+        }
+        Some(ch)
+    }
+
+    fn skip_whitespace_and_comments(&mut self) {
+        loop {
+            // Skip whitespace
+            while self.peek().map_or(false, |c| c.is_ascii_whitespace()) {
+                self.advance();
+            }
+            // Skip line comments
+            if self.src.get(self.pos..self.pos + 2) == Some(b"//") {
+                while self.peek().map_or(false, |c| c != b'\n') {
+                    self.advance();
+                }
+            } else {
+                break;
+            }
+        }
+    }
+
+    fn next_token(&mut self) -> Result<Token, Error> {
+        self.skip_whitespace_and_comments();
+
+        let line = self.line;
+        let col = self.col;
+
+        let ch = match self.peek() {
+            None => return Ok(Token { kind: TokenKind::Eof, line, col }),
+            Some(c) => c,
+        };
+
+        let kind = match ch {
+            b'(' => { self.advance(); TokenKind::LParen }
+            b')' => { self.advance(); TokenKind::RParen }
+            b'{' => { self.advance(); TokenKind::LBrace }
+            b'}' => { self.advance(); TokenKind::RBrace }
+            b';' => { self.advance(); TokenKind::Semicolon }
+            b'!' => { self.advance(); TokenKind::Bang }
+            b'"' => self.lex_string(line, col)?,
+            c if c.is_ascii_alphabetic() || c == b'_' => self.lex_ident_or_keyword(),
+            _ => {
+                self.advance();
+                return Err(Error::new(line, col, format!("unexpected character '{}'", ch as char)));
+            }
+        };
+
+        Ok(Token { kind, line, col })
+    }
+
+    fn lex_string(&mut self, line: usize, col: usize) -> Result<TokenKind, Error> {
+        self.advance(); // consume opening "
+        let mut s = String::new();
+        loop {
+            match self.advance() {
+                None => return Err(Error::new(line, col, "unterminated string literal")),
+                Some(b'"') => break,
+                Some(b'\\') => match self.advance() {
+                    Some(b'n') => s.push('\n'),
+                    Some(b't') => s.push('\t'),
+                    Some(b'\\') => s.push('\\'),
+                    Some(b'"') => s.push('"'),
+                    Some(c) => s.push(c as char),
+                    None => return Err(Error::new(line, col, "unterminated escape sequence")),
+                },
+                Some(c) => s.push(c as char),
+            }
+        }
+        Ok(TokenKind::StringLit(s))
+    }
+
+    fn lex_ident_or_keyword(&mut self) -> TokenKind {
+        let mut name = String::new();
+        while self.peek().map_or(false, |c| c.is_ascii_alphanumeric() || c == b'_') {
+            name.push(self.advance().unwrap() as char);
+        }
+        match name.as_str() {
+            "fn" => TokenKind::Fn,
+            _ => TokenKind::Ident(name),
+        }
+    }
+}
