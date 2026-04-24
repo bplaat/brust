@@ -9,7 +9,22 @@ pub enum Item {
 
 pub struct FnDecl {
     pub name: String,
+    pub params: Vec<Param>,
+    pub return_ty: Ty,
     pub body: Block,
+}
+
+pub struct Param {
+    pub name: String,
+    pub ty: Ty,
+}
+
+/// Types supported so far.
+pub enum Ty {
+    I32,
+    I64,
+    Bool,
+    Unit, // ()
 }
 
 pub struct Block {
@@ -23,11 +38,16 @@ pub enum Stmt {
     Let { name: String, mutable: bool, expr: Expr },
     /// `name = expr;`
     Assign { name: String, expr: Expr },
+    /// `return [expr];`
+    Return(Option<Expr>),
+    /// Expression used as a statement, e.g. a function call.
+    Expr(Expr),
 }
 
 pub enum Expr {
     Int(i64),
     Var(String),
+    Call { name: String, args: Vec<Expr> },
     BinOp { op: BinOp, lhs: Box<Expr>, rhs: Box<Expr> },
 }
 
