@@ -73,6 +73,9 @@ impl Parser {
     // --- items ---
 
     fn parse_item(&mut self) -> Result<Item, Error> {
+        // `pub` is a visibility modifier — brust has no access control, so skip it
+        if self.peek().kind == TokenKind::Pub { self.advance(); }
+
         let tok = self.peek().clone();
         match &tok.kind {
             TokenKind::Fn     => Ok(Item::Fn(self.parse_fn()?)),
@@ -86,6 +89,17 @@ impl Parser {
                 let ty = self.parse_ty()?;
                 self.expect(&TokenKind::Semicolon)?;
                 Ok(Item::TypeAlias { name, ty })
+            }
+            TokenKind::Mod => {
+                self.advance();
+                let name = self.expect_ident()?;
+                self.expect(&TokenKind::LBrace)?;
+                let mut items = Vec::new();
+                while self.peek().kind != TokenKind::RBrace && !self.at_eof() {
+                    items.push(self.parse_item()?);
+                }
+                self.expect(&TokenKind::RBrace)?;
+                Ok(Item::Mod { name, items })
             }
             _ => Err(Error::new(
                 tok.line,
@@ -161,16 +175,13 @@ impl Parser {
         while self.peek().kind != TokenKind::RBrace && !self.at_eof() {
             if !fields.is_empty() {
                 self.expect(&TokenKind::Comma)?;
-                if self.peek().kind == TokenKind::RBrace {
-                    break;
-                }
+                if self.peek().kind == TokenKind::RBrace { break; }
             }
+            // Skip optional `pub` field visibility
+            if self.peek().kind == TokenKind::Pub { self.advance(); }
             let fname = self.expect_ident()?;
             self.expect(&TokenKind::Colon)?;
-            fields.push(FieldDecl {
-                name: fname,
-                ty: self.parse_ty()?,
-            });
+            fields.push(FieldDecl { name: fname, ty: self.parse_ty()? });
         }
         self.expect(&TokenKind::RBrace)?;
         Ok(StructDecl { name, fields })
@@ -189,6 +200,8 @@ impl Parser {
     }
 
     fn parse_fn(&mut self) -> Result<FnDecl, Error> {
+        // Skip optional `pub` visibility on functions in impl blocks / modules
+        if self.peek().kind == TokenKind::Pub { self.advance(); }
         self.expect(&TokenKind::Fn)?;
         let name = self.expect_ident()?;
         self.expect(&TokenKind::LParen)?;
@@ -350,7 +363,17 @@ impl Parser {
                     "u32"   => Ty::U32,   "u64"   => Ty::U64,   "usize" => Ty::Usize,
                     "f32"   => Ty::F32,   "f64"   => Ty::F64,
                     "bool"  => Ty::Bool,  "char"  => Ty::Char,  "str"   => Ty::Str,
-                    name    => Ty::Named(name.to_string()),
+                    name    => {
+                        // Check for `mod::Type` qualified path (e.g., math::Vec2)
+                        let base = name.to_string();
+                        self.advance();
+                        if self.peek().kind == TokenKind::ColonColon {
+                            self.advance();
+                            let type_name = self.expect_ident()?;
+                            return Ok(Ty::Named(format!("{base}_{type_name}")));
+                        }
+                        return Ok(Ty::Named(base));
+                    }
                 };
                 self.advance();
                 Ok(ty)
@@ -612,7 +635,16 @@ impl Parser {
                 let type_name = name.clone();
                 self.advance();
                 self.expect(&TokenKind::ColonColon)?;
-                let variant = self.expect_ident()?;
+                let part2 = self.expect_ident()?;
+
+                // Three-segment: mod::Enum::Variant
+                let (type_name, variant) = if self.peek().kind == TokenKind::ColonColon {
+                    self.advance();
+                    let part3 = self.expect_ident()?;
+                    (format!("{type_name}_{part2}"), part3)
+                } else {
+                    (type_name, part2)
+                };
                 let bindings = if self.peek().kind == TokenKind::LParen {
                     // Tuple bindings: Variant(a, b, _)
                     self.advance();
@@ -1048,41 +1080,55 @@ impl Parser {
 
                 if self.peek().kind == TokenKind::ColonColon {
                     self.advance();
-                    let method = self.expect_ident()?;
+                    let part2 = self.expect_ident()?;
+
+                    // Three-segment path: mod::Type::method or mod::Enum::Variant
+                    if self.peek().kind == TokenKind::ColonColon {
+                        self.advance();
+                        let part3 = self.expect_ident()?;
+                        let qualified = format!("{name}_{part2}");
+                        if self.peek().kind == TokenKind::LParen {
+                            let args = self.parse_call_args()?;
+                            return Ok(Expr::AssocCall { type_name: qualified, method: part3, args });
+                        } else if self.peek().kind == TokenKind::LBrace {
+                            self.advance();
+                            let mut fields = Vec::new();
+                            while self.peek().kind != TokenKind::RBrace && !self.at_eof() {
+                                if !fields.is_empty() {
+                                    self.expect(&TokenKind::Comma)?;
+                                    if self.peek().kind == TokenKind::RBrace { break; }
+                                }
+                                let fname = self.expect_ident()?;
+                                self.expect(&TokenKind::Colon)?;
+                                fields.push((fname, self.parse_expr()?));
+                            }
+                            self.expect(&TokenKind::RBrace)?;
+                            return Ok(Expr::EnumStructLit { type_name: qualified, variant: part3, fields });
+                        } else {
+                            return Ok(Expr::AssocCall { type_name: qualified, method: part3, args: vec![] });
+                        }
+                    }
+
+                    // Two-segment: name::part2 — existing enum/assoc/struct-lit logic
                     if self.peek().kind == TokenKind::LParen {
                         let args = self.parse_call_args()?;
-                        Ok(Expr::AssocCall {
-                            type_name: name,
-                            method,
-                            args,
-                        })
+                        Ok(Expr::AssocCall { type_name: name, method: part2, args })
                     } else if self.peek().kind == TokenKind::LBrace {
-                        // Struct-like enum variant: `Type::Variant { x: expr, ... }`
                         self.advance();
                         let mut fields = Vec::new();
                         while self.peek().kind != TokenKind::RBrace && !self.at_eof() {
                             if !fields.is_empty() {
                                 self.expect(&TokenKind::Comma)?;
-                                if self.peek().kind == TokenKind::RBrace {
-                                    break;
-                                }
+                                if self.peek().kind == TokenKind::RBrace { break; }
                             }
                             let fname = self.expect_ident()?;
                             self.expect(&TokenKind::Colon)?;
                             fields.push((fname, self.parse_expr()?));
                         }
                         self.expect(&TokenKind::RBrace)?;
-                        Ok(Expr::EnumStructLit {
-                            type_name: name,
-                            variant: method,
-                            fields,
-                        })
+                        Ok(Expr::EnumStructLit { type_name: name, variant: part2, fields })
                     } else {
-                        Ok(Expr::AssocCall {
-                            type_name: name,
-                            method,
-                            args: vec![],
-                        })
+                        Ok(Expr::AssocCall { type_name: name, method: part2, args: vec![] })
                     }
                 } else if self.peek().kind == TokenKind::LBrace
                     && name.chars().next().map_or(false, |c| c.is_uppercase())

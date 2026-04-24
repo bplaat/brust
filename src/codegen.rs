@@ -10,6 +10,7 @@ use crate::ast::{
 
 #[derive(Clone)]
 struct Ctx {
+    #[allow(dead_code)]
     impl_type: Option<String>,
     ref_self: bool,
     /// Maps variable names to their struct/enum type name, for method call resolution.
@@ -46,30 +47,48 @@ struct Codegen {
 }
 
 pub fn generate(file: &File) -> String {
-    let enums: HashMap<String, EnumDecl> = file.items.iter()
-        .filter_map(|i| if let Item::Enum(e) = i { Some((e.name.clone(), e.clone())) } else { None })
-        .collect();
+    let mut enums: HashMap<String, EnumDecl> = HashMap::new();
     let mut fn_params: HashMap<String, Vec<Ty>> = HashMap::new();
     let mut never_fns = std::collections::HashSet::new();
-    for item in &file.items {
+    collect_items(&file.items, "", &mut enums, &mut fn_params, &mut never_fns);
+    let mut cg = Codegen { enums, fn_params, never_fns, out: String::new() };
+    cg.run(file);
+    cg.out
+}
+
+fn collect_items(
+    items: &[Item],
+    prefix: &str,
+    enums: &mut HashMap<String, EnumDecl>,
+    fn_params: &mut HashMap<String, Vec<Ty>>,
+    never_fns: &mut std::collections::HashSet<String>,
+) {
+    for item in items {
         match item {
             Item::Fn(f) => {
-                fn_params.insert(f.name.clone(), f.params.iter().map(|p| p.ty.clone()).collect());
-                if f.return_ty == Ty::Never { never_fns.insert(f.name.clone()); }
+                let name = format!("{prefix}{}", f.name);
+                fn_params.insert(name.clone(), f.params.iter().map(|p| p.ty.clone()).collect());
+                if f.return_ty == Ty::Never { never_fns.insert(name); }
             }
             Item::Impl(imp) => {
                 for m in &imp.methods {
-                    let mangled = format!("{}_{}", imp.type_name, m.name);
+                    let mangled = format!("{prefix}{}_{}", imp.type_name, m.name);
                     if m.return_ty == Ty::Never { never_fns.insert(mangled.clone()); }
                     fn_params.insert(mangled, m.params.iter().map(|p| p.ty.clone()).collect());
                 }
             }
+            Item::Enum(e) => {
+                let name = format!("{prefix}{}", e.name);
+                let mut prefixed = e.clone();
+                prefixed.name = name.clone();
+                enums.insert(name, prefixed);
+            }
+            Item::Mod { name, items: mod_items } => {
+                collect_items(mod_items, &format!("{prefix}{name}_"), enums, fn_params, never_fns);
+            }
             _ => {}
         }
     }
-    let mut cg = Codegen { enums, fn_params, never_fns, out: String::new() };
-    cg.run(file);
-    cg.out
 }
 
 impl Codegen {
@@ -84,42 +103,69 @@ impl Codegen {
         }
 
         // Emit type aliases, struct and enum type definitions
-        for item in &file.items {
-            match item {
-                Item::TypeAlias { name, ty } => {
-                    self.out.push('\n');
-                    // C typedef — fn ptr needs special syntax
-                    let decl = ty_str_decl(ty, name);
-                    self.out.push_str(&format!("typedef {decl};\n"));
-                }
-                Item::Struct(s) => { self.out.push('\n'); emit_struct(&mut self.out, s); }
-                Item::Enum(e)   => { self.out.push('\n'); self.emit_enum(e); }
-                _ => {}
-            }
-        }
+        self.emit_type_defs(&file.items, "");
 
         // Forward declarations
         self.out.push('\n');
-        for item in &file.items {
+        self.emit_forward_decls(&file.items, "");
+
+        // Function / method definitions
+        self.out.push('\n');
+        self.emit_items(&file.items, "");
+    }
+
+    fn emit_type_defs(&mut self, items: &[Item], prefix: &str) {
+        for item in items {
             match item {
-                Item::Fn(f) if f.name != "main" => {
-                    self.out.push_str(&format!("{};\n", fn_signature(f, None)));
+                Item::TypeAlias { name, ty } => {
+                    self.out.push('\n');
+                    let prefixed = format!("{prefix}{name}");
+                    let decl = ty_str_decl(ty, &prefixed);
+                    self.out.push_str(&format!("typedef {decl};\n"));
                 }
-                Item::Impl(imp) => {
-                    for m in &imp.methods {
-                        self.out.push_str(&format!("{};\n", fn_signature(m, Some(&imp.type_name))));
-                    }
+                Item::Struct(s) => { self.out.push('\n'); emit_struct(&mut self.out, s, prefix); }
+                Item::Enum(e)   => { self.out.push('\n'); self.emit_enum(e, prefix); }
+                Item::Mod { name, items: mod_items } => {
+                    self.emit_type_defs(mod_items, &format!("{prefix}{name}_"));
                 }
                 _ => {}
             }
         }
+    }
 
-        // Function / method definitions
-        self.out.push('\n');
-        for item in &file.items {
+    fn emit_forward_decls(&mut self, items: &[Item], prefix: &str) {
+        for item in items {
             match item {
-                Item::Fn(f) => self.emit_fn(f, None),
-                Item::Impl(imp) => self.emit_impl(imp),
+                Item::Fn(f) if f.name != "main" => {
+                    self.out.push_str(&format!("{};\n", fn_signature(f, None, prefix)));
+                }
+                Item::Impl(imp) => {
+                    let type_prefix = format!("{prefix}{}", imp.type_name);
+                    for m in &imp.methods {
+                        self.out.push_str(&format!("{};\n", fn_signature(m, Some(&type_prefix), "")));
+                    }
+                }
+                Item::Mod { name, items: mod_items } => {
+                    self.emit_forward_decls(mod_items, &format!("{prefix}{name}_"));
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn emit_items(&mut self, items: &[Item], prefix: &str) {
+        for item in items {
+            match item {
+                Item::Fn(f) => self.emit_fn(f, None, prefix),
+                Item::Impl(imp) => {
+                    let type_prefix = format!("{prefix}{}", imp.type_name);
+                    for m in &imp.methods {
+                        self.emit_fn(m, Some(&type_prefix), "");
+                    }
+                }
+                Item::Mod { name, items: mod_items } => {
+                    self.emit_items(mod_items, &format!("{prefix}{name}_"));
+                }
                 Item::Struct(_) | Item::Enum(_) | Item::TypeAlias { .. } => {}
             }
         }
@@ -129,26 +175,27 @@ impl Codegen {
     // Struct and enum emission
     // -----------------------------------------------------------------------
 
-    fn emit_enum(&mut self, e: &EnumDecl) {
+    fn emit_enum(&mut self, e: &EnumDecl, prefix: &str) {
+        let name = format!("{prefix}{}", e.name);
         let has_data = e.variants.iter().any(|v| !matches!(v.fields, VariantFields::Unit));
         if !has_data {
             // Simple C enum — all unit variants
             self.out.push_str("typedef enum {\n");
             for (i, v) in e.variants.iter().enumerate() {
                 let comma = if i + 1 < e.variants.len() { "," } else { "" };
-                self.out.push_str(&format!("    {}_{} = {}{}\n", e.name, v.name, i, comma));
+                self.out.push_str(&format!("    {}_{} = {}{}\n", name, v.name, i, comma));
             }
-            self.out.push_str(&format!("}} {};\n", e.name));
+            self.out.push_str(&format!("}} {name};\n"));
         } else {
             // Tagged union: tag enum + struct with union data + static inline constructors
             self.out.push_str("typedef enum {\n");
             for (i, v) in e.variants.iter().enumerate() {
                 let comma = if i + 1 < e.variants.len() { "," } else { "" };
-                self.out.push_str(&format!("    {}_{}_tag = {}{}\n", e.name, v.name, i, comma));
+                self.out.push_str(&format!("    {}_{}_tag = {}{}\n", name, v.name, i, comma));
             }
-            self.out.push_str(&format!("}} {}_tag;\n", e.name));
+            self.out.push_str(&format!("}} {name}_tag;\n"));
 
-            self.out.push_str(&format!("typedef struct {{\n    {}_tag tag;\n    union {{\n", e.name));
+            self.out.push_str(&format!("typedef struct {{\n    {name}_tag tag;\n    union {{\n"));
             for v in &e.variants {
                 match &v.fields {
                     VariantFields::Unit => {}
@@ -168,24 +215,22 @@ impl Codegen {
                     }
                 }
             }
-            self.out.push_str(&format!("    }} data;\n}} {};\n", e.name));
+            self.out.push_str(&format!("    }} data;\n}} {name};\n"));
 
             // Static inline constructor functions (safe for complex arg expressions)
             for v in &e.variants {
-                self.emit_enum_constructor(e, v);
+                self.emit_enum_constructor(&name, e, v);
             }
         }
     }
 
-    fn emit_enum_constructor(&mut self, e: &EnumDecl, v: &EnumVariant) {
-        let tag = format!("{}_{}_tag", e.name, v.name);
-        let mangled = format!("{}_{}", e.name, v.name);
+    fn emit_enum_constructor(&mut self, name: &str, _e: &EnumDecl, v: &EnumVariant) {
+        let tag = format!("{name}_{}_tag", v.name);
+        let mangled = format!("{name}_{}", v.name);
         match &v.fields {
             VariantFields::Unit => {
-                // Unit variant in tagged union: zero-arg inline function
                 self.out.push_str(&format!(
                     "static inline {name} {mangled}(void) {{ return ({name}){{ .tag = {tag} }}; }}\n",
-                    name = e.name
                 ));
             }
             VariantFields::Tuple(tys) => {
@@ -197,10 +242,8 @@ impl Codegen {
                     .collect();
                 self.out.push_str(&format!(
                     "static inline {name} {mangled}({params}) {{ return ({name}){{ .tag = {tag}, {inits} }}; }}\n",
-                    name = e.name,
                     params = params.join(", "), inits = inits.join(", ")
                 ));
-                // Register param types for tuple arg hinting at call sites
                 self.fn_params.insert(mangled, tys.clone());
             }
             VariantFields::Named(fields) => {
@@ -212,10 +255,8 @@ impl Codegen {
                     .collect();
                 self.out.push_str(&format!(
                     "static inline {name} {mangled}({params}) {{ return ({name}){{ .tag = {tag}, {inits} }}; }}\n",
-                    name = e.name,
                     params = params.join(", "), inits = inits.join(", ")
                 ));
-                // Register param types (in field order) for call-site hinting
                 self.fn_params.insert(mangled, fields.iter().map(|f| f.ty.clone()).collect());
             }
         }
@@ -225,8 +266,8 @@ impl Codegen {
     // Functions and methods
     // -----------------------------------------------------------------------
 
-    fn emit_fn(&mut self, f: &FnDecl, impl_type: Option<&str>) {
-        let sig = fn_signature(f, impl_type);
+    fn emit_fn(&mut self, f: &FnDecl, impl_type: Option<&str>, prefix: &str) {
+        let sig = fn_signature(f, impl_type, prefix);
         self.out.push_str(&format!("{sig} {{\n"));
 
         let mut params_env = HashMap::new();
@@ -250,10 +291,9 @@ impl Codegen {
         self.out.push_str("}\n\n");
     }
 
-    fn emit_impl(&mut self, imp: &ImplBlock) {
-        for m in &imp.methods {
-            self.emit_fn(m, Some(&imp.type_name));
-        }
+    #[allow(dead_code)]
+    fn emit_impl(&mut self, _imp: &ImplBlock) {
+        // Kept for potential future use — module items use emit_fn directly
     }
 
     // -----------------------------------------------------------------------
@@ -552,22 +592,27 @@ impl Codegen {
 
             // Struct-like enum variant: `Type::Variant { x: e, ... }`
             // Look up field order in the enum declaration, emit constructor call.
+            // If type_name_variant is not an enum, treat as module-qualified struct literal.
             Expr::EnumStructLit { type_name, variant, fields } => {
                 let mangled = format!("{type_name}_{variant}");
-                let arg_exprs: Vec<String> = if let Some(edecl) = self.enums.get(type_name.as_str()) {
-                    if let Some(ev) = edecl.variants.iter().find(|v| v.name == *variant) {
+                if let Some(edecl) = self.enums.get(type_name.as_str()) {
+                    let arg_exprs: Vec<String> = if let Some(ev) = edecl.variants.iter().find(|v| v.name == *variant) {
                         if let VariantFields::Named(decl_fields) = &ev.fields {
-                            // Emit args in declared field order
                             decl_fields.iter().map(|df| {
-                                let val = fields.iter().find(|(n, _)| n == &df.name)
+                                fields.iter().find(|(n, _)| n == &df.name)
                                     .map(|(_, e)| self.emit_expr(e, ctx))
-                                    .unwrap_or_else(|| "0".to_string());
-                                val
+                                    .unwrap_or_else(|| "0".to_string())
                             }).collect()
                         } else { vec![] }
-                    } else { vec![] }
-                } else { vec![] };
-                format!("{mangled}({})", arg_exprs.join(", "))
+                    } else { vec![] };
+                    format!("{mangled}({})", arg_exprs.join(", "))
+                } else {
+                    // Module-qualified struct literal: math::Vec2 { x: 1.0, y: 2.0 }
+                    let inits: Vec<String> = fields.iter()
+                        .map(|(n, e)| format!(".{n} = {}", self.emit_expr(e, ctx)))
+                        .collect();
+                    format!("({mangled}){{{}}}", inits.join(", "))
+                }
             }
 
             Expr::Field { expr, field } => {
@@ -797,6 +842,26 @@ fn collect_tuple_types(file: &File) -> Vec<Vec<Ty>> {
                 }
             }
             Item::TypeAlias { ty, .. } => scan_ty(ty, &mut found),
+            Item::Mod { items: mod_items, .. } => {
+                for mod_item in mod_items {
+                    match mod_item {
+                        Item::Fn(f) => {
+                            scan_ty(&f.return_ty, &mut found);
+                            for p in &f.params { scan_ty(&p.ty, &mut found); }
+                            scan_block(&f.body, &mut found);
+                        }
+                        Item::Struct(s) => { for f in &s.fields { scan_ty(&f.ty, &mut found); } }
+                        Item::Impl(imp) => {
+                            for m in &imp.methods {
+                                scan_ty(&m.return_ty, &mut found);
+                                for p in &m.params { scan_ty(&p.ty, &mut found); }
+                                scan_block(&m.body, &mut found);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
         }
     }
     found
@@ -958,15 +1023,16 @@ fn emit_tuple_typedef(out: &mut String, tys: &[Ty]) {
     out.push_str(&format!("}} {name};\n"));
 }
 
-fn emit_struct(out: &mut String, s: &StructDecl) {
-    out.push_str(&format!("typedef struct {} {{\n", s.name));
+fn emit_struct(out: &mut String, s: &StructDecl, prefix: &str) {
+    let name = format!("{prefix}{}", s.name);
+    out.push_str(&format!("typedef struct {name} {{\n"));
     for f in &s.fields {
         out.push_str(&format!("    {};\n", ty_str_decl(&f.ty, &f.name)));
     }
-    out.push_str(&format!("}} {};\n", s.name));
+    out.push_str(&format!("}} {name};\n"));
 }
 
-fn fn_signature(f: &FnDecl, impl_type: Option<&str>) -> String {
+fn fn_signature(f: &FnDecl, impl_type: Option<&str>, prefix: &str) -> String {
     if f.name == "main" { return "int main(void)".to_string(); }
 
     let noreturn = if f.return_ty == Ty::Never { "_Noreturn " } else { "" };
@@ -988,7 +1054,7 @@ fn fn_signature(f: &FnDecl, impl_type: Option<&str>) -> String {
 
     let mangled = match impl_type {
         Some(t) => format!("{t}_{}", f.name),
-        None    => f.name.clone(),
+        None    => format!("{prefix}{}", f.name),
     };
     format!("{noreturn}{ret} {mangled}({params})")
 }
