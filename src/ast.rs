@@ -1,3 +1,7 @@
+#![allow(dead_code)]
+
+use crate::loc::Loc;
+
 /// A complete source file / compilation unit.
 pub struct File {
     pub items: Vec<Item>,
@@ -12,9 +16,11 @@ pub enum Item {
     Mod { name: String, items: Vec<Item> },
 }
 
+#[derive(Clone)]
 pub struct StructDecl {
     pub name: String,
     pub fields: Vec<FieldDecl>,
+    pub loc: Loc,
 }
 
 #[derive(Clone, PartialEq)]
@@ -27,6 +33,7 @@ pub struct FieldDecl {
 pub struct EnumDecl {
     pub name: String,
     pub variants: Vec<EnumVariant>,
+    pub loc: Loc,
 }
 
 #[derive(Clone)]
@@ -54,6 +61,7 @@ pub struct FnDecl {
     pub params: Vec<Param>,
     pub return_ty: Ty,
     pub body: Block,
+    pub loc: Loc,
 }
 
 /// How `self` is received in a method.
@@ -68,7 +76,7 @@ pub struct Param {
     pub ty: Ty,
 }
 
-/// Types supported.
+/// All types supported by brust.
 #[derive(Clone, PartialEq)]
 pub enum Ty {
     // Signed integers
@@ -86,20 +94,19 @@ pub enum Ty {
     // Floats
     F32,
     F64,
-    // Other primitives
+    // Primitives
     Bool,
-    Char,              // Unicode scalar value (u32)
-    Unit,              // ()
-    Str,               // &str (const char*)
-    Never,             // ! (diverging — _Noreturn void in C)
-    Array(Box<Ty>, usize), // [T; N]
-    Slice(Box<Ty>),    // &[T] (v1: T*, no length)
-    Tuple(Vec<Ty>),    // (T0, T1, ...)
-    FnPtr {            // fn(T0, T1) -> Ret
-        params: Vec<Ty>,
-        ret: Box<Ty>,
-    },
-    Named(String),     // user-defined struct/enum type
+    Char,  // Unicode scalar value (u32 in C)
+    Unit,  // ()
+    Str,   // &str (const char* in C)
+    Never, // ! (diverging -- _Noreturn void in C)
+    // Compound types
+    Array(Box<Ty>, usize),                   // [T; N]
+    Slice(Box<Ty>),                          // &[T] (T* in C, no length tracking)
+    Tuple(Vec<Ty>),                          // (T0, T1, ...)
+    FnPtr { params: Vec<Ty>, ret: Box<Ty> }, // fn(T0, T1) -> Ret
+    // User-defined and pointer types
+    Named(String),     // user-defined struct/enum
     Ref(Box<Ty>),      // &T
     RefMut(Box<Ty>),   // &mut T
     RawConst(Box<Ty>), // *const T
@@ -110,7 +117,14 @@ pub struct Block {
     pub stmts: Vec<Stmt>,
 }
 
-pub enum Stmt {
+/// A statement node with its source location.
+pub struct Stmt {
+    pub kind: StmtKind,
+    pub loc: Loc,
+}
+
+/// All statement forms.
+pub enum StmtKind {
     /// `println!("format", args...);`
     Println { format: String, args: Vec<Expr> },
     /// `let [mut] name [: ty] = expr;`
@@ -120,9 +134,9 @@ pub enum Stmt {
         ty: Option<Ty>,
         expr: Expr,
     },
-    /// `name = expr;`
+    /// `name = expr;` (also used for field/index assignment via BinOp::Eq in lvalue position)
     Assign { name: String, expr: Expr },
-    /// `return [expr];` or implicit tail return
+    /// `return [expr];` or implicit tail-expression return.
     Return(Option<Expr>),
     /// `if expr { ... } [else { ... }]`
     If {
@@ -134,16 +148,17 @@ pub enum Stmt {
     While { cond: Expr, body: Block },
     /// `match expr { pat => { ... }, ... }`
     Match { expr: Expr, arms: Vec<MatchArm> },
-    /// Expression used as a statement (function call, method call, field assignment).
+    /// Expression used as a statement (calls, assignments via BinOp::Eq, unsafe blocks).
     Expr(Expr),
 }
 
 pub struct MatchArm {
     pub pat: Pat,
     pub body: Block,
+    pub loc: Loc,
 }
 
-/// Match patterns.
+/// Match patterns supported in `match` arms.
 pub enum Pat {
     Wildcard,
     Bool(bool),
@@ -155,21 +170,28 @@ pub enum Pat {
     },
 }
 
-/// Bindings extracted in a match arm.
+/// Bindings introduced by a match pattern.
 pub enum PatBindings {
     None,                         // unit variant: no bindings
     Tuple(Vec<String>),           // Variant(a, b, _)
-    Named(Vec<(String, String)>), // Variant { field: binding, ... } or shorthand { x, y }
+    Named(Vec<(String, String)>), // Variant { field: binding } or shorthand { x }
 }
 
-pub enum Expr {
+/// An expression node with its source location.
+pub struct Expr {
+    pub kind: ExprKind,
+    pub loc: Loc,
+}
+
+/// All expression forms.
+pub enum ExprKind {
     Int(i64),
     Float(f64),
     Bool(bool),
     Char(u32),
     Str(String),
     Var(String),
-    /// `[expr, expr, ...]` — array literal
+    /// `[expr, expr, ...]` -- array literal
     ArrayLit(Vec<Expr>),
     /// `expr[index]`
     Index {
@@ -178,18 +200,18 @@ pub enum Expr {
     },
     /// `(expr0, expr1, ...)`
     Tuple(Vec<Expr>),
-    /// `Type { field: expr, ... }` — struct literal
+    /// `Type { field: expr, ... }` -- struct literal
     StructLit {
         name: String,
         fields: Vec<(String, Expr)>,
     },
-    /// `Type::Variant { field: expr, ... }` — struct-like enum variant literal
+    /// `Type::Variant { field: expr, ... }` -- named enum variant literal
     EnumStructLit {
         type_name: String,
         variant: String,
         fields: Vec<(String, Expr)>,
     },
-    /// `expr.field` or `expr.0` (tuple index via numeric field name "0", "1", ...)
+    /// `expr.field` or `expr.0` (tuple index via numeric field name)
     Field {
         expr: Box<Expr>,
         field: String,
@@ -199,7 +221,7 @@ pub enum Expr {
         name: String,
         args: Vec<Expr>,
     },
-    /// Associated function or enum variant: `Type::name(args)` or `Type::Variant`
+    /// Associated function or enum variant construction: `Type::name(args)`
     AssocCall {
         type_name: String,
         method: String,
@@ -220,19 +242,19 @@ pub enum Expr {
         lhs: Box<Expr>,
         rhs: Box<Expr>,
     },
-    /// `&expr` — address-of
+    /// `&expr` or `&mut expr` -- address-of
     AddrOf {
         mutable: bool,
         expr: Box<Expr>,
     },
-    /// `*expr` — raw pointer / reference dereference
+    /// `*expr` -- dereference a raw pointer or reference
     Deref(Box<Expr>),
-    /// `expr as Ty` — type cast
+    /// `expr as Ty` -- type cast
     Cast {
         expr: Box<Expr>,
         ty: Ty,
     },
-    /// `unsafe { stmts }` — unsafe block
+    /// `unsafe { stmts }` -- unsafe block (emitted as a plain block in C)
     Unsafe(Block),
 }
 
@@ -240,7 +262,7 @@ pub enum Expr {
 pub enum UnOp {
     Neg,    // -x
     Not,    // !x  logical NOT
-    BitNot, // ~x  bitwise NOT
+    BitNot, // ~x  bitwise NOT (^x in Rust notation)
 }
 
 #[derive(Clone, Copy)]

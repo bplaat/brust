@@ -2,7 +2,9 @@ mod ast;
 mod codegen;
 mod error;
 mod lexer;
+mod loc;
 mod parser;
+mod type_checker;
 
 use std::{env, fs, path::Path, process};
 
@@ -31,11 +33,24 @@ fn main() {
         process::exit(1);
     });
 
+    // Type and borrow check
+    let tc_errors = type_checker::check(&file);
+    if !tc_errors.is_empty() {
+        for e in &tc_errors {
+            eprintln!("{}", e);
+        }
+        process::exit(1);
+    }
+
     // Codegen
     let c_src = codegen::generate(&file);
 
     // Write output: same name, .c extension
-    let out_path = Path::new(input_path).with_extension("c");
+    let out_path = if args.len() >= 4 && args[2] == "-o" {
+        Path::new(&args[3]).to_path_buf()
+    } else {
+        Path::new(input_path).with_extension("c")
+    };
     fs::write(&out_path, &c_src).unwrap_or_else(|e| {
         eprintln!("error: cannot write '{}': {}", out_path.display(), e);
         process::exit(1);
