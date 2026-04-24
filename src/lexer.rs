@@ -6,13 +6,21 @@ pub enum TokenKind {
     Fn,
     // Identifiers and literals
     Ident(String),
+    IntLit(i64),
     StringLit(String),
+    // Arithmetic operators
+    Plus,
+    Minus,
+    Star,
+    Slash,
+    Percent,
     // Punctuation
     LParen,
     RParen,
     LBrace,
     RBrace,
     Semicolon,
+    Comma,
     Bang,
     Eof,
 }
@@ -99,8 +107,15 @@ impl<'a> Lexer<'a> {
             b'{' => { self.advance(); TokenKind::LBrace }
             b'}' => { self.advance(); TokenKind::RBrace }
             b';' => { self.advance(); TokenKind::Semicolon }
+            b',' => { self.advance(); TokenKind::Comma }
             b'!' => { self.advance(); TokenKind::Bang }
+            b'+' => { self.advance(); TokenKind::Plus }
+            b'-' => { self.advance(); TokenKind::Minus }
+            b'*' => { self.advance(); TokenKind::Star }
+            b'/' => { self.advance(); TokenKind::Slash }
+            b'%' => { self.advance(); TokenKind::Percent }
             b'"' => self.lex_string(line, col)?,
+            c if c.is_ascii_digit() => self.lex_int(line, col)?,
             c if c.is_ascii_alphabetic() || c == b'_' => self.lex_ident_or_keyword(),
             _ => {
                 self.advance();
@@ -130,6 +145,16 @@ impl<'a> Lexer<'a> {
             }
         }
         Ok(TokenKind::StringLit(s))
+    }
+
+    fn lex_int(&mut self, line: usize, col: usize) -> Result<TokenKind, Error> {
+        let mut s = String::new();
+        while self.peek().map_or(false, |c| c.is_ascii_digit()) {
+            s.push(self.advance().unwrap() as char);
+        }
+        s.parse::<i64>()
+            .map(TokenKind::IntLit)
+            .map_err(|_| Error::new(line, col, format!("integer literal '{s}' out of range")))
     }
 
     fn lex_ident_or_keyword(&mut self) -> TokenKind {

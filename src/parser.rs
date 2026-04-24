@@ -1,4 +1,4 @@
-use crate::ast::{Block, FnDecl, File, Item, Stmt};
+use crate::ast::{Block, BinOp, Expr, FnDecl, File, Item, Stmt};
 use crate::error::Error;
 use crate::lexer::{Token, TokenKind};
 
@@ -103,16 +103,94 @@ impl Parser {
         self.expect_ident()?; // println
         self.expect(&TokenKind::Bang)?;
         self.expect(&TokenKind::LParen)?;
-        // Expect a string literal
+
         let str_tok = self.peek().clone();
-        let text = match &str_tok.kind {
+        let format = match &str_tok.kind {
             TokenKind::StringLit(s) => s.clone(),
             _ => return Err(Error::new(str_tok.line, str_tok.col,
                 "println! expects a string literal as first argument")),
         };
         self.advance();
+
+        // Parse optional expression arguments: , expr, expr, ...
+        let mut args = Vec::new();
+        while self.peek().kind == TokenKind::Comma {
+            self.advance(); // consume ','
+            args.push(self.parse_expr()?);
+        }
+
         self.expect(&TokenKind::RParen)?;
         self.expect(&TokenKind::Semicolon)?;
-        Ok(Stmt::Println(text))
+        Ok(Stmt::Println { format, args })
+    }
+
+    // --- expressions (recursive descent with precedence) ---
+
+    fn parse_expr(&mut self) -> Result<Expr, Error> {
+        self.parse_additive()
+    }
+
+    fn parse_additive(&mut self) -> Result<Expr, Error> {
+        let mut lhs = self.parse_multiplicative()?;
+        loop {
+            let op = match self.peek().kind {
+                TokenKind::Plus  => BinOp::Add,
+                TokenKind::Minus => BinOp::Sub,
+                _ => break,
+            };
+            self.advance();
+            let rhs = self.parse_multiplicative()?;
+            lhs = Expr::BinOp { op, lhs: Box::new(lhs), rhs: Box::new(rhs) };
+        }
+        Ok(lhs)
+    }
+
+    fn parse_multiplicative(&mut self) -> Result<Expr, Error> {
+        let mut lhs = self.parse_unary()?;
+        loop {
+            let op = match self.peek().kind {
+                TokenKind::Star    => BinOp::Mul,
+                TokenKind::Slash   => BinOp::Div,
+                TokenKind::Percent => BinOp::Rem,
+                _ => break,
+            };
+            self.advance();
+            let rhs = self.parse_unary()?;
+            lhs = Expr::BinOp { op, lhs: Box::new(lhs), rhs: Box::new(rhs) };
+        }
+        Ok(lhs)
+    }
+
+    fn parse_unary(&mut self) -> Result<Expr, Error> {
+        // Unary minus: -expr
+        if self.peek().kind == TokenKind::Minus {
+            self.advance();
+            let operand = self.parse_primary()?;
+            return Ok(Expr::BinOp {
+                op: BinOp::Sub,
+                lhs: Box::new(Expr::Int(0)),
+                rhs: Box::new(operand),
+            });
+        }
+        self.parse_primary()
+    }
+
+    fn parse_primary(&mut self) -> Result<Expr, Error> {
+        let tok = self.peek().clone();
+        match &tok.kind {
+            TokenKind::IntLit(n) => {
+                let n = *n;
+                self.advance();
+                Ok(Expr::Int(n))
+            }
+            TokenKind::LParen => {
+                self.advance();
+                let expr = self.parse_expr()?;
+                self.expect(&TokenKind::RParen)?;
+                Ok(expr)
+            }
+            _ => Err(Error::new(tok.line, tok.col,
+                format!("expected expression, got {:?}", tok.kind))),
+        }
     }
 }
