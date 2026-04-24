@@ -1,4 +1,4 @@
-use crate::ast::{BinOp, Expr, FnDecl, File, Item, Stmt, Ty};
+use crate::ast::{BinOp, Expr, FnDecl, File, Item, Stmt, Ty, UnOp};
 
 pub fn generate(file: &File) -> String {
     let mut out = String::new();
@@ -23,12 +23,23 @@ pub fn generate(file: &File) -> String {
 
 fn ty_str(ty: &Ty) -> &'static str {
     match ty {
-        Ty::I32  => "int32_t",
-        Ty::I64  => "int64_t",
-        Ty::Bool => "bool",
-        Ty::Unit => "void",
+        Ty::I8    => "int8_t",
+        Ty::I16   => "int16_t",
+        Ty::I32   => "int32_t",
+        Ty::I64   => "int64_t",
+        Ty::Isize => "intptr_t",
+        Ty::U8    => "uint8_t",
+        Ty::U16   => "uint16_t",
+        Ty::U32   => "uint32_t",
+        Ty::U64   => "uint64_t",
+        Ty::Usize => "uintptr_t",
+        Ty::Bool  => "bool",
+        Ty::Unit  => "void",
     }
 }
+
+/// Default C type for unannoted `let` bindings (inferred as i64 until type checker).
+fn default_int_ty() -> &'static str { "int64_t" }
 
 fn fn_signature(f: &FnDecl) -> String {
     let ret = ty_str(&f.return_ty);
@@ -60,9 +71,10 @@ fn emit_fn(out: &mut String, f: &FnDecl) {
 fn emit_stmt(out: &mut String, stmt: &Stmt) {
     match stmt {
         Stmt::Println { format, args } => emit_println(out, format, args),
-        Stmt::Let { name, mutable, expr } => {
+        Stmt::Let { name, mutable, ty, expr } => {
+            let c_ty = ty.as_ref().map_or(default_int_ty(), ty_str);
             let kw = if *mutable { "" } else { "const " };
-            out.push_str(&format!("    {kw}int64_t {name} = {};\n", emit_expr(expr)));
+            out.push_str(&format!("    {kw}{c_ty} {name} = {};\n", emit_expr(expr)));
         }
         Stmt::Assign { name, expr } => {
             out.push_str(&format!("    {name} = {};\n", emit_expr(expr)));
@@ -177,21 +189,34 @@ fn emit_expr(expr: &Expr) -> String {
             let args_str: Vec<String> = args.iter().map(emit_expr).collect();
             format!("{name}({})", args_str.join(", "))
         }
+        Expr::UnOp { op, operand } => {
+            let op_str = match op {
+                UnOp::Neg    => "-",
+                UnOp::Not    => "!",
+                UnOp::BitNot => "~",
+            };
+            format!("({op_str}{})", emit_expr(operand))
+        }
         Expr::BinOp { op, lhs, rhs } => {
             let op_str = match op {
-                BinOp::Add => "+",
-                BinOp::Sub => "-",
-                BinOp::Mul => "*",
-                BinOp::Div => "/",
-                BinOp::Rem => "%",
-                BinOp::Eq  => "==",
-                BinOp::Ne  => "!=",
-                BinOp::Lt  => "<",
-                BinOp::Gt  => ">",
-                BinOp::Le  => "<=",
-                BinOp::Ge  => ">=",
-                BinOp::And => "&&",
-                BinOp::Or  => "||",
+                BinOp::Add    => "+",
+                BinOp::Sub    => "-",
+                BinOp::Mul    => "*",
+                BinOp::Div    => "/",
+                BinOp::Rem    => "%",
+                BinOp::BitAnd => "&",
+                BinOp::BitOr  => "|",
+                BinOp::BitXor => "^",
+                BinOp::Shl    => "<<",
+                BinOp::Shr    => ">>",
+                BinOp::Eq     => "==",
+                BinOp::Ne     => "!=",
+                BinOp::Lt     => "<",
+                BinOp::Gt     => ">",
+                BinOp::Le     => "<=",
+                BinOp::Ge     => ">=",
+                BinOp::And    => "&&",
+                BinOp::Or     => "||",
             };
             format!("({} {} {})", emit_expr(lhs), op_str, emit_expr(rhs))
         }

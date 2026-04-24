@@ -1,4 +1,4 @@
-use crate::ast::{Block, BinOp, Expr, FnDecl, File, Item, Param, Stmt, Ty};
+use crate::ast::{Block, BinOp, Expr, FnDecl, File, Item, Param, Stmt, Ty, UnOp};
 use crate::error::Error;
 use crate::lexer::{Token, TokenKind};
 
@@ -105,9 +105,17 @@ impl Parser {
         match &tok.kind {
             TokenKind::Ident(name) => {
                 let ty = match name.as_str() {
-                    "i32"  => Ty::I32,
-                    "i64"  => Ty::I64,
-                    "bool" => Ty::Bool,
+                    "i8"    => Ty::I8,
+                    "i16"   => Ty::I16,
+                    "i32"   => Ty::I32,
+                    "i64"   => Ty::I64,
+                    "isize" => Ty::Isize,
+                    "u8"    => Ty::U8,
+                    "u16"   => Ty::U16,
+                    "u32"   => Ty::U32,
+                    "u64"   => Ty::U64,
+                    "usize" => Ty::Usize,
+                    "bool"  => Ty::Bool,
                     _ => return Err(Error::new(tok.line, tok.col,
                         format!("unknown type '{name}'"))),
                 };
@@ -115,7 +123,6 @@ impl Parser {
                 Ok(ty)
             }
             TokenKind::LParen => {
-                // Unit type `()`
                 self.advance();
                 self.expect(&TokenKind::RParen)?;
                 Ok(Ty::Unit)
@@ -159,10 +166,16 @@ impl Parser {
             false
         };
         let name = self.expect_ident()?;
+        let ty = if self.peek().kind == TokenKind::Colon {
+            self.advance();
+            Some(self.parse_ty()?)
+        } else {
+            None
+        };
         self.expect(&TokenKind::Eq)?;
         let expr = self.parse_expr()?;
         self.expect(&TokenKind::Semicolon)?;
-        Ok(Stmt::Let { name, mutable, expr })
+        Ok(Stmt::Let { name, mutable, ty, expr })
     }
 
     /// Parse a statement starting with an identifier: assignment or call.
@@ -251,7 +264,7 @@ impl Parser {
 
     // --- expressions (recursive descent with precedence) ---
     // Precedence (lowest to highest):
-    //   || -> && -> == != -> < > <= >= -> + - -> * / % -> unary -> primary
+    //   || -> && -> == != -> < > <= >= -> | -> ^ -> & -> << >> -> + - -> * / % -> unary -> primary
 
     fn parse_expr(&mut self) -> Result<Expr, Error> {
         self.parse_or()
@@ -293,13 +306,58 @@ impl Parser {
     }
 
     fn parse_relational(&mut self) -> Result<Expr, Error> {
-        let mut lhs = self.parse_additive()?;
+        let mut lhs = self.parse_bitor()?;
         loop {
             let op = match self.peek().kind {
                 TokenKind::Lt => BinOp::Lt,
                 TokenKind::Gt => BinOp::Gt,
                 TokenKind::Le => BinOp::Le,
                 TokenKind::Ge => BinOp::Ge,
+                _ => break,
+            };
+            self.advance();
+            let rhs = self.parse_bitor()?;
+            lhs = Expr::BinOp { op, lhs: Box::new(lhs), rhs: Box::new(rhs) };
+        }
+        Ok(lhs)
+    }
+
+    fn parse_bitor(&mut self) -> Result<Expr, Error> {
+        let mut lhs = self.parse_bitxor()?;
+        while self.peek().kind == TokenKind::Pipe {
+            self.advance();
+            let rhs = self.parse_bitxor()?;
+            lhs = Expr::BinOp { op: BinOp::BitOr, lhs: Box::new(lhs), rhs: Box::new(rhs) };
+        }
+        Ok(lhs)
+    }
+
+    fn parse_bitxor(&mut self) -> Result<Expr, Error> {
+        let mut lhs = self.parse_bitand()?;
+        while self.peek().kind == TokenKind::Caret {
+            self.advance();
+            let rhs = self.parse_bitand()?;
+            lhs = Expr::BinOp { op: BinOp::BitXor, lhs: Box::new(lhs), rhs: Box::new(rhs) };
+        }
+        Ok(lhs)
+    }
+
+    fn parse_bitand(&mut self) -> Result<Expr, Error> {
+        let mut lhs = self.parse_shift()?;
+        while self.peek().kind == TokenKind::Amp {
+            self.advance();
+            let rhs = self.parse_shift()?;
+            lhs = Expr::BinOp { op: BinOp::BitAnd, lhs: Box::new(lhs), rhs: Box::new(rhs) };
+        }
+        Ok(lhs)
+    }
+
+    fn parse_shift(&mut self) -> Result<Expr, Error> {
+        let mut lhs = self.parse_additive()?;
+        loop {
+            let op = match self.peek().kind {
+                TokenKind::Shl => BinOp::Shl,
+                TokenKind::Shr => BinOp::Shr,
                 _ => break,
             };
             self.advance();
@@ -341,17 +399,24 @@ impl Parser {
     }
 
     fn parse_unary(&mut self) -> Result<Expr, Error> {
-        // Unary minus: -expr
-        if self.peek().kind == TokenKind::Minus {
-            self.advance();
-            let operand = self.parse_primary()?;
-            return Ok(Expr::BinOp {
-                op: BinOp::Sub,
-                lhs: Box::new(Expr::Int(0)),
-                rhs: Box::new(operand),
-            });
+        match self.peek().kind {
+            TokenKind::Minus => {
+                self.advance();
+                let operand = self.parse_primary()?;
+                Ok(Expr::UnOp { op: UnOp::Neg, operand: Box::new(operand) })
+            }
+            TokenKind::Bang => {
+                self.advance();
+                let operand = self.parse_primary()?;
+                Ok(Expr::UnOp { op: UnOp::Not, operand: Box::new(operand) })
+            }
+            TokenKind::Tilde => {
+                self.advance();
+                let operand = self.parse_primary()?;
+                Ok(Expr::UnOp { op: UnOp::BitNot, operand: Box::new(operand) })
+            }
+            _ => self.parse_primary(),
         }
-        self.parse_primary()
     }
 
     fn parse_call_args(&mut self) -> Result<Vec<Expr>, Error> {

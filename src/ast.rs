@@ -19,10 +19,12 @@ pub struct Param {
     pub ty: Ty,
 }
 
-/// Types supported so far.
+/// Types supported.
 pub enum Ty {
-    I32,
-    I64,
+    // Signed integers
+    I8, I16, I32, I64, Isize,
+    // Unsigned integers
+    U8, U16, U32, U64, Usize,
     Bool,
     Unit, // ()
 }
@@ -34,8 +36,8 @@ pub struct Block {
 pub enum Stmt {
     /// `println!("format", args...);`
     Println { format: String, args: Vec<Expr> },
-    /// `let [mut] name = expr;`
-    Let { name: String, mutable: bool, expr: Expr },
+    /// `let [mut] name [: ty] = expr;`
+    Let { name: String, mutable: bool, ty: Option<Ty>, expr: Expr },
     /// `name = expr;`
     Assign { name: String, expr: Expr },
     /// `return [expr];`
@@ -53,13 +55,23 @@ pub enum Expr {
     Bool(bool),
     Var(String),
     Call { name: String, args: Vec<Expr> },
+    UnOp { op: UnOp, operand: Box<Expr> },
     BinOp { op: BinOp, lhs: Box<Expr>, rhs: Box<Expr> },
+}
+
+#[derive(Clone, Copy)]
+pub enum UnOp {
+    Neg, // -x
+    Not, // !x  (logical NOT for bool, bitwise NOT for integers)
+    BitNot, // ~x (explicit bitwise NOT, C-style)
 }
 
 #[derive(Clone, Copy)]
 pub enum BinOp {
     // Arithmetic
     Add, Sub, Mul, Div, Rem,
+    // Bitwise
+    BitAnd, BitOr, BitXor, Shl, Shr,
     // Comparison
     Eq, Ne, Lt, Gt, Le, Ge,
     // Logical
