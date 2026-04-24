@@ -92,6 +92,10 @@ pub enum Ty {
     Array(Box<Ty>, usize), // [T; N]
     Slice(Box<Ty>),    // &[T] (v1: T*, no length)
     Tuple(Vec<Ty>),    // (T0, T1, ...)
+    FnPtr {            // fn(T0, T1) -> Ret
+        params: Vec<Ty>,
+        ret: Box<Ty>,
+    },
     Named(String),     // user-defined struct/enum type
     Ref(Box<Ty>),      // &T
     RefMut(Box<Ty>),   // &mut T

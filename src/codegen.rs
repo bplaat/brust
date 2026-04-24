@@ -263,8 +263,8 @@ impl Codegen {
                 if let Some(Ty::Named(n)) = ty { ctx.type_env.insert(name.clone(), n.clone()); }
                 // Track all types for printf format specifier selection
                 if let Some(t) = ty { ctx.var_types.insert(name.clone(), t.clone()); }
-                // Don't add `const` prefix for pointer/ref/array types
-                let is_ptr = matches!(ty, Some(Ty::Ref(_) | Ty::RefMut(_) | Ty::RawConst(_) | Ty::RawMut(_) | Ty::Array(_, _) | Ty::Str));
+                // Don't add `const` prefix for pointer/ref/array/fnptr types
+                let is_ptr = matches!(ty, Some(Ty::Ref(_) | Ty::RefMut(_) | Ty::RawConst(_) | Ty::RawMut(_) | Ty::Array(_, _) | Ty::Str | Ty::FnPtr { .. }));
                 let kw = if *mutable || is_ptr { "" } else { "const " };
                 let val = self.emit_expr_hint(expr, ctx, ty.as_ref());
                 let decl = ty.as_ref().map(|t| ty_str_decl(t, name))
@@ -786,6 +786,11 @@ fn scan_ty(ty: &Ty, found: &mut Vec<Vec<Ty>>) {
             if !found.iter().any(|f| f == tys) { found.push(tys.clone()); }
             for t in tys { scan_ty(t, found); }
         }
+        Ty::Array(inner, _) | Ty::Slice(inner) => scan_ty(inner, found),
+        Ty::FnPtr { params, ret } => {
+            for p in params { scan_ty(p, found); }
+            scan_ty(ret, found);
+        }
         Ty::Ref(inner) | Ty::RefMut(inner) | Ty::RawConst(inner) | Ty::RawMut(inner) => {
             scan_ty(inner, found);
         }
@@ -862,8 +867,14 @@ fn ty_str(ty: &Ty) -> String {
         Ty::Char  => "uint32_t".into(),
         Ty::Str   => "const char*".into(),
         Ty::Unit  => "void".into(),
-        Ty::Array(inner, n) => format!("{}[{n}]", ty_str(inner)), // used differently in let/param
+        Ty::Array(inner, n) => format!("{}[{n}]", ty_str(inner)),
         Ty::Slice(inner) => format!("{}*", ty_str(inner)),
+        Ty::FnPtr { params, ret } => {
+            // Anonymous fn ptr for use in cast expressions: `ret (*)(params)`
+            let ps = params.iter().map(|p| ty_str(p)).collect::<Vec<_>>().join(", ");
+            let ps = if ps.is_empty() { "void".to_string() } else { ps };
+            format!("{}(*)({ps})", ty_str(ret))
+        }
         Ty::Named(n) => n.clone(),
         Ty::Tuple(tys) => tuple_typedef_name(tys),
         Ty::Ref(inner)      => format!("const {}*", ty_str(inner)),
@@ -874,11 +885,16 @@ fn ty_str(ty: &Ty) -> String {
 }
 
 fn ty_str_decl(ty: &Ty, name: &str) -> String {
-    // C array declarations need the size after the name, not after the type.
-    if let Ty::Array(inner, n) = ty {
-        format!("{} {name}[{n}]", ty_str(inner))
-    } else {
-        format!("{} {name}", ty_str(ty))
+    match ty {
+        // C array: size goes after the name
+        Ty::Array(inner, n) => format!("{} {name}[{n}]", ty_str(inner)),
+        // C function pointer: ret (*name)(params)
+        Ty::FnPtr { params, ret } => {
+            let ps = params.iter().map(|p| ty_str(p)).collect::<Vec<_>>().join(", ");
+            let ps = if ps.is_empty() { "void".to_string() } else { ps };
+            format!("{}(*{name})({ps})", ty_str(ret))
+        }
+        _ => format!("{} {name}", ty_str(ty)),
     }
 }
 
@@ -893,6 +909,10 @@ fn ty_key(ty: &Ty) -> String {
         Ty::Str   => "str".into(),
         Ty::Array(inner, n) => format!("arr_{}_{n}", ty_key(inner)),
         Ty::Slice(inner) => format!("slice_{}", ty_key(inner)),
+        Ty::FnPtr { params, ret } => {
+            let ps = params.iter().map(ty_key).collect::<Vec<_>>().join("_");
+            format!("fnptr_{}_ret_{}", ps, ty_key(ret))
+        }
         Ty::Named(n) => n.clone(),
         Ty::Tuple(tys)      => format!("({})", tys.iter().map(ty_key).collect::<Vec<_>>().join("_")),
         Ty::Ref(inner)      => format!("ref_{}", ty_key(inner)),
