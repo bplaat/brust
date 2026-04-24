@@ -40,6 +40,8 @@ struct Codegen {
     enums: HashMap<String, EnumDecl>,
     /// Function/method param types (mangled name → param type list) for tuple arg hints.
     fn_params: HashMap<String, Vec<Ty>>,
+    /// Functions that return `!` — calls to these inside a return emit as statements.
+    never_fns: std::collections::HashSet<String>,
     out: String,
 }
 
@@ -47,23 +49,25 @@ pub fn generate(file: &File) -> String {
     let enums: HashMap<String, EnumDecl> = file.items.iter()
         .filter_map(|i| if let Item::Enum(e) = i { Some((e.name.clone(), e.clone())) } else { None })
         .collect();
-    // Collect param types for all functions and methods
     let mut fn_params: HashMap<String, Vec<Ty>> = HashMap::new();
+    let mut never_fns = std::collections::HashSet::new();
     for item in &file.items {
         match item {
             Item::Fn(f) => {
                 fn_params.insert(f.name.clone(), f.params.iter().map(|p| p.ty.clone()).collect());
+                if f.return_ty == Ty::Never { never_fns.insert(f.name.clone()); }
             }
             Item::Impl(imp) => {
                 for m in &imp.methods {
                     let mangled = format!("{}_{}", imp.type_name, m.name);
+                    if m.return_ty == Ty::Never { never_fns.insert(mangled.clone()); }
                     fn_params.insert(mangled, m.params.iter().map(|p| p.ty.clone()).collect());
                 }
             }
             _ => {}
         }
     }
-    let mut cg = Codegen { enums, fn_params, out: String::new() };
+    let mut cg = Codegen { enums, fn_params, never_fns, out: String::new() };
     cg.run(file);
     cg.out
 }
@@ -79,9 +83,15 @@ impl Codegen {
             emit_tuple_typedef(&mut self.out, tys);
         }
 
-        // Emit struct and enum type definitions
+        // Emit type aliases, struct and enum type definitions
         for item in &file.items {
             match item {
+                Item::TypeAlias { name, ty } => {
+                    self.out.push('\n');
+                    // C typedef — fn ptr needs special syntax
+                    let decl = ty_str_decl(ty, name);
+                    self.out.push_str(&format!("typedef {decl};\n"));
+                }
                 Item::Struct(s) => { self.out.push('\n'); emit_struct(&mut self.out, s); }
                 Item::Enum(e)   => { self.out.push('\n'); self.emit_enum(e); }
                 _ => {}
@@ -110,7 +120,7 @@ impl Codegen {
             match item {
                 Item::Fn(f) => self.emit_fn(f, None),
                 Item::Impl(imp) => self.emit_impl(imp),
-                Item::Struct(_) | Item::Enum(_) => {}
+                Item::Struct(_) | Item::Enum(_) | Item::TypeAlias { .. } => {}
             }
         }
     }
@@ -287,9 +297,20 @@ impl Codegen {
                     }
                 }
                 Some(e) => {
-                    let hint = ctx.return_ty.clone();
-                    let s = self.emit_expr_hint(e, ctx, hint.as_ref());
-                    self.out.push_str(&format!("{p}return {s};\n"));
+                    // For _Noreturn (!) functions, tail expr is a statement, not a return value.
+                    // Also, calling a never-returning function inside a return emits as statement.
+                    let call_is_never = match e {
+                        Expr::Call { name, .. } => self.never_fns.contains(name.as_str()),
+                        _ => false,
+                    };
+                    if ctx.return_ty == Some(Ty::Never) || call_is_never {
+                        let s = self.emit_expr(e, ctx);
+                        self.out.push_str(&format!("{p}{s};\n"));
+                    } else {
+                        let hint = ctx.return_ty.clone();
+                        let s = self.emit_expr_hint(e, ctx, hint.as_ref());
+                        self.out.push_str(&format!("{p}return {s};\n"));
+                    }
                 }
                 None => self.out.push_str(&format!("{p}return;\n")),
             },
@@ -775,6 +796,7 @@ fn collect_tuple_types(file: &File) -> Vec<Vec<Ty>> {
                     scan_block(&m.body, &mut found);
                 }
             }
+            Item::TypeAlias { ty, .. } => scan_ty(ty, &mut found),
         }
     }
     found
@@ -866,6 +888,7 @@ fn ty_str(ty: &Ty) -> String {
         Ty::Bool  => "bool".into(),
         Ty::Char  => "uint32_t".into(),
         Ty::Str   => "const char*".into(),
+        Ty::Never => "void".into(), // _Noreturn applied at fn level
         Ty::Unit  => "void".into(),
         Ty::Array(inner, n) => format!("{}[{n}]", ty_str(inner)),
         Ty::Slice(inner) => format!("{}*", ty_str(inner)),
@@ -906,7 +929,7 @@ fn ty_key(ty: &Ty) -> String {
         Ty::U32   => "u32".into(),  Ty::U64  => "u64".into(),  Ty::Usize => "usize".into(),
         Ty::F32   => "f32".into(),  Ty::F64  => "f64".into(),
         Ty::Bool  => "bool".into(), Ty::Char => "char".into(), Ty::Unit => "unit".into(),
-        Ty::Str   => "str".into(),
+        Ty::Str   => "str".into(),  Ty::Never => "never".into(),
         Ty::Array(inner, n) => format!("arr_{}_{n}", ty_key(inner)),
         Ty::Slice(inner) => format!("slice_{}", ty_key(inner)),
         Ty::FnPtr { params, ret } => {
@@ -946,6 +969,7 @@ fn emit_struct(out: &mut String, s: &StructDecl) {
 fn fn_signature(f: &FnDecl, impl_type: Option<&str>) -> String {
     if f.name == "main" { return "int main(void)".to_string(); }
 
+    let noreturn = if f.return_ty == Ty::Never { "_Noreturn " } else { "" };
     let ret = ty_str(&f.return_ty);
     let mut param_parts: Vec<String> = Vec::new();
 
@@ -966,7 +990,7 @@ fn fn_signature(f: &FnDecl, impl_type: Option<&str>) -> String {
         Some(t) => format!("{t}_{}", f.name),
         None    => f.name.clone(),
     };
-    format!("{ret} {mangled}({params})")
+    format!("{noreturn}{ret} {mangled}({params})")
 }
 
 fn pad(indent: usize) -> String { "    ".repeat(indent) }

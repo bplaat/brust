@@ -8,6 +8,7 @@ pub enum Item {
     Struct(StructDecl),
     Impl(ImplBlock),
     Enum(EnumDecl),
+    TypeAlias { name: String, ty: Ty },
 }
 
 pub struct StructDecl {
@@ -89,6 +90,7 @@ pub enum Ty {
     Char,              // Unicode scalar value (u32)
     Unit,              // ()
     Str,               // &str (const char*)
+    Never,             // ! (diverging — _Noreturn void in C)
     Array(Box<Ty>, usize), // [T; N]
     Slice(Box<Ty>),    // &[T] (v1: T*, no length)
     Tuple(Vec<Ty>),    // (T0, T1, ...)
