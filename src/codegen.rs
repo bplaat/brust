@@ -71,6 +71,32 @@ fn emit_stmt(out: &mut String, stmt: &Stmt) {
             Some(e) => out.push_str(&format!("    return {};\n", emit_expr(e))),
             None    => out.push_str("    return;\n"),
         },
+        Stmt::If { cond, then_block, else_block } => {
+            out.push_str(&format!("    if ({}) {{\n", emit_expr(cond)));
+            for s in &then_block.stmts { emit_stmt_indented(out, s, 2); }
+            match else_block {
+                None => out.push_str("    }\n"),
+                Some(blk) => {
+                    // Detect `else if` (block with a single If stmt) vs plain else
+                    if blk.stmts.len() == 1 {
+                        if let Stmt::If { cond: c2, then_block: t2, else_block: e2 } = &blk.stmts[0] {
+                            out.push_str(&format!("    }} else if ({}) {{\n", emit_expr(c2)));
+                            for s in &t2.stmts { emit_stmt_indented(out, s, 2); }
+                            emit_else_tail(out, e2);
+                            return;
+                        }
+                    }
+                    out.push_str("    } else {\n");
+                    for s in &blk.stmts { emit_stmt_indented(out, s, 2); }
+                    out.push_str("    }\n");
+                }
+            }
+        }
+        Stmt::While { cond, body } => {
+            out.push_str(&format!("    while ({}) {{\n", emit_expr(cond)));
+            for s in &body.stmts { emit_stmt_indented(out, s, 2); }
+            out.push_str("    }\n");
+        }
         Stmt::Expr(expr) => {
             out.push_str(&format!("    {};\n", emit_expr(expr)));
         }
@@ -108,9 +134,44 @@ fn emit_println(out: &mut String, format: &str, args: &[Expr]) {
     }
 }
 
+/// Emit a statement with `indent` levels of 4-space indentation.
+fn emit_stmt_indented(out: &mut String, stmt: &Stmt, indent: usize) {
+    let prefix = "    ".repeat(indent);
+    // Temporarily capture and re-indent
+    let mut buf = String::new();
+    emit_stmt(&mut buf, stmt);
+    for line in buf.lines() {
+        out.push_str(&prefix);
+        // strip the leading 4 spaces emit_stmt already adds
+        out.push_str(line.strip_prefix("    ").unwrap_or(line));
+        out.push('\n');
+    }
+}
+
+/// Emit the tail of an else-if chain.
+fn emit_else_tail(out: &mut String, else_block: &Option<crate::ast::Block>) {
+    match else_block {
+        None => out.push_str("    }\n"),
+        Some(blk) => {
+            if blk.stmts.len() == 1 {
+                if let Stmt::If { cond, then_block, else_block: inner } = &blk.stmts[0] {
+                    out.push_str(&format!("    }} else if ({}) {{\n", emit_expr(cond)));
+                    for s in &then_block.stmts { emit_stmt_indented(out, s, 2); }
+                    emit_else_tail(out, inner);
+                    return;
+                }
+            }
+            out.push_str("    } else {\n");
+            for s in &blk.stmts { emit_stmt_indented(out, s, 2); }
+            out.push_str("    }\n");
+        }
+    }
+}
+
 fn emit_expr(expr: &Expr) -> String {
     match expr {
-        Expr::Int(n)  => format!("INT64_C({n})"),
+        Expr::Int(n)    => format!("INT64_C({n})"),
+        Expr::Bool(b)   => if *b { "true".to_string() } else { "false".to_string() },
         Expr::Var(name) => name.clone(),
         Expr::Call { name, args } => {
             let args_str: Vec<String> = args.iter().map(emit_expr).collect();
@@ -123,8 +184,15 @@ fn emit_expr(expr: &Expr) -> String {
                 BinOp::Mul => "*",
                 BinOp::Div => "/",
                 BinOp::Rem => "%",
+                BinOp::Eq  => "==",
+                BinOp::Ne  => "!=",
+                BinOp::Lt  => "<",
+                BinOp::Gt  => ">",
+                BinOp::Le  => "<=",
+                BinOp::Ge  => ">=",
+                BinOp::And => "&&",
+                BinOp::Or  => "||",
             };
-            // Wrap in parens to preserve brust precedence in C output
             format!("({} {} {})", emit_expr(lhs), op_str, emit_expr(rhs))
         }
     }
