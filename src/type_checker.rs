@@ -510,6 +510,27 @@ impl<'a> TypeChecker<'a> {
                 self.check_block(body, scope, return_ty);
             }
 
+            StmtKind::Loop(body) => {
+                self.check_block(body, scope, return_ty);
+            }
+
+            StmtKind::For { var, iter, body } => {
+                // Infer element type from the array/slice expression.
+                let iter_ty = self.infer_expr(iter, scope);
+                let elem_ty = match &iter_ty {
+                    Ty::Array(elem, _) => *elem.clone(),
+                    _ => Ty::I64, // fallback for unknown iterables
+                };
+                scope.push();
+                scope.insert(var.clone(), elem_ty, false);
+                self.check_block_stmts(&body.stmts, scope, return_ty);
+                scope.pop();
+            }
+
+            StmtKind::Break | StmtKind::Continue => {
+                // Valid inside loops; no further type checking needed here.
+            }
+
             StmtKind::Match { expr, arms } => {
                 let scrutinee = self.infer_expr(expr, scope);
                 for arm in arms {
@@ -1420,6 +1441,21 @@ impl<'a> BorrowChecker<'a> {
                 self.check_expr(cond, scope, true);
                 self.check_block(body, scope);
             }
+
+            StmtKind::Loop(body) => {
+                self.check_block(body, scope);
+            }
+
+            StmtKind::For { var, iter, body } => {
+                self.check_expr(iter, scope, false);
+                scope.insert(
+                    var.clone(),
+                    BVar { ty: Ty::Unit, mutable: false, moved: false },
+                );
+                self.check_block(body, scope);
+            }
+
+            StmtKind::Break | StmtKind::Continue => {}
 
             StmtKind::Match { expr, arms } => {
                 self.check_expr(expr, scope, true);

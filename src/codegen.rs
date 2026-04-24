@@ -23,6 +23,8 @@ struct Ctx {
     fn_ret_tys: HashMap<String, Ty>,
     /// Type aliases shared from Codegen, for resolving Named types in printf spec.
     type_aliases: HashMap<String, Ty>,
+    /// Methods whose self parameter is by value (not a pointer), for correct call-site emission.
+    value_self_fns: std::collections::HashSet<String>,
 }
 
 impl Ctx {
@@ -35,6 +37,7 @@ impl Ctx {
             return_ty: None,
             fn_ret_tys: HashMap::new(),
             type_aliases: HashMap::new(),
+            value_self_fns: std::collections::HashSet::new(),
         }
     }
 
@@ -54,6 +57,7 @@ impl Ctx {
             return_ty: None,
             fn_ret_tys: HashMap::new(),
             type_aliases: HashMap::new(),
+            value_self_fns: std::collections::HashSet::new(),
         }
     }
 }
@@ -73,6 +77,8 @@ struct Codegen {
     type_aliases: HashMap<String, Ty>,
     /// Functions that return `!` — calls to these inside a return emit as statements.
     never_fns: std::collections::HashSet<String>,
+    /// Methods whose `self` is passed by value (not a pointer) in the C signature.
+    value_self_fns: std::collections::HashSet<String>,
     out: String,
 }
 
@@ -82,6 +88,7 @@ pub fn generate(file: &File) -> String {
     let mut fn_ret_tys: HashMap<String, Ty> = HashMap::new();
     let mut type_aliases: HashMap<String, Ty> = HashMap::new();
     let mut never_fns = std::collections::HashSet::new();
+    let mut value_self_fns = std::collections::HashSet::new();
     collect_type_aliases(&file.items, &mut type_aliases);
     collect_items(
         &file.items,
@@ -90,6 +97,7 @@ pub fn generate(file: &File) -> String {
         &mut fn_params,
         &mut fn_ret_tys,
         &mut never_fns,
+        &mut value_self_fns,
     );
     let mut cg = Codegen {
         enums,
@@ -97,6 +105,7 @@ pub fn generate(file: &File) -> String {
         fn_ret_tys,
         type_aliases,
         never_fns,
+        value_self_fns,
         out: String::new(),
     };
     cg.run(file);
@@ -118,6 +127,7 @@ fn collect_items(
     fn_params: &mut HashMap<String, Vec<Ty>>,
     fn_ret_tys: &mut HashMap<String, Ty>,
     never_fns: &mut std::collections::HashSet<String>,
+    value_self_fns: &mut std::collections::HashSet<String>,
 ) {
     for item in items {
         match item {
@@ -142,7 +152,10 @@ fn collect_items(
                         mangled.clone(),
                         m.params.iter().map(|p| p.ty.clone()).collect(),
                     );
-                    fn_ret_tys.insert(mangled, m.return_ty.clone());
+                    fn_ret_tys.insert(mangled.clone(), m.return_ty.clone());
+                    if matches!(m.receiver, Some(Receiver::Value)) {
+                        value_self_fns.insert(mangled);
+                    }
                 }
             }
             Item::Enum(e) => {
@@ -162,6 +175,7 @@ fn collect_items(
                     fn_params,
                     fn_ret_tys,
                     never_fns,
+                    value_self_fns,
                 );
             }
             _ => {}
@@ -409,6 +423,7 @@ impl Codegen {
         ctx.return_ty = Some(f.return_ty.clone());
         ctx.fn_ret_tys = self.fn_ret_tys.clone();
         ctx.type_aliases = self.type_aliases.clone();
+        ctx.value_self_fns = self.value_self_fns.clone();
 
         for stmt in &f.body.stmts {
             self.emit_stmt(stmt, &mut ctx, 1);
@@ -533,6 +548,39 @@ impl Codegen {
                     self.emit_stmt(s, ctx, indent + 1);
                 }
                 self.out.push_str(&format!("{p}}}\n"));
+            }
+
+            StmtKind::Loop(body) => {
+                self.out.push_str(&format!("{p}for (;;) {{\n"));
+                for s in &body.stmts {
+                    self.emit_stmt(s, ctx, indent + 1);
+                }
+                self.out.push_str(&format!("{p}}}\n"));
+            }
+
+            StmtKind::For { var, iter, body } => {
+                // Emit as: for (size_t _i = 0; _i < sizeof(arr)/sizeof(arr[0]); _i++)
+                // The iterator expression must be an array; we use a C sizeof trick.
+                let iter_s = self.emit_expr(iter, ctx);
+                let p1 = "    ".repeat(indent + 1);
+                self.out.push_str(&format!(
+                    "{p}for (size_t _brust_i = 0; _brust_i < sizeof({iter_s})/sizeof({iter_s}[0]); _brust_i++) {{\n"
+                ));
+                self.out.push_str(&format!(
+                    "{p1}__auto_type {var} = {iter_s}[_brust_i];\n"
+                ));
+                for s in &body.stmts {
+                    self.emit_stmt(s, ctx, indent + 1);
+                }
+                self.out.push_str(&format!("{p}}}\n"));
+            }
+
+            StmtKind::Break => {
+                self.out.push_str(&format!("{p}break;\n"));
+            }
+
+            StmtKind::Continue => {
+                self.out.push_str(&format!("{p}continue;\n"));
             }
 
             StmtKind::Match { expr, arms } => self.emit_match(expr, arms, ctx, indent),
@@ -944,17 +992,22 @@ impl Codegen {
 
                 match type_name {
                     Some(t) => {
-                        let self_arg = if matches!(&expr.kind, ExprKind::Var(n) if n == "self")
+                        let mangled = format!("{t}_{method}");
+                        // Value-receiver methods receive the object by copy, not pointer.
+                        let self_arg = if ctx.value_self_fns.contains(mangled.as_str()) {
+                            expr_c
+                        } else if matches!(&expr.kind, ExprKind::Var(n) if n == "self")
                             && ctx.ref_self
                         {
+                            // self is already a pointer inside a ref/refmut method.
                             expr_c
                         } else {
                             format!("&({expr_c})")
                         };
                         if args_s.is_empty() {
-                            format!("{t}_{method}({self_arg})")
+                            format!("{mangled}({self_arg})")
                         } else {
-                            format!("{t}_{method}({self_arg}, {})", args_s.join(", "))
+                            format!("{mangled}({self_arg}, {})", args_s.join(", "))
                         }
                     }
                     None => format!("/* unknown type */{expr_c}.{method}({})", args_s.join(", ")),
@@ -1500,7 +1553,7 @@ fn fn_signature(f: &FnDecl, impl_type: Option<&str>, prefix: &str) -> String {
 
     if let (Some(recv), Some(itype)) = (&f.receiver, impl_type) {
         let self_param = match recv {
-            Receiver::Value => format!("{itype}* self"),
+            Receiver::Value => format!("{itype} self"),
             Receiver::Ref => format!("const {itype}* self"),
             Receiver::RefMut => format!("{itype}* self"),
         };
