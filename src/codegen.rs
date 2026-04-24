@@ -257,7 +257,9 @@ impl Codegen {
                 let c_ty = ty.as_ref().map(|t| ty_str(t)).unwrap_or_else(|| "int64_t".to_string());
                 // Track named types for method resolution
                 if let Some(Ty::Named(n)) = ty { ctx.type_env.insert(name.clone(), n.clone()); }
-                let kw = if *mutable { "" } else { "const " };
+                // Don't add `const` prefix for pointer/ref types — constness lives in the type already
+                let is_ptr = matches!(ty, Some(Ty::Ref(_) | Ty::RefMut(_) | Ty::RawConst(_) | Ty::RawMut(_)));
+                let kw = if *mutable || is_ptr { "" } else { "const " };
                 let val = self.emit_expr_hint(expr, ctx, ty.as_ref());
                 self.out.push_str(&format!("{p}{kw}{c_ty} {name} = {val};\n"));
             }
@@ -298,6 +300,9 @@ impl Codegen {
                     let ls = self.emit_expr(lhs, ctx);
                     let rs = self.emit_expr(rhs, ctx);
                     self.out.push_str(&format!("{p}{ls} = {rs};\n"));
+                } else if let Expr::Unsafe(block) = expr {
+                    // `unsafe { ... }` as a statement: emit stmts directly
+                    for s in &block.stmts { self.emit_stmt(s, ctx, indent); }
                 } else {
                     let s = self.emit_expr(expr, ctx);
                     self.out.push_str(&format!("{p}{s};\n"));
@@ -567,6 +572,51 @@ impl Codegen {
                 };
                 format!("({} {op_s} {})", self.emit_expr(lhs, ctx), self.emit_expr(rhs, ctx))
             }
+
+            Expr::AddrOf { mutable, expr } => {
+                let _ = mutable; // semantics preserved in C type; no runtime difference
+                format!("(&{})", self.emit_expr(expr, ctx))
+            }
+
+            Expr::Deref(expr) => {
+                format!("(*{})", self.emit_expr(expr, ctx))
+            }
+
+            Expr::Cast { expr, ty } => {
+                format!("(({})({}))", ty_str(ty), self.emit_expr(expr, ctx))
+            }
+
+            // `unsafe { stmts }` — emit as a GNU statement expression `({ stmts })`
+            // or just emit the block inline (last expr becomes the value).
+            Expr::Unsafe(block) => {
+                if block.stmts.is_empty() {
+                    "/* unsafe {} */".to_string()
+                } else if block.stmts.len() == 1 {
+                    // Single expression inside unsafe: emit directly
+                    match &block.stmts[0] {
+                        Stmt::Return(Some(e)) | Stmt::Expr(e) => self.emit_expr(e, ctx),
+                        _ => "/* unsafe block */".to_string(),
+                    }
+                } else {
+                    // Multi-statement unsafe: use GCC/Clang statement expression
+                    let mut out = "({ ".to_string();
+                    for (i, s) in block.stmts.iter().enumerate() {
+                        match s {
+                            Stmt::Return(Some(e)) if i + 1 == block.stmts.len() => {
+                                out.push_str(&self.emit_expr(e, ctx));
+                                out.push_str("; ");
+                            }
+                            Stmt::Expr(e) if i + 1 == block.stmts.len() => {
+                                out.push_str(&self.emit_expr(e, ctx));
+                                out.push_str("; ");
+                            }
+                            _ => {} // complex stmts in unsafe: skip for now
+                        }
+                    }
+                    out.push_str("})");
+                    out
+                }
+            }
         }
     }
 
@@ -634,9 +684,15 @@ fn collect_tuple_types(file: &File) -> Vec<Vec<Ty>> {
 }
 
 fn scan_ty(ty: &Ty, found: &mut Vec<Vec<Ty>>) {
-    if let Ty::Tuple(tys) = ty {
-        if !found.iter().any(|f| f == tys) { found.push(tys.clone()); }
-        for t in tys { scan_ty(t, found); }
+    match ty {
+        Ty::Tuple(tys) => {
+            if !found.iter().any(|f| f == tys) { found.push(tys.clone()); }
+            for t in tys { scan_ty(t, found); }
+        }
+        Ty::Ref(inner) | Ty::RefMut(inner) | Ty::RawConst(inner) | Ty::RawMut(inner) => {
+            scan_ty(inner, found);
+        }
+        _ => {}
     }
 }
 
@@ -686,6 +742,10 @@ fn scan_expr(expr: &Expr, hint: Option<&Ty>, found: &mut Vec<Vec<Ty>>) {
         Expr::Field { expr, .. }          => scan_expr(expr, None, found),
         Expr::StructLit { fields, .. }    => { for (_, e) in fields { scan_expr(e, None, found); } }
         Expr::EnumStructLit { fields, .. } => { for (_, e) in fields { scan_expr(e, None, found); } }
+        Expr::AddrOf { expr, .. }  => scan_expr(expr, None, found),
+        Expr::Deref(expr)          => scan_expr(expr, None, found),
+        Expr::Cast { expr, ty }    => { scan_expr(expr, None, found); scan_ty(ty, found); }
+        Expr::Unsafe(block)        => scan_block(block, found),
         _ => {}
     }
 }
@@ -704,6 +764,10 @@ fn ty_str(ty: &Ty) -> String {
         Ty::Unit  => "void".into(),
         Ty::Named(n) => n.clone(),
         Ty::Tuple(tys) => tuple_typedef_name(tys),
+        Ty::Ref(inner)      => format!("const {}*", ty_str(inner)),
+        Ty::RefMut(inner)   => format!("{}*", ty_str(inner)),
+        Ty::RawConst(inner) => format!("const {}*", ty_str(inner)),
+        Ty::RawMut(inner)   => format!("{}*", ty_str(inner)),
     }
 }
 
@@ -715,7 +779,11 @@ fn ty_key(ty: &Ty) -> String {
         Ty::U32   => "u32".into(),  Ty::U64  => "u64".into(),  Ty::Usize => "usize".into(),
         Ty::Bool  => "bool".into(), Ty::Unit => "unit".into(),
         Ty::Named(n) => n.clone(),
-        Ty::Tuple(tys) => format!("({})", tys.iter().map(ty_key).collect::<Vec<_>>().join("_")),
+        Ty::Tuple(tys)      => format!("({})", tys.iter().map(ty_key).collect::<Vec<_>>().join("_")),
+        Ty::Ref(inner)      => format!("ref_{}", ty_key(inner)),
+        Ty::RefMut(inner)   => format!("refmut_{}", ty_key(inner)),
+        Ty::RawConst(inner) => format!("ptr_{}", ty_key(inner)),
+        Ty::RawMut(inner)   => format!("ptrm_{}", ty_key(inner)),
     }
 }
 
