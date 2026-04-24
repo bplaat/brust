@@ -37,7 +37,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::ast::{
     BinOp, Block, EnumDecl, Expr, ExprKind, File, FnDecl, Item, MatchArm, Pat, PatBindings,
-    Receiver, Stmt, StmtKind, StructDecl, Ty, UnOp, VariantFields,
+    Receiver, Stmt, StmtKind, StructDecl, TraitDecl, Ty, UnOp, VariantFields,
 };
 use crate::error::Error;
 use crate::loc::Loc;
@@ -53,6 +53,8 @@ pub struct TyEnv {
     /// Note: `self` receiver is NOT included in the param list.
     pub fns: HashMap<String, (Vec<Ty>, Ty)>,
     pub type_aliases: HashMap<String, Ty>,
+    /// Trait declarations, for dyn method resolution and impl checking.
+    pub traits: HashMap<String, TraitDecl>,
 }
 
 impl TyEnv {
@@ -62,6 +64,7 @@ impl TyEnv {
             enums: HashMap::new(),
             fns: HashMap::new(),
             type_aliases: HashMap::new(),
+            traits: HashMap::new(),
         };
         env.collect_items(&file.items, "");
         env
@@ -96,12 +99,29 @@ impl TyEnv {
                     let params = f.params.iter().map(|p| p.ty.clone()).collect();
                     self.fns.insert(name, (params, f.return_ty.clone()));
                 }
+                Item::Trait(t) => {
+                    let full = format!("{prefix}{}", t.name);
+                    let mut trait_clone = t.clone();
+                    trait_clone.name = full.clone();
+                    self.traits.insert(full, trait_clone);
+                }
                 Item::Impl(imp) => {
                     let type_name = format!("{prefix}{}", imp.type_name);
                     for m in &imp.methods {
-                        let mangled = format!("{type_name}_{}", m.name);
-                        let params = m.params.iter().map(|p| p.ty.clone()).collect();
-                        self.fns.insert(mangled, (params, m.return_ty.clone()));
+                        if imp.trait_name.is_some() {
+                            // Trait impl methods: also register under TypeName_method for
+                            // unambiguous resolution when calling on concrete types.
+                            let mangled = format!("{type_name}_{}", m.name);
+                            // Only insert if there's no inherent method with the same name.
+                            self.fns.entry(mangled).or_insert_with(|| {
+                                let params = m.params.iter().map(|p| p.ty.clone()).collect();
+                                (params, m.return_ty.clone())
+                            });
+                        } else {
+                            let mangled = format!("{type_name}_{}", m.name);
+                            let params = m.params.iter().map(|p| p.ty.clone()).collect();
+                            self.fns.insert(mangled, (params, m.return_ty.clone()));
+                        }
                     }
                 }
                 Item::TypeAlias { name, ty } => {
@@ -277,8 +297,32 @@ impl<'a> TypeChecker<'a> {
                     {
                         self.err(format!("impl for unknown type `{}`", imp.type_name));
                     }
+                    // Validate trait exists and all required methods are provided.
+                    if let Some(trait_name) = &imp.trait_name {
+                        if let Some(tr) = self.env.traits.get(trait_name).cloned() {
+                            for sig in &tr.methods {
+                                if !imp.methods.iter().any(|m| m.name == sig.name) {
+                                    self.err(format!(
+                                        "`impl {trait_name} for {}` missing method `{}`",
+                                        imp.type_name, sig.name
+                                    ));
+                                }
+                            }
+                        } else {
+                            self.err(format!("unknown trait `{trait_name}`"));
+                        }
+                    }
                     for m in &imp.methods {
                         self.cur_loc = m.loc;
+                        for p in &m.params {
+                            self.validate_ty(&p.ty);
+                        }
+                        self.validate_ty(&m.return_ty);
+                    }
+                }
+                Item::Trait(t) => {
+                    // Validate method signatures in the trait definition.
+                    for m in &t.methods {
                         for p in &m.params {
                             self.validate_ty(&p.ty);
                         }
@@ -304,6 +348,11 @@ impl<'a> TypeChecker<'a> {
                     && !self.env.type_aliases.contains_key(name)
                 {
                     self.err(format!("unknown type `{name}`"));
+                }
+            }
+            Ty::DynTrait(name) => {
+                if !self.env.traits.contains_key(name) {
+                    self.err(format!("unknown trait `{name}`"));
                 }
             }
             Ty::Array(inner, _) | Ty::Slice(inner) => self.validate_ty(inner),
@@ -340,7 +389,7 @@ impl<'a> TypeChecker<'a> {
                 } => {
                     self.check_items(mod_items, &format!("{prefix}{name}_"));
                 }
-                _ => {} // structs, enums, type aliases are pure declarations
+                _ => {} // traits, structs, enums, type aliases are pure declarations
             }
         }
     }
@@ -920,6 +969,23 @@ impl<'a> TypeChecker<'a> {
             ExprKind::MethodCall { expr, method, args } => {
                 let recv = self.infer_expr(expr, scope);
                 let recv_r = self.resolve(&recv);
+                // Dyn trait dispatch: look up method in the trait definition.
+                if let Ty::DynTrait(trait_name) = &recv_r {
+                    let trait_name = trait_name.clone();
+                    if let Some(tr) = self.env.traits.get(&trait_name).cloned()
+                        && let Some(sig) = tr.methods.iter().find(|m| m.name == *method)
+                    {
+                        for a in args {
+                            self.infer_expr(a, scope);
+                        }
+                        return sig.return_ty.clone();
+                    }
+                    for a in args {
+                        self.infer_expr(a, scope);
+                    }
+                    self.err(format!("no method `{method}` on `dyn {trait_name}`"));
+                    return Ty::Unit;
+                }
                 if let Some(type_name) = base_type_name(&recv_r) {
                     let mangled = format!("{type_name}_{method}");
                     if let Some((param_tys, ret_ty)) = self.env.fns.get(&mangled).cloned() {
@@ -1866,6 +1932,7 @@ pub fn ty_display(ty: &Ty) -> String {
             format!("fn({ps}) -> {}", ty_display(ret))
         }
         Ty::Named(n) => n.clone(),
+        Ty::DynTrait(t) => format!("dyn {t}"),
         Ty::Ref(inner) => format!("&{}", ty_display(inner)),
         Ty::RefMut(inner) => format!("&mut {}", ty_display(inner)),
         Ty::RawConst(inner) => format!("*const {}", ty_display(inner)),

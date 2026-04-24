@@ -21,7 +21,7 @@ fn main() {
         };
         let mut entries: Vec<_> = read_dir
             .filter_map(|e| e.ok())
-            .filter(|e| e.path().extension().map_or(false, |x| x == "rs"))
+            .filter(|e| e.path().extension().is_some_and(|x| x == "rs"))
             .collect();
         entries.sort_by_key(|e| e.file_name());
 
@@ -36,7 +36,7 @@ fn main() {
                 .chars()
                 .map(|c| if c.is_alphanumeric() { c } else { '_' })
                 .collect();
-            let fn_name = if sanitized.chars().next().map_or(true, |c| c.is_ascii_digit()) {
+            let fn_name = if sanitized.chars().next().is_none_or(|c| c.is_ascii_digit()) {
                 format!("t_{sanitized}")
             } else {
                 sanitized

@@ -1,7 +1,7 @@
 use crate::ast::{
     BinOp, Block, EnumDecl, EnumVariant, Expr, ExprKind, FieldDecl, File, FnDecl, ImplBlock, Item,
-    MatchArm, Param, Pat, PatBindings, Receiver, Stmt, StmtKind, StructDecl, Ty, UnOp,
-    VariantFields,
+    MatchArm, Param, Pat, PatBindings, Receiver, Stmt, StmtKind, StructDecl, TraitDecl,
+    TraitMethodSig, Ty, UnOp, VariantFields,
 };
 use crate::error::Error;
 use crate::lexer::{Token, TokenKind};
@@ -71,10 +71,10 @@ impl Parser {
     /// fully-qualified internal name (`{mod}_{name}`). Otherwise return `name`
     /// unchanged.
     fn qualify(&self, name: String) -> String {
-        if let Some(ref m) = self.current_mod {
-            if self.mod_local_names.contains(&name) {
-                return format!("{m}_{name}");
-            }
+        if let Some(ref m) = self.current_mod
+            && self.mod_local_names.contains(&name)
+        {
+            return format!("{m}_{name}");
         }
         name
     }
@@ -144,6 +144,7 @@ impl Parser {
             TokenKind::Fn => Ok(Item::Fn(self.parse_fn()?)),
             TokenKind::Struct => Ok(Item::Struct(self.parse_struct()?)),
             TokenKind::Impl => Ok(Item::Impl(self.parse_impl()?)),
+            TokenKind::Trait => Ok(Item::Trait(self.parse_trait()?)),
             TokenKind::Enum => Ok(Item::Enum(self.parse_enum()?)),
             TokenKind::Type => {
                 self.advance();
@@ -269,14 +270,51 @@ impl Parser {
 
     fn parse_impl(&mut self) -> Result<ImplBlock, Error> {
         self.expect(&TokenKind::Impl)?;
-        let type_name = self.expect_ident()?;
+        let first_name = self.expect_ident()?;
+        // `impl Foo for Bar { ... }` vs `impl Bar { ... }`
+        let (trait_name, type_name) = if self.peek().kind == TokenKind::For {
+            self.advance();
+            let type_name = self.expect_ident()?;
+            (Some(first_name), type_name)
+        } else {
+            (None, first_name)
+        };
         self.expect(&TokenKind::LBrace)?;
         let mut methods = Vec::new();
         while self.peek().kind != TokenKind::RBrace && !self.at_eof() {
             methods.push(self.parse_fn()?);
         }
         self.expect(&TokenKind::RBrace)?;
-        Ok(ImplBlock { type_name, methods })
+        Ok(ImplBlock { type_name, trait_name, methods })
+    }
+
+    /// Parse a trait declaration: `trait Foo { fn method(&self, ...) -> Ty; ... }`.
+    fn parse_trait(&mut self) -> Result<TraitDecl, Error> {
+        self.expect(&TokenKind::Trait)?;
+        let name = self.expect_ident()?;
+        self.expect(&TokenKind::LBrace)?;
+        let mut methods = Vec::new();
+        while self.peek().kind != TokenKind::RBrace && !self.at_eof() {
+            if self.peek().kind == TokenKind::Pub {
+                self.advance();
+            }
+            self.expect(&TokenKind::Fn)?;
+            let mname = self.expect_ident()?;
+            self.expect(&TokenKind::LParen)?;
+            let (receiver, params) = self.parse_receiver_and_params()?;
+            self.expect(&TokenKind::RParen)?;
+            let return_ty = if self.peek().kind == TokenKind::Arrow {
+                self.advance();
+                self.parse_ty()?
+            } else {
+                Ty::Unit
+            };
+            self.expect(&TokenKind::Semicolon)?;
+            let receiver = receiver.unwrap_or(Receiver::Ref);
+            methods.push(TraitMethodSig { name: mname, receiver, params, return_ty });
+        }
+        self.expect(&TokenKind::RBrace)?;
+        Ok(TraitDecl { name, methods })
     }
 
     fn parse_fn(&mut self) -> Result<FnDecl, Error> {
@@ -442,6 +480,11 @@ impl Parser {
                         "expected `const` or `mut` after `*` in type".to_string(),
                     )),
                 }
+            }
+            TokenKind::Dyn => {
+                self.advance();
+                let trait_name = self.expect_ident()?;
+                Ok(Ty::DynTrait(self.qualify(trait_name)))
             }
             TokenKind::Ident(name) => {
                 let ty = match name.as_str() {
