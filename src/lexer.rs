@@ -14,7 +14,9 @@ pub enum TokenKind {
     False,
     Struct,
     Impl,
-    SelfKw, // `self`
+    SelfKw,  // `self`
+    Enum,
+    Match,
     // Identifiers and literals
     Ident(String),
     IntLit(i64),
@@ -54,6 +56,7 @@ pub enum TokenKind {
     ColonColon,
     Eq,
     Arrow, // ->
+    FatArrow, // =>
     Bang,
     Eof,
 }
@@ -149,7 +152,9 @@ impl<'a> Lexer<'a> {
             }
             b'=' => {
                 self.advance();
-                if self.peek() == Some(b'=') { self.advance(); TokenKind::EqEq } else { TokenKind::Eq }
+                if self.peek() == Some(b'=') { self.advance(); TokenKind::EqEq }
+                else if self.peek() == Some(b'>') { self.advance(); TokenKind::FatArrow }
+                else { TokenKind::Eq }
             }
             b'!' => {
                 self.advance();
@@ -280,6 +285,8 @@ impl<'a> Lexer<'a> {
             "struct" => TokenKind::Struct,
             "impl"   => TokenKind::Impl,
             "self"   => TokenKind::SelfKw,
+            "enum"   => TokenKind::Enum,
+            "match"  => TokenKind::Match,
             _ => TokenKind::Ident(name),
         }
     }
