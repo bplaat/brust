@@ -109,19 +109,20 @@ impl TyEnv {
                 Item::Impl(imp) => {
                     let type_name = format!("{prefix}{}", imp.type_name);
                     for m in &imp.methods {
+                        let ret_ty = m.return_ty.resolve_self(&type_name);
                         if imp.trait_name.is_some() {
                             // Trait impl methods: also register under TypeName_method for
                             // unambiguous resolution when calling on concrete types.
                             let mangled = format!("{type_name}_{}", m.name);
                             // Only insert if there's no inherent method with the same name.
                             self.fns.entry(mangled).or_insert_with(|| {
-                                let params = m.params.iter().map(|p| p.ty.clone()).collect();
-                                (params, m.return_ty.clone())
+                                let params = m.params.iter().map(|p| p.ty.resolve_self(&type_name)).collect();
+                                (params, ret_ty)
                             });
                         } else {
                             let mangled = format!("{type_name}_{}", m.name);
-                            let params = m.params.iter().map(|p| p.ty.clone()).collect();
-                            self.fns.insert(mangled, (params, m.return_ty.clone()));
+                            let params = m.params.iter().map(|p| p.ty.resolve_self(&type_name)).collect();
+                            self.fns.insert(mangled, (params, ret_ty));
                         }
                     }
                 }
@@ -135,6 +136,7 @@ impl TyEnv {
                 } => {
                     self.collect_items(mod_items, &format!("{prefix}{name}_"));
                 }
+                Item::Skip => {}
             }
         }
     }
@@ -336,6 +338,7 @@ impl TypeChecker {
                 } => {
                     self.validate_items(mod_items, &format!("{prefix}{name}_"));
                 }
+                Item::Skip => {}
             }
         }
     }
@@ -370,7 +373,7 @@ impl TypeChecker {
                 }
                 self.validate_ty(ret);
             }
-            _ => {} // primitives are always valid
+            _ => {} // primitives and SelfTy are always valid in context
         }
     }
 
@@ -402,6 +405,12 @@ impl TypeChecker {
     fn check_fn(&mut self, f: &FnDecl, impl_type: Option<&str>, prefix: &str) {
         let mut scope = Scope::new();
 
+        // Resolve SelfTy to the concrete implementing type.
+        let return_ty = match impl_type {
+            Some(itype) => f.return_ty.resolve_self(itype),
+            None => f.return_ty.clone(),
+        };
+
         // Insert `self` for methods.
         if let (Some(recv), Some(itype)) = (&f.receiver, impl_type) {
             let self_ty = match recv {
@@ -412,20 +421,23 @@ impl TypeChecker {
             scope.insert("self".to_string(), self_ty, false);
         }
         for p in &f.params {
-            scope.insert(p.name.clone(), p.ty.clone(), false);
+            let ty = match impl_type {
+                Some(itype) => p.ty.resolve_self(itype),
+                None => p.ty.clone(),
+            };
+            scope.insert(p.name.clone(), ty, false);
         }
 
         let _ = prefix; // name mangling handled by TyEnv
-        self.check_block_stmts(&f.body.stmts, &mut scope, &f.return_ty);
+        self.check_block_stmts(&f.body.stmts, &mut scope, &return_ty);
 
         // All-paths-return check for non-void functions.
-        if f.return_ty != Ty::Unit && f.return_ty != Ty::Never && !block_definitely_returns(&f.body)
-        {
+        if return_ty != Ty::Unit && return_ty != Ty::Never && !block_definitely_returns(&f.body) {
             self.cur_loc = f.loc;
             self.err(format!(
                 "function `{}` may not return a value (expected `{}`)",
                 f.name,
-                ty_display(&f.return_ty)
+                ty_display(&return_ty)
             ));
         }
     }
@@ -1870,6 +1882,10 @@ fn ty_compat(got: &Ty, expected: &Ty) -> bool {
     if got == expected {
         return true;
     }
+    // SelfTy in annotations: compatible with any Named type (resolved in impl context).
+    if matches!(expected, Ty::SelfTy) || matches!(got, Ty::SelfTy) {
+        return true;
+    }
     // Integer literal (I64) is compatible with any integer type.
     if got == &Ty::I64 && is_integer(expected) {
         return true;
@@ -1961,6 +1977,7 @@ pub fn ty_display(ty: &Ty) -> String {
         }
         Ty::Named(n) => n.clone(),
         Ty::DynTrait(t) => format!("dyn {t}"),
+        Ty::SelfTy => "Self".into(),
         Ty::Ref(inner) => format!("&{}", ty_display(inner)),
         Ty::RefMut(inner) => format!("&mut {}", ty_display(inner)),
         Ty::RawConst(inner) => format!("*const {}", ty_display(inner)),

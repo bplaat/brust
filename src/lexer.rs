@@ -30,6 +30,8 @@ pub enum TokenKind {
     Pub,
     Trait,
     Dyn,
+    Use,
+    Extern,
     // Identifiers and literals
     Ident(String),
     IntLit(i64),
@@ -139,6 +141,29 @@ impl Lexer {
             if self.src.get(self.pos..self.pos + 2) == Some(b"//") {
                 while self.peek().is_some_and(|c| c != b'\n') {
                     self.advance();
+                }
+            } else if self.peek() == Some(b'#') {
+                // Attribute: #[...] or #![...] -- skip entirely.
+                self.advance();
+                if self.peek() == Some(b'!') {
+                    self.advance();
+                }
+                if self.peek() == Some(b'[') {
+                    self.advance();
+                    let mut depth: usize = 1;
+                    loop {
+                        match self.advance() {
+                            Some(b'[') => depth += 1,
+                            Some(b']') => {
+                                depth -= 1;
+                                if depth == 0 {
+                                    break;
+                                }
+                            }
+                            None => break,
+                            _ => {}
+                        }
+                    }
                 }
             } else {
                 break;
@@ -511,6 +536,8 @@ impl Lexer {
             "pub" => TokenKind::Pub,
             "trait" => TokenKind::Trait,
             "dyn" => TokenKind::Dyn,
+            "use" => TokenKind::Use,
+            "extern" => TokenKind::Extern,
             _ => TokenKind::Ident(name),
         }
     }

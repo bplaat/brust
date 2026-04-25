@@ -2,6 +2,7 @@
 
 use crate::loc::Loc;
 
+
 /// A complete source file / compilation unit.
 pub struct File {
     pub items: Vec<Item>,
@@ -15,6 +16,8 @@ pub enum Item {
     Enum(EnumDecl),
     TypeAlias { name: String, ty: Ty },
     Mod { name: String, items: Vec<Item> },
+    /// Discarded item: `use ...;`, `extern crate ...;`, etc.
+    Skip,
 }
 
 #[derive(Clone)]
@@ -121,6 +124,7 @@ pub enum Ty {
     Unit,  // ()
     Str,   // &str (const char* in C)
     Never, // ! (diverging -- _Noreturn void in C)
+    SelfTy, // Self -- the implementing type in an impl/trait context
     // Compound types
     Array(Box<Ty>, usize),                   // [T; N]
     Slice(Box<Ty>),                          // &[T] (T* in C, no length tracking)
@@ -128,11 +132,47 @@ pub enum Ty {
     FnPtr { params: Vec<Ty>, ret: Box<Ty> }, // fn(T0, T1) -> Ret
     // User-defined and pointer types
     Named(String),     // user-defined struct/enum
-    DynTrait(String),  // dyn TraitName — fat pointer {data, vtable}
+    DynTrait(String),  // dyn TraitName -- fat pointer {data, vtable}
     Ref(Box<Ty>),      // &T
     RefMut(Box<Ty>),   // &mut T
     RawConst(Box<Ty>), // *const T
     RawMut(Box<Ty>),   // *mut T
+}
+
+impl Ty {
+    /// Replace all `SelfTy` occurrences with `Named(self_ty)` recursively.
+    pub fn resolve_self(&self, self_ty: &str) -> Self {
+        match self {
+            Ty::SelfTy => Ty::Named(self_ty.to_string()),
+            Ty::Ref(inner) => Ty::Ref(Box::new(inner.resolve_self(self_ty))),
+            Ty::RefMut(inner) => Ty::RefMut(Box::new(inner.resolve_self(self_ty))),
+            Ty::RawConst(inner) => Ty::RawConst(Box::new(inner.resolve_self(self_ty))),
+            Ty::RawMut(inner) => Ty::RawMut(Box::new(inner.resolve_self(self_ty))),
+            Ty::Slice(inner) => Ty::Slice(Box::new(inner.resolve_self(self_ty))),
+            Ty::Array(inner, n) => Ty::Array(Box::new(inner.resolve_self(self_ty)), *n),
+            Ty::Tuple(tys) => Ty::Tuple(tys.iter().map(|t| t.resolve_self(self_ty)).collect()),
+            Ty::FnPtr { params, ret } => Ty::FnPtr {
+                params: params.iter().map(|t| t.resolve_self(self_ty)).collect(),
+                ret: Box::new(ret.resolve_self(self_ty)),
+            },
+            other => other.clone(),
+        }
+    }
+
+    /// Returns true if this type contains `SelfTy` anywhere.
+    pub fn contains_self(&self) -> bool {
+        match self {
+            Ty::SelfTy => true,
+            Ty::Ref(inner) | Ty::RefMut(inner) | Ty::RawConst(inner) | Ty::RawMut(inner)
+            | Ty::Slice(inner) => inner.contains_self(),
+            Ty::Array(inner, _) => inner.contains_self(),
+            Ty::Tuple(tys) => tys.iter().any(|t| t.contains_self()),
+            Ty::FnPtr { params, ret } => {
+                params.iter().any(|t| t.contains_self()) || ret.contains_self()
+            }
+            _ => false,
+        }
+    }
 }
 
 pub struct Block {

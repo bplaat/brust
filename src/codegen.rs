@@ -173,10 +173,11 @@ fn collect_items(
             Item::Impl(imp) => {
                 let type_name = format!("{prefix}{}", imp.type_name);
                 for m in &imp.methods {
+                    let ret_ty = m.return_ty.resolve_self(&type_name);
                     if let Some(trait_name) = &imp.trait_name {
                         // Trait impl: trampoline symbol is TypeName__TraitName__method.
                         let trampoline = format!("{type_name}__{trait_name}__{}", m.name);
-                        fn_ret_tys.insert(trampoline.clone(), m.return_ty.clone());
+                        fn_ret_tys.insert(trampoline.clone(), ret_ty);
                         trait_method_trampolines
                             .entry(type_name.clone())
                             .or_default()
@@ -184,14 +185,14 @@ fn collect_items(
                     } else {
                         // Inherent impl: mangled as TypeName_method.
                         let mangled = format!("{type_name}_{}", m.name);
-                        if m.return_ty == Ty::Never {
+                        if ret_ty == Ty::Never {
                             never_fns.insert(mangled.clone());
                         }
                         fn_params.insert(
                             mangled.clone(),
-                            m.params.iter().map(|p| p.ty.clone()).collect(),
+                            m.params.iter().map(|p| p.ty.resolve_self(&type_name)).collect(),
                         );
-                        fn_ret_tys.insert(mangled.clone(), m.return_ty.clone());
+                        fn_ret_tys.insert(mangled.clone(), ret_ty);
                         if matches!(m.receiver, Some(Receiver::Value)) {
                             value_self_fns.insert(mangled);
                         }
@@ -329,10 +330,12 @@ impl Codegen {
                         // Trait impl: forward-declare trampolines.
                         for m in &imp.methods {
                             let trampoline = format!("{type_name}__{trait_name}__{}", m.name);
-                            let ret = ty_str(&m.return_ty);
+                            let ret = ty_str(&m.return_ty.resolve_self(&type_name));
                             let params: Vec<String> =
                                 std::iter::once("void* _self".to_string())
-                                    .chain(m.params.iter().map(|p| ty_str_decl(&p.ty, &p.name)))
+                                    .chain(m.params.iter().map(|p| {
+                                        ty_str_decl(&p.ty.resolve_self(&type_name), &p.name)
+                                    }))
                                     .collect();
                             self.out.push_str(&format!(
                                 "static {ret} {trampoline}({});\n",
@@ -382,7 +385,7 @@ impl Codegen {
                 } => {
                     self.emit_items(mod_items, &format!("{prefix}{name}_"));
                 }
-                Item::Struct(_) | Item::Enum(_) | Item::TypeAlias { .. } | Item::Trait(_) => {}
+                Item::Struct(_) | Item::Enum(_) | Item::TypeAlias { .. } | Item::Trait(_) | Item::Skip => {}
             }
         }
     }
@@ -512,10 +515,14 @@ impl Codegen {
         let mut params_env = HashMap::new();
         let mut params_var_types = HashMap::new();
         for p in &f.params {
-            if let Ty::Named(n) = &p.ty {
+            let ty = match impl_type {
+                Some(itype) => p.ty.resolve_self(itype),
+                None => p.ty.clone(),
+            };
+            if let Ty::Named(n) = &ty {
                 params_env.insert(p.name.clone(), n.clone());
             }
-            params_var_types.insert(p.name.clone(), p.ty.clone());
+            params_var_types.insert(p.name.clone(), ty);
         }
 
         let mut ctx = match (&f.receiver, impl_type) {
@@ -526,7 +533,10 @@ impl Codegen {
             },
         };
         ctx.var_types = params_var_types;
-        ctx.return_ty = Some(f.return_ty.clone());
+        ctx.return_ty = Some(match impl_type {
+            Some(itype) => f.return_ty.resolve_self(itype),
+            None => f.return_ty.clone(),
+        });
         ctx.fn_ret_tys = self.fn_ret_tys.clone();
         ctx.type_aliases = self.type_aliases.clone();
         ctx.value_self_fns = self.value_self_fns.clone();
@@ -549,9 +559,12 @@ impl Codegen {
     fn emit_trait_impl(&mut self, imp: &ImplBlock, type_name: &str, trait_name: &str) {
         for m in &imp.methods {
             let trampoline = format!("{type_name}__{trait_name}__{}", m.name);
-            let ret = ty_str(&m.return_ty);
+            let ret_ty = m.return_ty.resolve_self(type_name);
+            let ret = ty_str(&ret_ty);
             let params: Vec<String> = std::iter::once("void* _self".to_string())
-                .chain(m.params.iter().map(|p| ty_str_decl(&p.ty, &p.name)))
+                .chain(m.params.iter().map(|p| {
+                    ty_str_decl(&p.ty.resolve_self(type_name), &p.name)
+                }))
                 .collect();
             self.out.push_str(&format!(
                 "static {ret} {trampoline}({}) {{\n",
@@ -567,14 +580,15 @@ impl Codegen {
             let mut params_env = HashMap::new();
             let mut params_var_types = HashMap::new();
             for p in &m.params {
-                if let Ty::Named(n) = &p.ty {
+                let ty = p.ty.resolve_self(type_name);
+                if let Ty::Named(n) = &ty {
                     params_env.insert(p.name.clone(), n.clone());
                 }
-                params_var_types.insert(p.name.clone(), p.ty.clone());
+                params_var_types.insert(p.name.clone(), ty);
             }
             let mut ctx = Ctx::for_method(type_name, &Receiver::Ref, params_env);
             ctx.var_types = params_var_types;
-            ctx.return_ty = Some(m.return_ty.clone());
+            ctx.return_ty = Some(ret_ty);
             ctx.fn_ret_tys = self.fn_ret_tys.clone();
             ctx.type_aliases = self.type_aliases.clone();
             ctx.value_self_fns = self.value_self_fns.clone();
@@ -590,7 +604,20 @@ impl Codegen {
         ));
         for m in &imp.methods {
             let trampoline = format!("{type_name}__{trait_name}__{}", m.name);
-            self.out.push_str(&format!("    .{} = {trampoline},\n", m.name));
+            // Cast is needed when the trampoline's signature differs from the vtable's
+            // (e.g. the vtable uses void* for Self but the trampoline uses the concrete type).
+            let needs_cast = m.return_ty.contains_self()
+                || m.params.iter().any(|p| p.ty.contains_self());
+            if needs_cast {
+                let vtable_ret = ty_str(&m.return_ty);
+                let vtable_params: Vec<String> = std::iter::once("void*".to_string())
+                    .chain(m.params.iter().map(|p| ty_str(&p.ty)))
+                    .collect();
+                let cast = format!("({vtable_ret} (*)({}))", vtable_params.join(", "));
+                self.out.push_str(&format!("    .{} = {cast}{trampoline},\n", m.name));
+            } else {
+                self.out.push_str(&format!("    .{} = {trampoline},\n", m.name));
+            }
         }
         self.out.push_str("};\n\n");
     }
@@ -1514,7 +1541,7 @@ fn collect_tuple_types(file: &File) -> Vec<Vec<Ty>> {
                 }
             }
             Item::TypeAlias { ty, .. } => scan_ty(ty, &mut found),
-            Item::Trait(_) => {}
+            Item::Trait(_) | Item::Skip => {}
             Item::Mod {
                 items: mod_items, ..
             } => {
@@ -1718,6 +1745,8 @@ fn ty_str(ty: &Ty) -> String {
         }
         Ty::Named(n) => n.clone(),
         Ty::DynTrait(t) => format!("dyn_{t}"),
+        // SelfTy should be resolved before reaching ty_str; fall back to void* as safe default.
+        Ty::SelfTy => "void*".to_string(),
         Ty::Tuple(tys) => tuple_typedef_name(tys),
         Ty::Ref(inner) => format!("const {}*", ty_str(inner)),
         Ty::RefMut(inner) => format!("{}*", ty_str(inner)),
@@ -1771,6 +1800,7 @@ fn ty_key(ty: &Ty) -> String {
         }
         Ty::Named(n) => n.clone(),
         Ty::DynTrait(t) => format!("dyn_{t}"),
+        Ty::SelfTy => "Self".into(),
         Ty::Tuple(tys) => format!("({})", tys.iter().map(ty_key).collect::<Vec<_>>().join("_")),
         Ty::Ref(inner) => format!("ref_{}", ty_key(inner)),
         Ty::RefMut(inner) => format!("refmut_{}", ty_key(inner)),
@@ -1809,12 +1839,12 @@ fn fn_signature(f: &FnDecl, impl_type: Option<&str>, prefix: &str) -> String {
         return "int main(void)".to_string();
     }
 
-    let noreturn = if f.return_ty == Ty::Never {
-        "_Noreturn "
-    } else {
-        ""
+    let ret_ty = match impl_type {
+        Some(itype) => f.return_ty.resolve_self(itype),
+        None => f.return_ty.clone(),
     };
-    let ret = ty_str(&f.return_ty);
+    let noreturn = if ret_ty == Ty::Never { "_Noreturn " } else { "" };
+    let ret = ty_str(&ret_ty);
     let mut param_parts: Vec<String> = Vec::new();
 
     if let (Some(recv), Some(itype)) = (&f.receiver, impl_type) {
@@ -1826,7 +1856,11 @@ fn fn_signature(f: &FnDecl, impl_type: Option<&str>, prefix: &str) -> String {
         param_parts.push(self_param);
     }
     for p in &f.params {
-        param_parts.push(ty_str_decl(&p.ty, &p.name));
+        let ty = match impl_type {
+            Some(itype) => p.ty.resolve_self(itype),
+            None => p.ty.clone(),
+        };
+        param_parts.push(ty_str_decl(&ty, &p.name));
     }
     let params = if param_parts.is_empty() {
         "void".to_string()

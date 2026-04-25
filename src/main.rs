@@ -28,7 +28,7 @@ fn main() {
     });
 
     // Parse
-    let file = parser::Parser::new(tokens).parse().unwrap_or_else(|e| {
+    let file = parser::Parser::new(tokens).parse_file().unwrap_or_else(|e| {
         eprintln!("{}", e);
         process::exit(1);
     });
