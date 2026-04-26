@@ -723,10 +723,8 @@ impl Codegen {
                     let decl = ty_str_decl(t, name);
                     self.out.push_str(&format!("{p}{kw}{decl} = {val};\n"));
                 } else {
-                    // Fallback (should not happen after type checking)
-                    let kw = if *mutable { "" } else { "const " };
-                    self.out
-                        .push_str(&format!("{p}{kw}__auto_type {name} = {val};\n"));
+                    // Should not happen: type checker always fills in let type.
+                    unreachable!("StmtKind::Let has no type after type checking");
                 }
             }
 
@@ -817,7 +815,12 @@ impl Codegen {
                 self.out.push_str(&format!("{p}}}\n"));
             }
 
-            StmtKind::For { var, iter, body } => {
+            StmtKind::For {
+                var,
+                iter,
+                body,
+                elem_ty,
+            } => {
                 let p1 = "    ".repeat(indent + 1);
                 // `for i in lo..hi` -- emit as a numeric C for-loop.
                 if let ExprKind::Range { start, end } = &iter.kind {
@@ -838,8 +841,9 @@ impl Codegen {
                     self.out.push_str(&format!(
                         "{p}for (size_t _brust_i = 0; _brust_i < sizeof({iter_s})/sizeof({iter_s}[0]); _brust_i++) {{\n"
                     ));
+                    let decl = typed_or_auto_decl(elem_ty.as_ref(), var);
                     self.out
-                        .push_str(&format!("{p1}__auto_type {var} = {iter_s}[_brust_i];\n"));
+                        .push_str(&format!("{p1}{decl} = {iter_s}[_brust_i];\n"));
                 }
                 for s in &body.stmts {
                     self.emit_stmt(s, ctx, indent + 1);
@@ -887,11 +891,16 @@ impl Codegen {
                 expr,
                 then_block,
                 else_block,
+                expr_ty,
             } => {
-                self.emit_if_let(pat, expr, then_block, else_block, ctx, indent);
+                self.emit_if_let(pat, expr, expr_ty.as_ref(), then_block, else_block, ctx, indent);
             }
 
-            StmtKind::Match { expr, arms } => self.emit_match(expr, arms, ctx, indent),
+            StmtKind::Match {
+                expr,
+                arms,
+                scrutinee_ty,
+            } => self.emit_match(expr, arms, ctx, indent, scrutinee_ty.as_ref()),
 
             StmtKind::Expr(expr) => {
                 if let ExprKind::BinOp {
@@ -930,10 +939,11 @@ impl Codegen {
                 } else if let ExprKind::Match {
                     expr: match_expr,
                     arms,
+                    ..
                 } = &expr.kind
                 {
                     // match expression used as a statement: emit as proper C switch.
-                    self.emit_match(match_expr, arms, ctx, indent);
+                    self.emit_match(match_expr, arms, ctx, indent, None);
                 } else {
                     let s = self.emit_expr(expr, ctx);
                     self.out.push_str(&format!("{p}{s};\n"));
@@ -975,6 +985,7 @@ impl Codegen {
         &mut self,
         pat: &Pat,
         expr: &Expr,
+        expr_ty: Option<&Ty>,
         then_block: &Block,
         else_block: &Option<Block>,
         ctx: &mut Ctx,
@@ -1082,9 +1093,10 @@ impl Codegen {
             }
             Pat::Binding(name) => {
                 // Binding pattern always matches; bind value in block.
+                let decl = typed_or_auto_decl(expr_ty, name);
                 self.out.push_str(&format!("{p}{{\n"));
                 self.out
-                    .push_str(&format!("{ip}__auto_type {name} = {expr_s};\n"));
+                    .push_str(&format!("{ip}{decl} = {expr_s};\n"));
                 for s in &then_block.stmts {
                     self.emit_stmt(s, ctx, indent + 1);
                 }
@@ -1101,13 +1113,15 @@ impl Codegen {
         enum_decl: &Option<EnumDecl>,
         bp: &str,
         arm_ctx: &mut Ctx,
+        scrutinee_ty: Option<&Ty>,
     ) {
         // Only EnumVariant patterns introduce bindings.
         let (_type_name, variant, bindings) = match pat {
             Pat::Binding(name) => {
                 // Bind the whole matched value to `name`.
+                let decl = typed_or_auto_decl(scrutinee_ty, name);
                 self.out
-                    .push_str(&format!("{bp}__auto_type {name} = {match_var};\n"));
+                    .push_str(&format!("{bp}{decl} = {match_var};\n"));
                 return;
             }
             Pat::EnumVariant {
@@ -1178,13 +1192,15 @@ impl Codegen {
         arms: &[MatchArm],
         ctx: &mut Ctx,
         indent: usize,
+        scrutinee_ty: Option<&Ty>,
     ) {
         let p = pad(indent);
         let ip = pad(indent + 1);
         // Materialize scrutinee once.
         let expr_s = self.emit_expr(expr, ctx);
+        let ms_decl = typed_or_auto_decl(scrutinee_ty, "_ms");
         self.out
-            .push_str(&format!("{p}__auto_type _ms = {expr_s};\n"));
+            .push_str(&format!("{p}{ms_decl} = {expr_s};\n"));
 
         for (i, arm) in arms.iter().enumerate() {
             let mut arm_ctx = ctx.clone();
@@ -1193,13 +1209,15 @@ impl Codegen {
             match (&arm.pat, &arm.guard) {
                 // Binding pattern with guard: use GNU stmt expr for condition
                 (Pat::Binding(name), Some(guard)) => {
-                    // Condition: ({ __auto_type name = _ms; guard_expr; })
+                    // Condition: ({ TYPE name = _ms; guard_expr; })
                     arm_ctx.type_env.insert(name.clone(), "i64".to_string());
                     let gs = self.emit_expr(guard, &mut arm_ctx);
-                    let cond = format!("({{ __auto_type {name} = _ms; {gs}; }})");
+                    let cond_decl = typed_or_auto_decl(scrutinee_ty, name);
+                    let cond = format!("({{ {cond_decl} = _ms; {gs}; }})");
                     self.out.push_str(&format!("{p}{keyword} ({cond}) {{\n"));
+                    let body_decl = typed_or_auto_decl(scrutinee_ty, name);
                     self.out
-                        .push_str(&format!("{ip}__auto_type {name} = _ms;\n"));
+                        .push_str(&format!("{ip}{body_decl} = _ms;\n"));
                     for s in &arm.body.stmts {
                         self.emit_stmt(s, &mut arm_ctx, indent + 1);
                     }
@@ -1208,7 +1226,7 @@ impl Codegen {
                 // Wildcard/binding without guard: always matches
                 (Pat::Wildcard, None) | (Pat::Binding(_), None) => {
                     let decl = if let Pat::Binding(name) = &arm.pat {
-                        Some(format!("{ip}__auto_type {name} = _ms;\n"))
+                        Some(format!("{ip}{} = _ms;\n", typed_or_auto_decl(scrutinee_ty, name)))
                     } else {
                         None
                     };
@@ -1261,7 +1279,7 @@ impl Codegen {
                     };
                     self.out
                         .push_str(&format!("{p}{keyword} ({full_cond}) {{\n"));
-                    self.emit_match_arm_bindings(pat, "_ms", false, &None, &ip, &mut arm_ctx);
+                    self.emit_match_arm_bindings(pat, "_ms", false, &None, &ip, &mut arm_ctx, scrutinee_ty);
                     for s in &arm.body.stmts {
                         self.emit_stmt(s, &mut arm_ctx, indent + 1);
                     }
@@ -1271,11 +1289,11 @@ impl Codegen {
         }
     }
 
-    fn emit_match(&mut self, expr: &Expr, arms: &[MatchArm], ctx: &mut Ctx, indent: usize) {
+    fn emit_match(&mut self, expr: &Expr, arms: &[MatchArm], ctx: &mut Ctx, indent: usize, scrutinee_ty: Option<&Ty>) {
         // When any arm uses a binding pattern, C switch can't express it — use if-else chain.
         let needs_if_chain = arms.iter().any(|a| matches!(&a.pat, Pat::Binding(_)));
         if needs_if_chain {
-            self.emit_match_if_chain(expr, arms, ctx, indent);
+            self.emit_match_if_chain(expr, arms, ctx, indent, scrutinee_ty);
             return;
         }
 
@@ -1378,6 +1396,7 @@ impl Codegen {
                     &enum_decl,
                     &bp,
                     &mut arm_ctx,
+                    None,
                 );
                 for s in &arm.body.stmts {
                     self.emit_stmt(s, &mut arm_ctx, indent + 2);
@@ -1448,6 +1467,7 @@ impl Codegen {
                 &enum_decl,
                 &bp,
                 &mut arm_ctx,
+                None,
             );
             for s in &arm.body.stmts {
                 self.emit_stmt(s, &mut arm_ctx, indent + 2);
@@ -1504,7 +1524,7 @@ impl Codegen {
                     .unwrap_or_else(|| "(void)0".to_string());
                 format!("(({cond_s}) ? ({then_s}) : ({else_s}))")
             }
-            StmtKind::Match { expr, arms } => self.emit_match_as_expr(expr, arms, ctx),
+            StmtKind::Match { expr, arms, .. } => self.emit_match_as_expr(expr, arms, ctx),
             _ => "(void)0".to_string(),
         }
     }
@@ -2050,9 +2070,9 @@ impl Codegen {
                 format!("(({cond_s}) ? ({then_s}) : ({else_s}))")
             }
 
-            ExprKind::Match { expr, arms } => self.emit_match_as_expr(expr, arms, ctx),
+            ExprKind::Match { expr, arms, .. } => self.emit_match_as_expr(expr, arms, ctx),
 
-            ExprKind::Loop(body) => {
+            ExprKind::Loop { body, result_ty } => {
                 // `loop { ... }` as expression: use GNU statement expr with result variable.
                 // `break val` inside stores val into `_lv`, then `break`.
                 let saved = std::mem::take(&mut self.out);
@@ -2064,7 +2084,9 @@ impl Codegen {
                 let inner = std::mem::take(&mut self.out);
                 self.out = saved;
                 let inner = inner.trim_end().to_string();
-                format!("({{ __auto_type _lv = 0; for (;;) {{ {inner} }} _lv; }})")
+                let decl = typed_or_auto_decl(result_ty.as_ref(), "_lv");
+                let init = result_ty.as_ref().map(zero_init).unwrap_or("0");
+                format!("({{ {decl} = {init}; for (;;) {{ {inner} }} _lv; }})")
             }
         }
     }
@@ -2329,7 +2351,7 @@ fn scan_block(block: &crate::ast::Block, found: &mut Vec<Vec<Ty>>) {
                 scan_expr(cond, None, found);
                 scan_block(body, found);
             }
-            StmtKind::Match { expr, arms } => {
+            StmtKind::Match { expr, arms, .. } => {
                 scan_expr(expr, None, found);
                 for arm in arms {
                     scan_block(&arm.body, found);
@@ -2423,13 +2445,13 @@ fn scan_expr(expr: &Expr, hint: Option<&Ty>, found: &mut Vec<Vec<Ty>>) {
                 scan_block(b, found);
             }
         }
-        ExprKind::Match { expr, arms } => {
+        ExprKind::Match { expr, arms, .. } => {
             scan_expr(expr, None, found);
             for arm in arms {
                 scan_block(&arm.body, found);
             }
         }
-        ExprKind::Loop(block) => scan_block(block, found),
+        ExprKind::Loop { body: block, .. } => scan_block(block, found),
         _ => {}
     }
 }
@@ -2437,6 +2459,24 @@ fn scan_expr(expr: &Expr, hint: Option<&Ty>, found: &mut Vec<Vec<Ty>>) {
 // ---------------------------------------------------------------------------
 // Helpers: type strings, signatures, padding
 // ---------------------------------------------------------------------------
+
+/// Return a typed C declaration "TYPE name", or fall back to "__auto_type name"
+/// for types that cannot be used as a direct r-value in C (arrays/slices/None).
+fn typed_or_auto_decl(ty: Option<&Ty>, name: &str) -> String {
+    match ty {
+        Some(t) if !matches!(t, Ty::Array(_, _) | Ty::Slice(_)) => ty_str_decl(t, name),
+        _ => format!("__auto_type {name}"),
+    }
+}
+
+/// Return the appropriate C zero-initializer literal for a type.
+/// Aggregate types need `{0}`; scalars and pointers use `0`.
+fn zero_init(ty: &Ty) -> &'static str {
+    match ty {
+        Ty::Named(_) | Ty::Tuple(_) | Ty::Array(_, _) => "{0}",
+        _ => "0",
+    }
+}
 
 fn ty_str(ty: &Ty) -> String {
     match ty {

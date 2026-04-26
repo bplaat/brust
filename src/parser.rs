@@ -1316,6 +1316,7 @@ impl Parser {
                 kind: StmtKind::IfLet {
                     pat,
                     expr,
+                    expr_ty: None,
                     then_block,
                     else_block,
                 },
@@ -1364,7 +1365,7 @@ impl Parser {
         let iter = self.parse_expr()?;
         let body = self.parse_block()?;
         Ok(Stmt {
-            kind: StmtKind::For { var, iter, body },
+            kind: StmtKind::For { var, iter, body, elem_ty: None },
             loc,
         })
     }
@@ -1404,7 +1405,7 @@ impl Parser {
         }
         self.expect(&TokenKind::RBrace)?;
         Ok(Stmt {
-            kind: StmtKind::Match { expr, arms },
+            kind: StmtKind::Match { expr, arms, scrutinee_ty: None },
             loc,
         })
     }
@@ -2409,6 +2410,7 @@ impl Parser {
                     kind: ExprKind::Match {
                         expr: Box::new(expr),
                         arms,
+                        scrutinee_ty: None,
                     },
                     loc,
                 })
@@ -2417,7 +2419,7 @@ impl Parser {
                 self.advance(); // consume `loop`
                 let block = self.parse_block()?;
                 Ok(Expr {
-                    kind: ExprKind::Loop(block),
+                    kind: ExprKind::Loop { body: block, result_ty: None },
                     loc,
                 })
             }
