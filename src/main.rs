@@ -68,7 +68,12 @@ fn main() {
     // Compile C -> binary using $CC or cc.
     let cc = env::var("CC").unwrap_or_else(|_| "cc".to_string());
     let status = process::Command::new(&cc)
-        .args([c_path.to_str().unwrap(), "-o", bin_path.to_str().unwrap()])
+        .args([
+            c_path.to_str().unwrap(),
+            "-o",
+            bin_path.to_str().unwrap(),
+            "-w", // suppress warnings from generated C
+        ])
         .status()
         .unwrap_or_else(|e| {
             eprintln!("error: cannot run '{}': {}", cc, e);

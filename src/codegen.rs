@@ -1,6 +1,7 @@
 use crate::ast::{
-    BinOp, Block, EnumDecl, EnumVariant, Expr, ExprKind, File, FnDecl, ImplBlock, Item, MatchArm,
-    Pat, PatBindings, Receiver, Stmt, StmtKind, StructDecl, TraitDecl, Ty, UnOp, VariantFields,
+    BinOp, Block, EnumDecl, EnumVariant, Expr, ExprKind, ExternFnDecl, File, FnDecl, ImplBlock,
+    Item, MatchArm, Pat, PatBindings, Receiver, Stmt, StmtKind, StructDecl, TraitDecl, Ty, UnOp,
+    VariantFields,
 };
 use std::collections::HashMap;
 
@@ -365,6 +366,12 @@ impl Codegen {
                 } => {
                     self.emit_forward_decls(mod_items, &format!("{prefix}{name}_"));
                 }
+                Item::ExternBlock(fns) => {
+                    for f in fns {
+                        self.out.push_str(&extern_fn_decl(f));
+                        self.out.push('\n');
+                    }
+                }
                 _ => {}
             }
         }
@@ -397,6 +404,7 @@ impl Codegen {
                 | Item::Enum(_)
                 | Item::TypeAlias { .. }
                 | Item::Trait(_)
+                | Item::ExternBlock(_)
                 | Item::Skip => {}
             }
         }
@@ -818,8 +826,14 @@ impl Codegen {
                     self.out.push_str(&format!("{p}{ls} = {rs};\n"));
                 } else if let ExprKind::Unsafe(block) = &expr.kind {
                     // `unsafe { ... }` as a statement: emit the inner statements directly.
+                    // Inner implicit-return stmts (tail expressions) become bare expr stmts.
                     for s in &block.stmts {
-                        self.emit_stmt(s, ctx, indent);
+                        if let StmtKind::Return(Some(inner)) = &s.kind {
+                            let val = self.emit_expr(inner, ctx);
+                            self.out.push_str(&format!("{p}{val};\n"));
+                        } else {
+                            self.emit_stmt(s, ctx, indent);
+                        }
                     }
                 } else {
                     let s = self.emit_expr(expr, ctx);
@@ -1069,6 +1083,7 @@ impl Codegen {
                         '\n' => out.push_str("\\n"),
                         '\t' => out.push_str("\\t"),
                         '\r' => out.push_str("\\r"),
+                        '\0' => out.push_str("\\0"),
                         c => out.push(c),
                     }
                 }
@@ -1556,7 +1571,7 @@ fn collect_tuple_types(file: &File) -> Vec<Vec<Ty>> {
                 }
             }
             Item::TypeAlias { ty, .. } => scan_ty(ty, &mut found),
-            Item::Trait(_) | Item::Skip => {}
+            Item::Trait(_) | Item::Skip | Item::ExternBlock(_) => {}
             Item::Mod {
                 items: mod_items, ..
             } => {
@@ -1851,6 +1866,31 @@ fn emit_struct(out: &mut String, s: &StructDecl, prefix: &str) {
         out.push_str(&format!("    {};\n", ty_str_decl(&f.ty, &f.name)));
     }
     out.push_str(&format!("}} {name};\n"));
+}
+
+/// Emit a C extern declaration for an `extern "C"` fn.
+/// The symbol name is the raw C name (never mangled).
+fn extern_fn_decl(f: &ExternFnDecl) -> String {
+    let noreturn = if f.return_ty == Ty::Never {
+        "_Noreturn "
+    } else {
+        ""
+    };
+    let ret = ty_str(&f.return_ty);
+    let mut param_parts: Vec<String> = f
+        .params
+        .iter()
+        .map(|p| ty_str_decl(&p.ty, &p.name))
+        .collect();
+    if f.is_variadic {
+        param_parts.push("...".to_string());
+    }
+    let params = if param_parts.is_empty() {
+        if f.is_variadic { "...".to_string() } else { "void".to_string() }
+    } else {
+        param_parts.join(", ")
+    };
+    format!("extern {noreturn}{ret} {}({params});", f.name)
 }
 
 fn fn_signature(f: &FnDecl, impl_type: Option<&str>, prefix: &str) -> String {

@@ -73,6 +73,7 @@ pub enum TokenKind {
     Comma,
     Dot,
     DotDot,
+    DotDotDot,
     Colon,
     ColonColon,
     Eq,
@@ -224,7 +225,12 @@ impl Lexer {
                 self.advance();
                 if self.peek() == Some(b'.') {
                     self.advance();
-                    TokenKind::DotDot
+                    if self.peek() == Some(b'.') {
+                        self.advance();
+                        TokenKind::DotDotDot
+                    } else {
+                        TokenKind::DotDot
+                    }
                 } else {
                     TokenKind::Dot
                 }
@@ -360,9 +366,11 @@ impl Lexer {
                 Some(b'\\') => match self.advance() {
                     Some(b'n') => s.push('\n'),
                     Some(b't') => s.push('\t'),
+                    Some(b'r') => s.push('\r'),
                     Some(b'\\') => s.push('\\'),
                     Some(b'"') => s.push('"'),
-                    Some(c) => s.push(c as char),
+                    Some(b'0') => s.push('\0'),
+                    Some(c) => return Err(Error::new(loc, format!("unknown escape '\\{}'", c as char))),
                     None => return Err(Error::new(loc, "unterminated escape sequence")),
                 },
                 Some(c) => s.push(c as char),
