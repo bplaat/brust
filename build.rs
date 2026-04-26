@@ -1,5 +1,5 @@
 // build.rs — generate one #[test] fn per .rs file in tests/suite/ and
-// tests/suite/errors/.
+// tests/suite/errors/, and one per directory containing main.rs.
 //
 // The generated file is written to $OUT_DIR/suite_tests.rs and included by
 // tests/run_tests.rs. This gives cargo test a separate, parallel test entry
@@ -19,15 +19,38 @@ fn main() {
         let Ok(read_dir) = fs::read_dir(suite) else {
             continue;
         };
-        let mut entries: Vec<_> = read_dir
-            .filter_map(|e| e.ok())
-            .filter(|e| e.path().extension().is_some_and(|x| x == "rs"))
-            .collect();
+        let mut entries: Vec<_> = read_dir.filter_map(|e| e.ok()).collect();
         entries.sort_by_key(|e| e.file_name());
 
         for entry in &entries {
             let path = entry.path();
             println!("cargo:rerun-if-changed={}", path.display());
+
+            // Directory with main.rs — a multi-file module test.
+            if path.is_dir() {
+                let main_rs = path.join("main.rs");
+                if main_rs.exists() {
+                    let stem = path.file_stem().unwrap().to_string_lossy();
+                    let sanitized: String = stem
+                        .chars()
+                        .map(|c| if c.is_alphanumeric() { c } else { '_' })
+                        .collect();
+                    let fn_name = if sanitized.chars().next().is_none_or(|c| c.is_ascii_digit()) {
+                        format!("t_{sanitized}")
+                    } else {
+                        sanitized
+                    };
+                    code.push_str(&format!(
+                        "\n#[test]\nfn {fn_name}() {{\n    run_test(\"{}\");\n}}\n",
+                        main_rs.display()
+                    ));
+                }
+                continue;
+            }
+
+            if path.extension().is_none_or(|x| x != "rs") {
+                continue;
+            }
 
             let stem = path.file_stem().unwrap().to_string_lossy();
             // Build a valid Rust identifier from the stem. Digits-first stems

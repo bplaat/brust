@@ -127,7 +127,7 @@ pub fn generate(file: &File) -> String {
 
 fn collect_type_aliases(items: &[Item], aliases: &mut HashMap<String, Ty>) {
     for item in items {
-        if let Item::TypeAlias { name, ty } = item {
+        if let Item::TypeAlias { name, ty, .. } = item {
             aliases.insert(name.clone(), ty.clone());
         }
     }
@@ -140,7 +140,9 @@ fn collect_traits(items: &[Item], traits: &mut HashMap<String, TraitDecl>) {
             Item::Trait(t) => {
                 traits.insert(t.name.clone(), t.clone());
             }
-            Item::Mod { items: mod_items, .. } => collect_traits(mod_items, traits),
+            Item::Mod {
+                items: mod_items, ..
+            } => collect_traits(mod_items, traits),
             _ => {}
         }
     }
@@ -190,7 +192,10 @@ fn collect_items(
                         }
                         fn_params.insert(
                             mangled.clone(),
-                            m.params.iter().map(|p| p.ty.resolve_self(&type_name)).collect(),
+                            m.params
+                                .iter()
+                                .map(|p| p.ty.resolve_self(&type_name))
+                                .collect(),
                         );
                         fn_ret_tys.insert(mangled.clone(), ret_ty);
                         if matches!(m.receiver, Some(Receiver::Value)) {
@@ -208,6 +213,7 @@ fn collect_items(
             Item::Mod {
                 name,
                 items: mod_items,
+                ..
             } => {
                 collect_items(
                     mod_items,
@@ -255,7 +261,7 @@ impl Codegen {
     fn emit_type_defs(&mut self, items: &[Item], prefix: &str) {
         for item in items {
             match item {
-                Item::TypeAlias { name, ty } => {
+                Item::TypeAlias { name, ty, .. } => {
                     self.out.push('\n');
                     let prefixed = format!("{prefix}{name}");
                     let decl = ty_str_decl(ty, &prefixed);
@@ -272,6 +278,7 @@ impl Codegen {
                 Item::Mod {
                     name,
                     items: mod_items,
+                    ..
                 } => {
                     self.emit_type_defs(mod_items, &format!("{prefix}{name}_"));
                 }
@@ -288,7 +295,7 @@ impl Codegen {
                 Item::Trait(t) => {
                     let full = format!("{prefix}{}", t.name);
                     // Vtable struct: one function-pointer field per method.
-                self.out.push_str("\ntypedef struct {\n");
+                    self.out.push_str("\ntypedef struct {\n");
                     for m in &t.methods {
                         let ret = ty_str(&m.return_ty);
                         let params: Vec<String> = std::iter::once("void* _self".to_string())
@@ -309,6 +316,7 @@ impl Codegen {
                 Item::Mod {
                     name,
                     items: mod_items,
+                    ..
                 } => {
                     self.emit_trait_type_defs(mod_items, &format!("{prefix}{name}_"));
                 }
@@ -345,16 +353,15 @@ impl Codegen {
                     } else {
                         // Inherent impl: forward-declare under TypeName_method.
                         for m in &imp.methods {
-                            self.out.push_str(&format!(
-                                "{};\n",
-                                fn_signature(m, Some(&type_name), "")
-                            ));
+                            self.out
+                                .push_str(&format!("{};\n", fn_signature(m, Some(&type_name), "")));
                         }
                     }
                 }
                 Item::Mod {
                     name,
                     items: mod_items,
+                    ..
                 } => {
                     self.emit_forward_decls(mod_items, &format!("{prefix}{name}_"));
                 }
@@ -382,10 +389,15 @@ impl Codegen {
                 Item::Mod {
                     name,
                     items: mod_items,
+                    ..
                 } => {
                     self.emit_items(mod_items, &format!("{prefix}{name}_"));
                 }
-                Item::Struct(_) | Item::Enum(_) | Item::TypeAlias { .. } | Item::Trait(_) | Item::Skip => {}
+                Item::Struct(_)
+                | Item::Enum(_)
+                | Item::TypeAlias { .. }
+                | Item::Trait(_)
+                | Item::Skip => {}
             }
         }
     }
@@ -562,16 +574,22 @@ impl Codegen {
             let ret_ty = m.return_ty.resolve_self(type_name);
             let ret = ty_str(&ret_ty);
             let params: Vec<String> = std::iter::once("void* _self".to_string())
-                .chain(m.params.iter().map(|p| {
-                    ty_str_decl(&p.ty.resolve_self(type_name), &p.name)
-                }))
+                .chain(
+                    m.params
+                        .iter()
+                        .map(|p| ty_str_decl(&p.ty.resolve_self(type_name), &p.name)),
+                )
                 .collect();
             self.out.push_str(&format!(
                 "static {ret} {trampoline}({}) {{\n",
                 params.join(", ")
             ));
             // Always use pointer-to-struct for self inside the trampoline.
-            let const_kw = if matches!(m.receiver, Some(Receiver::Ref)) { "const " } else { "" };
+            let const_kw = if matches!(m.receiver, Some(Receiver::Ref)) {
+                "const "
+            } else {
+                ""
+            };
             self.out.push_str(&format!(
                 "    {const_kw}{type_name}* self = ({const_kw}{type_name}*)_self;\n"
             ));
@@ -606,17 +624,19 @@ impl Codegen {
             let trampoline = format!("{type_name}__{trait_name}__{}", m.name);
             // Cast is needed when the trampoline's signature differs from the vtable's
             // (e.g. the vtable uses void* for Self but the trampoline uses the concrete type).
-            let needs_cast = m.return_ty.contains_self()
-                || m.params.iter().any(|p| p.ty.contains_self());
+            let needs_cast =
+                m.return_ty.contains_self() || m.params.iter().any(|p| p.ty.contains_self());
             if needs_cast {
                 let vtable_ret = ty_str(&m.return_ty);
                 let vtable_params: Vec<String> = std::iter::once("void*".to_string())
                     .chain(m.params.iter().map(|p| ty_str(&p.ty)))
                     .collect();
                 let cast = format!("({vtable_ret} (*)({}))", vtable_params.join(", "));
-                self.out.push_str(&format!("    .{} = {cast}{trampoline},\n", m.name));
+                self.out
+                    .push_str(&format!("    .{} = {cast}{trampoline},\n", m.name));
             } else {
-                self.out.push_str(&format!("    .{} = {trampoline},\n", m.name));
+                self.out
+                    .push_str(&format!("    .{} = {trampoline},\n", m.name));
             }
         }
         self.out.push_str("};\n\n");
@@ -766,9 +786,8 @@ impl Codegen {
                     self.out.push_str(&format!(
                         "{p}for (size_t _brust_i = 0; _brust_i < sizeof({iter_s})/sizeof({iter_s}[0]); _brust_i++) {{\n"
                     ));
-                    self.out.push_str(&format!(
-                        "{p1}__auto_type {var} = {iter_s}[_brust_i];\n"
-                    ));
+                    self.out
+                        .push_str(&format!("{p1}__auto_type {var} = {iter_s}[_brust_i];\n"));
                 }
                 for s in &body.stmts {
                     self.emit_stmt(s, ctx, indent + 1);
@@ -1199,8 +1218,7 @@ impl Codegen {
                 if let ExprKind::Var(n) = &expr.kind
                     && let Some(Ty::DynTrait(_)) = ctx.var_types.get(n.as_str())
                 {
-                    let args_s: Vec<String> =
-                        args.iter().map(|a| self.emit_expr(a, ctx)).collect();
+                    let args_s: Vec<String> = args.iter().map(|a| self.emit_expr(a, ctx)).collect();
                     return if args_s.is_empty() {
                         format!("{n}.vtable->{method}({n}.data)")
                     } else {
@@ -1242,14 +1260,13 @@ impl Codegen {
                             .cloned()
                         {
                             // Trait impl method on concrete type — call trampoline with void* cast.
-                            let self_ptr =
-                                if matches!(&expr.kind, ExprKind::Var(n) if n == "self")
-                                    && ctx.ref_self
-                                {
-                                    format!("(void*){expr_c}")
-                                } else {
-                                    format!("(void*)&({expr_c})")
-                                };
+                            let self_ptr = if matches!(&expr.kind, ExprKind::Var(n) if n == "self")
+                                && ctx.ref_self
+                            {
+                                format!("(void*){expr_c}")
+                            } else {
+                                format!("(void*)&({expr_c})")
+                            };
                             if args_s.is_empty() {
                                 format!("{trampoline}({self_ptr})")
                             } else {
@@ -1329,9 +1346,7 @@ impl Codegen {
                     let expr_c = self.emit_expr(expr, ctx);
                     if let Some(type_name) = concrete {
                         let vtable = format!("{type_name}__{trait_name}__vtable");
-                        format!(
-                            "(dyn_{trait_name}){{.data=(void*)({expr_c}), .vtable=&{vtable}}}"
-                        )
+                        format!("(dyn_{trait_name}){{.data=(void*)({expr_c}), .vtable=&{vtable}}}")
                     } else {
                         // Fallback: emit without vtable (C compiler will catch missing fields).
                         format!("(dyn_{trait_name}){{.data=(void*)({expr_c})}}")
@@ -1700,8 +1715,12 @@ fn scan_expr(expr: &Expr, hint: Option<&Ty>, found: &mut Vec<Vec<Ty>>) {
             scan_expr(index, None, found);
         }
         ExprKind::Range { start, end } => {
-            if let Some(e) = start { scan_expr(e, None, found); }
-            if let Some(e) = end   { scan_expr(e, None, found); }
+            if let Some(e) = start {
+                scan_expr(e, None, found);
+            }
+            if let Some(e) = end {
+                scan_expr(e, None, found);
+            }
         }
         ExprKind::Unsafe(block) => scan_block(block, found),
         _ => {}
@@ -1843,7 +1862,11 @@ fn fn_signature(f: &FnDecl, impl_type: Option<&str>, prefix: &str) -> String {
         Some(itype) => f.return_ty.resolve_self(itype),
         None => f.return_ty.clone(),
     };
-    let noreturn = if ret_ty == Ty::Never { "_Noreturn " } else { "" };
+    let noreturn = if ret_ty == Ty::Never {
+        "_Noreturn "
+    } else {
+        ""
+    };
     let ret = ty_str(&ret_ty);
     let mut param_parts: Vec<String> = Vec::new();
 

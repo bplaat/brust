@@ -52,7 +52,11 @@ fn run_test(path_str: &str) {
             let stderr = String::from_utf8_lossy(&result.stderr);
             for pat in &patterns {
                 if !stderr.contains(pat.as_str()) {
-                    panic!("stderr missing pattern {:?}\nstderr:\n{}", pat, stderr.trim());
+                    panic!(
+                        "stderr missing pattern {:?}\nstderr:\n{}",
+                        pat,
+                        stderr.trim()
+                    );
                 }
             }
         }
