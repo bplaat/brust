@@ -26,6 +26,8 @@ struct Ctx {
     type_aliases: HashMap<String, Ty>,
     /// Methods whose self parameter is by value (not a pointer), for correct call-site emission.
     value_self_fns: std::collections::HashSet<String>,
+    /// Variable name used to capture `break val` inside a `loop { }` expression.
+    loop_result_var: Option<String>,
 }
 
 impl Ctx {
@@ -39,6 +41,7 @@ impl Ctx {
             fn_ret_tys: HashMap::new(),
             type_aliases: HashMap::new(),
             value_self_fns: std::collections::HashSet::new(),
+            loop_result_var: None,
         }
     }
 
@@ -59,6 +62,7 @@ impl Ctx {
             fn_ret_tys: HashMap::new(),
             type_aliases: HashMap::new(),
             value_self_fns: std::collections::HashSet::new(),
+            loop_result_var: None,
         }
     }
 }
@@ -561,11 +565,33 @@ impl Codegen {
         ctx.type_aliases = self.type_aliases.clone();
         ctx.value_self_fns = self.value_self_fns.clone();
 
-        for stmt in &f.body.stmts {
-            self.emit_stmt(stmt, &mut ctx, 1);
-        }
-        if f.name == "main" {
-            self.out.push_str("    return 0;\n");
+        // Emit all statements. If the tail is a `loop` in a non-void function,
+        // emit it so the loop result is returned.
+        let ret_ty = f.return_ty.resolve_self(impl_type.unwrap_or(""));
+        let stmts = &f.body.stmts;
+        let needs_loop_return = ret_ty != Ty::Unit
+            && f.name != "main"
+            && matches!(stmts.last().map(|s| &s.kind), Some(StmtKind::Loop(_)));
+
+        if needs_loop_return {
+            let (rest, last) = stmts.split_at(stmts.len() - 1);
+            for stmt in rest {
+                self.emit_stmt(stmt, &mut ctx, 1);
+            }
+            // Emit the loop with a result var, then return that var.
+            ctx.loop_result_var = Some("_loop_ret".to_string());
+            let ret_ty_s = ty_str(&ret_ty);
+            self.out.push_str(&format!("    {ret_ty_s} _loop_ret;\n"));
+            self.emit_stmt(&last[0], &mut ctx, 1);
+            ctx.loop_result_var = None;
+            self.out.push_str("    return _loop_ret;\n");
+        } else {
+            for stmt in stmts {
+                self.emit_stmt(stmt, &mut ctx, 1);
+            }
+            if f.name == "main" {
+                self.out.push_str("    return 0;\n");
+            }
         }
         self.out.push_str("}\n\n");
     }
@@ -657,8 +683,13 @@ impl Codegen {
     fn emit_stmt(&mut self, stmt: &Stmt, ctx: &mut Ctx, indent: usize) {
         let p = pad(indent);
         match &stmt.kind {
-            StmtKind::Println { format, args } => {
-                let s = self.emit_println(format, args, ctx);
+            StmtKind::Println {
+                format,
+                args,
+                newline,
+                stderr,
+            } => {
+                let s = self.emit_println(format, args, *newline, *stderr, ctx);
                 self.out.push_str(&format!("{p}{s}\n"));
             }
 
@@ -668,22 +699,18 @@ impl Codegen {
                 ty,
                 expr,
             } => {
-                // Track named types for method resolution
+                // After type checking, ty is always Some (type checker fills it in).
+                // Track named types for method resolution and printf format specifier selection.
                 if let Some(Ty::Named(n)) = ty {
                     ctx.type_env.insert(name.clone(), n.clone());
                 }
-                // Track DynTrait vars for vtable dispatch
-                if let Some(Ty::DynTrait(_)) = ty {
-                    // var_types below handles this; type_env entry not needed for dyn
-                }
-                // Track all types for printf format specifier selection
                 if let Some(t) = ty {
                     ctx.var_types.insert(name.clone(), t.clone());
                 }
-                // Don't add `const` prefix for pointer/ref/array/fnptr types
-                let is_ptr = matches!(
-                    ty,
-                    Some(
+                let val = self.emit_expr_hint(expr, ctx, ty.as_ref());
+                if let Some(t) = ty {
+                    let is_ptr = matches!(
+                        t,
                         Ty::Ref(_)
                             | Ty::RefMut(_)
                             | Ty::RawConst(_)
@@ -691,15 +718,16 @@ impl Codegen {
                             | Ty::Array(_, _)
                             | Ty::Str
                             | Ty::FnPtr { .. }
-                    )
-                );
-                let kw = if *mutable || is_ptr { "" } else { "const " };
-                let val = self.emit_expr_hint(expr, ctx, ty.as_ref());
-                let decl = ty
-                    .as_ref()
-                    .map(|t| ty_str_decl(t, name))
-                    .unwrap_or_else(|| format!("int64_t {name}"));
-                self.out.push_str(&format!("{p}{kw}{decl} = {val};\n"));
+                    );
+                    let kw = if *mutable || is_ptr { "" } else { "const " };
+                    let decl = ty_str_decl(t, name);
+                    self.out.push_str(&format!("{p}{kw}{decl} = {val};\n"));
+                } else {
+                    // Fallback (should not happen after type checking)
+                    let kw = if *mutable { "" } else { "const " };
+                    self.out
+                        .push_str(&format!("{p}{kw}__auto_type {name} = {val};\n"));
+                }
             }
 
             StmtKind::Assign { name, expr } => {
@@ -717,14 +745,30 @@ impl Codegen {
                     }
                 }
                 Some(e)
-                    if matches!(&e.kind, ExprKind::Unsafe(_))
+                    if (matches!(&e.kind, ExprKind::Unsafe(_) | ExprKind::Block(_))
+                        || matches!(&e.kind, ExprKind::If { .. }))
                         && ctx.return_ty == Some(Ty::Unit) =>
                 {
-                    // `unsafe { stmts }` as the tail of a unit function: inline the statements.
-                    if let ExprKind::Unsafe(block) = &e.kind {
-                        for s in &block.stmts {
-                            self.emit_stmt(s, ctx, indent);
+                    // Block/unsafe/if as the tail of a unit function: inline as statements.
+                    match &e.kind {
+                        ExprKind::Unsafe(block) | ExprKind::Block(block) => {
+                            for s in &block.stmts {
+                                self.emit_stmt(s, ctx, indent);
+                            }
                         }
+                        ExprKind::If {
+                            cond,
+                            then_block,
+                            else_block,
+                        } => {
+                            let cond_s = self.emit_expr(cond, ctx);
+                            self.out.push_str(&format!("{p}if ({cond_s}) {{\n"));
+                            for s in &then_block.stmts {
+                                self.emit_stmt(s, ctx, indent + 1);
+                            }
+                            self.emit_else(else_block, ctx, indent);
+                        }
+                        _ => unreachable!(),
                     }
                 }
                 Some(e) => {
@@ -803,12 +847,48 @@ impl Codegen {
                 self.out.push_str(&format!("{p}}}\n"));
             }
 
-            StmtKind::Break => {
+            StmtKind::Break(val) => {
+                if let Some(v) = val {
+                    // `break val` inside a loop expression: store result then break.
+                    let lv = ctx.loop_result_var.clone();
+                    if let Some(lv) = lv {
+                        let vs = self.emit_expr(v, ctx);
+                        self.out.push_str(&format!("{p}{lv} = {vs};\n"));
+                    }
+                }
                 self.out.push_str(&format!("{p}break;\n"));
             }
 
             StmtKind::Continue => {
                 self.out.push_str(&format!("{p}continue;\n"));
+            }
+
+            StmtKind::CompoundAssign { op, lhs, rhs } => {
+                let ls = self.emit_expr(lhs, ctx);
+                let rs = self.emit_expr(rhs, ctx);
+                let op_s = match op {
+                    BinOp::Add => "+=",
+                    BinOp::Sub => "-=",
+                    BinOp::Mul => "*=",
+                    BinOp::Div => "/=",
+                    BinOp::Rem => "%=",
+                    BinOp::BitAnd => "&=",
+                    BinOp::BitOr => "|=",
+                    BinOp::BitXor => "^=",
+                    BinOp::Shl => "<<=",
+                    BinOp::Shr => ">>=",
+                    _ => "+=",
+                };
+                self.out.push_str(&format!("{p}{ls} {op_s} {rs};\n"));
+            }
+
+            StmtKind::IfLet {
+                pat,
+                expr,
+                then_block,
+                else_block,
+            } => {
+                self.emit_if_let(pat, expr, then_block, else_block, ctx, indent);
             }
 
             StmtKind::Match { expr, arms } => self.emit_match(expr, arms, ctx, indent),
@@ -824,9 +904,8 @@ impl Codegen {
                     let ls = self.emit_expr(lhs, ctx);
                     let rs = self.emit_expr(rhs, ctx);
                     self.out.push_str(&format!("{p}{ls} = {rs};\n"));
-                } else if let ExprKind::Unsafe(block) = &expr.kind {
-                    // `unsafe { ... }` as a statement: emit the inner statements directly.
-                    // Inner implicit-return stmts (tail expressions) become bare expr stmts.
+                } else if let ExprKind::Unsafe(block) | ExprKind::Block(block) = &expr.kind {
+                    // Unsafe/block as a statement: inline the inner statements.
                     for s in &block.stmts {
                         if let StmtKind::Return(Some(inner)) = &s.kind {
                             let val = self.emit_expr(inner, ctx);
@@ -835,6 +914,26 @@ impl Codegen {
                             self.emit_stmt(s, ctx, indent);
                         }
                     }
+                } else if let ExprKind::If {
+                    cond,
+                    then_block,
+                    else_block,
+                } = &expr.kind
+                {
+                    // if expression used as a statement: emit as proper C if statement.
+                    let cond_s = self.emit_expr(cond, ctx);
+                    self.out.push_str(&format!("{p}if ({cond_s}) {{\n"));
+                    for s in &then_block.stmts {
+                        self.emit_stmt(s, ctx, indent + 1);
+                    }
+                    self.emit_else(else_block, ctx, indent);
+                } else if let ExprKind::Match {
+                    expr: match_expr,
+                    arms,
+                } = &expr.kind
+                {
+                    // match expression used as a statement: emit as proper C switch.
+                    self.emit_match(match_expr, arms, ctx, indent);
                 } else {
                     let s = self.emit_expr(expr, ctx);
                     self.out.push_str(&format!("{p}{s};\n"));
@@ -872,7 +971,314 @@ impl Codegen {
         }
     }
 
+    fn emit_if_let(
+        &mut self,
+        pat: &Pat,
+        expr: &Expr,
+        then_block: &Block,
+        else_block: &Option<Block>,
+        ctx: &mut Ctx,
+        indent: usize,
+    ) {
+        let p = pad(indent);
+        let ip = pad(indent + 1);
+        let expr_s = self.emit_expr(expr, ctx);
+        match pat {
+            Pat::Wildcard => {
+                // Always matches
+                self.out.push_str(&format!("{p}{{\n"));
+                for s in &then_block.stmts {
+                    self.emit_stmt(s, ctx, indent + 1);
+                }
+                self.emit_else(else_block, ctx, indent);
+            }
+            Pat::Bool(b) => {
+                let cond = if *b { expr_s } else { format!("!({expr_s})") };
+                self.out.push_str(&format!("{p}if ({cond}) {{\n"));
+                for s in &then_block.stmts {
+                    self.emit_stmt(s, ctx, indent + 1);
+                }
+                self.emit_else(else_block, ctx, indent);
+            }
+            Pat::Int(n) => {
+                self.out
+                    .push_str(&format!("{p}if (({expr_s}) == {n}) {{\n"));
+                for s in &then_block.stmts {
+                    self.emit_stmt(s, ctx, indent + 1);
+                }
+                self.emit_else(else_block, ctx, indent);
+            }
+            Pat::EnumVariant {
+                type_name,
+                variant,
+                bindings,
+            } => {
+                // Materialize the scrutinee once.
+                let match_var = match &expr.kind {
+                    ExprKind::Var(n) => n.clone(),
+                    _ => {
+                        self.out
+                            .push_str(&format!("{p}const {type_name} _iflet_val = {expr_s};\n"));
+                        "_iflet_val".to_string()
+                    }
+                };
+                self.out.push_str(&format!(
+                    "{p}if ({match_var}.tag == {type_name}_{variant}_tag) {{\n"
+                ));
+                let mut arm_ctx = ctx.clone();
+                if let Some(edecl) = self.enums.get(type_name).cloned() {
+                    if let Some(ev) = edecl.variants.iter().find(|v| v.name == *variant) {
+                        match bindings {
+                            PatBindings::Tuple(binds) => {
+                                if let VariantFields::Tuple(tys) = &ev.fields {
+                                    for (i, binding) in binds.iter().enumerate() {
+                                        if binding == "_" {
+                                            continue;
+                                        }
+                                        let fty = tys
+                                            .get(i)
+                                            .map(ty_str)
+                                            .unwrap_or_else(|| "int64_t".to_string());
+                                        self.out.push_str(&format!(
+                                            "{ip}{fty} {binding} = {match_var}.data.{variant}._{i};\n"
+                                        ));
+                                        if let Some(Ty::Named(n)) = tys.get(i) {
+                                            arm_ctx.type_env.insert(binding.clone(), n.clone());
+                                        }
+                                    }
+                                }
+                            }
+                            PatBindings::Named(fields_bind) => {
+                                if let VariantFields::Named(decl_fields) = &ev.fields {
+                                    for (field_name, binding) in fields_bind {
+                                        if let Some(df) =
+                                            decl_fields.iter().find(|f| f.name == *field_name)
+                                        {
+                                            let fty = ty_str(&df.ty);
+                                            self.out.push_str(&format!(
+                                                "{ip}{fty} {binding} = {match_var}.data.{variant}.{field_name};\n"
+                                            ));
+                                            if let Ty::Named(n) = &df.ty {
+                                                arm_ctx.type_env.insert(binding.clone(), n.clone());
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            PatBindings::None => {}
+                        }
+                    }
+                }
+                for s in &then_block.stmts {
+                    self.emit_stmt(s, &mut arm_ctx, indent + 1);
+                }
+                self.emit_else(else_block, ctx, indent);
+            }
+            Pat::Or(_) => {
+                // Or-patterns in if let: emit as `if (cond1 || cond2 || ...)`
+                // Not commonly needed, emit as always-false for now.
+                self.out.push_str(&format!("{p}if (0) {{\n"));
+                self.emit_else(else_block, ctx, indent);
+            }
+            Pat::Binding(name) => {
+                // Binding pattern always matches; bind value in block.
+                self.out.push_str(&format!("{p}{{\n"));
+                self.out
+                    .push_str(&format!("{ip}__auto_type {name} = {expr_s};\n"));
+                for s in &then_block.stmts {
+                    self.emit_stmt(s, ctx, indent + 1);
+                }
+                self.emit_else(else_block, ctx, indent);
+            }
+        }
+    }
+
+    fn emit_match_arm_bindings(
+        &mut self,
+        pat: &Pat,
+        match_var: &str,
+        is_tagged: bool,
+        enum_decl: &Option<EnumDecl>,
+        bp: &str,
+        arm_ctx: &mut Ctx,
+    ) {
+        // Only EnumVariant patterns introduce bindings.
+        let (_type_name, variant, bindings) = match pat {
+            Pat::Binding(name) => {
+                // Bind the whole matched value to `name`.
+                self.out
+                    .push_str(&format!("{bp}__auto_type {name} = {match_var};\n"));
+                return;
+            }
+            Pat::EnumVariant {
+                type_name,
+                variant,
+                bindings,
+            } => (type_name, variant, bindings),
+            _ => return,
+        };
+        if !is_tagged {
+            return;
+        }
+        if let Some(edecl) = enum_decl
+            && let Some(ev) = edecl.variants.iter().find(|v| v.name == *variant)
+        {
+            match bindings {
+                PatBindings::None => {}
+                PatBindings::Tuple(binds) => {
+                    if let VariantFields::Tuple(tys) = &ev.fields {
+                        for (i, binding) in binds.iter().enumerate() {
+                            if binding == "_" {
+                                continue;
+                            }
+                            let fty = tys
+                                .get(i)
+                                .map(ty_str)
+                                .unwrap_or_else(|| "int64_t".to_string());
+                            self.out.push_str(&format!(
+                                "{bp}{fty} {binding} = {match_var}.data.{variant}._{i};\n"
+                            ));
+                            if let Some(Ty::Named(n)) = tys.get(i) {
+                                arm_ctx.type_env.insert(binding.clone(), n.clone());
+                            }
+                        }
+                    }
+                }
+                PatBindings::Named(binds) => {
+                    if let VariantFields::Named(fields) = &ev.fields {
+                        for (field_name, binding_name) in binds {
+                            if binding_name == "_" {
+                                continue;
+                            }
+                            let fty = fields
+                                .iter()
+                                .find(|f| f.name == *field_name)
+                                .map(|f| ty_str(&f.ty))
+                                .unwrap_or_else(|| "int64_t".to_string());
+                            self.out.push_str(&format!(
+                                "{bp}{fty} {binding_name} = {match_var}.data.{variant}.{field_name};\n"
+                            ));
+                            if let Some(f) = fields.iter().find(|f| f.name == *field_name)
+                                && let Ty::Named(n) = &f.ty
+                            {
+                                arm_ctx.type_env.insert(binding_name.clone(), n.clone());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Emit a `match` as an if-else chain.
+    /// Used when binding patterns are present (can't use C switch).
+    fn emit_match_if_chain(
+        &mut self,
+        expr: &Expr,
+        arms: &[MatchArm],
+        ctx: &mut Ctx,
+        indent: usize,
+    ) {
+        let p = pad(indent);
+        let ip = pad(indent + 1);
+        // Materialize scrutinee once.
+        let expr_s = self.emit_expr(expr, ctx);
+        self.out
+            .push_str(&format!("{p}__auto_type _ms = {expr_s};\n"));
+
+        for (i, arm) in arms.iter().enumerate() {
+            let mut arm_ctx = ctx.clone();
+            let keyword = if i == 0 { "if" } else { "else if" };
+
+            match (&arm.pat, &arm.guard) {
+                // Binding pattern with guard: use GNU stmt expr for condition
+                (Pat::Binding(name), Some(guard)) => {
+                    // Condition: ({ __auto_type name = _ms; guard_expr; })
+                    arm_ctx.type_env.insert(name.clone(), "i64".to_string());
+                    let gs = self.emit_expr(guard, &mut arm_ctx);
+                    let cond = format!("({{ __auto_type {name} = _ms; {gs}; }})");
+                    self.out.push_str(&format!("{p}{keyword} ({cond}) {{\n"));
+                    self.out
+                        .push_str(&format!("{ip}__auto_type {name} = _ms;\n"));
+                    for s in &arm.body.stmts {
+                        self.emit_stmt(s, &mut arm_ctx, indent + 1);
+                    }
+                    self.out.push_str(&format!("{p}}}\n"));
+                }
+                // Wildcard/binding without guard: always matches
+                (Pat::Wildcard, None) | (Pat::Binding(_), None) => {
+                    let decl = if let Pat::Binding(name) = &arm.pat {
+                        Some(format!("{ip}__auto_type {name} = _ms;\n"))
+                    } else {
+                        None
+                    };
+                    if i == 0 {
+                        self.out.push_str(&format!("{p}{{\n"));
+                    } else {
+                        self.out.push_str(&format!("{p}else {{\n"));
+                    }
+                    if let Some(d) = &decl {
+                        self.out.push_str(d);
+                    }
+                    for s in &arm.body.stmts {
+                        self.emit_stmt(s, &mut arm_ctx, indent + 1);
+                    }
+                    self.out.push_str(&format!("{p}}}\n"));
+                }
+                // Other patterns (Int, Bool, EnumVariant, Or) with optional guard
+                (pat, guard) => {
+                    let pat_cond = match pat {
+                        Pat::Bool(b) => format!("_ms == {}", if *b { 1 } else { 0 }),
+                        Pat::Int(n) => format!("_ms == {n}"),
+                        Pat::EnumVariant {
+                            type_name, variant, ..
+                        } => {
+                            format!("_ms.tag == {type_name}_{variant}_tag")
+                        }
+                        Pat::Or(alts) => alts
+                            .iter()
+                            .map(|p| match p {
+                                Pat::Wildcard | Pat::Binding(_) => "1".to_string(),
+                                Pat::Bool(b) => format!("_ms == {}", if *b { 1 } else { 0 }),
+                                Pat::Int(n) => format!("_ms == {n}"),
+                                Pat::EnumVariant {
+                                    type_name, variant, ..
+                                } => {
+                                    format!("_ms.tag == {type_name}_{variant}_tag")
+                                }
+                                Pat::Or(_) => "0".to_string(),
+                            })
+                            .collect::<Vec<_>>()
+                            .join(" || "),
+                        _ => "1".to_string(),
+                    };
+                    let full_cond = match guard {
+                        None => pat_cond,
+                        Some(g) => {
+                            let gs = self.emit_expr(g, &mut arm_ctx);
+                            format!("({pat_cond}) && ({gs})")
+                        }
+                    };
+                    self.out
+                        .push_str(&format!("{p}{keyword} ({full_cond}) {{\n"));
+                    self.emit_match_arm_bindings(pat, "_ms", false, &None, &ip, &mut arm_ctx);
+                    for s in &arm.body.stmts {
+                        self.emit_stmt(s, &mut arm_ctx, indent + 1);
+                    }
+                    self.out.push_str(&format!("{p}}}\n"));
+                }
+            }
+        }
+    }
+
     fn emit_match(&mut self, expr: &Expr, arms: &[MatchArm], ctx: &mut Ctx, indent: usize) {
+        // When any arm uses a binding pattern, C switch can't express it — use if-else chain.
+        let needs_if_chain = arms.iter().any(|a| matches!(&a.pat, Pat::Binding(_)));
+        if needs_if_chain {
+            self.emit_match_if_chain(expr, arms, ctx, indent);
+            return;
+        }
+
         let p = pad(indent);
         let ip = pad(indent + 1);
         let bp = pad(indent + 2);
@@ -924,84 +1330,125 @@ impl Codegen {
             // Clone type_env so bindings don't leak across arms
             let mut arm_ctx = ctx.clone();
 
-            match &arm.pat {
-                Pat::Wildcard => {
-                    self.out.push_str(&format!("{ip}default: {{\n"));
-                }
-                Pat::Bool(b) => {
-                    self.out
-                        .push_str(&format!("{ip}case {}: {{\n", if *b { 1 } else { 0 }));
-                }
-                Pat::Int(n) => {
-                    self.out.push_str(&format!("{ip}case {n}: {{\n"));
-                }
-                Pat::EnumVariant {
-                    type_name,
-                    variant,
-                    bindings,
-                } => {
-                    if is_tagged {
-                        self.out
-                            .push_str(&format!("{ip}case {type_name}_{variant}_tag: {{\n"));
-                        // Emit binding declarations from variant fields
-                        if let Some(ref edecl) = enum_decl
-                            && let Some(ev) = edecl.variants.iter().find(|v| v.name == *variant)
-                        {
-                            match bindings {
-                                PatBindings::None => {}
-                                PatBindings::Tuple(binds) => {
-                                    if let VariantFields::Tuple(tys) = &ev.fields {
-                                        for (i, binding) in binds.iter().enumerate() {
-                                            if binding == "_" {
-                                                continue;
-                                            }
-                                            let fty = tys
-                                                .get(i)
-                                                .map(ty_str)
-                                                .unwrap_or_else(|| "int64_t".to_string());
-                                            self.out.push_str(&format!(
-                                                    "{bp}{fty} {binding} = {match_var}.data.{variant}._{i};\n"
-                                                ));
-                                            if let Some(Ty::Named(n)) = tys.get(i) {
-                                                arm_ctx.type_env.insert(binding.clone(), n.clone());
-                                            }
-                                        }
-                                    }
-                                }
-                                PatBindings::Named(binds) => {
-                                    if let VariantFields::Named(fields) = &ev.fields {
-                                        for (field_name, binding_name) in binds {
-                                            if binding_name == "_" {
-                                                continue;
-                                            }
-                                            let fty = fields
-                                                .iter()
-                                                .find(|f| f.name == *field_name)
-                                                .map(|f| ty_str(&f.ty))
-                                                .unwrap_or_else(|| "int64_t".to_string());
-                                            self.out.push_str(&format!(
-                                                    "{bp}{fty} {binding_name} = {match_var}.data.{variant}.{field_name};\n"
-                                                ));
-                                            if let Some(f) =
-                                                fields.iter().find(|f| f.name == *field_name)
-                                                && let Ty::Named(n) = &f.ty
-                                            {
-                                                arm_ctx
-                                                    .type_env
-                                                    .insert(binding_name.clone(), n.clone());
-                                            }
-                                        }
-                                    }
-                                }
+            // Emit case label(s) - Pat::Or emits multiple labels.
+            let pats: &[Pat] = match &arm.pat {
+                Pat::Or(alts) => alts.as_slice(),
+                single => std::slice::from_ref(single),
+            };
+            // When there's a guard, we can't use switch `case` directly.
+            // Fall back to using `default:` + inner `if (cond)` with a goto skip.
+            if arm.guard.is_some() {
+                // Generate a unique label to skip past this arm if guard fails.
+                let skip_label = format!("_guard_skip_{}", arm.loc.line);
+                // Emit all matching case labels for this guarded arm.
+                for pat in pats {
+                    match pat {
+                        Pat::Wildcard | Pat::Binding(_) => {
+                            self.out.push_str(&format!("{ip}default: {{\n"));
+                        }
+                        Pat::Bool(b) => {
+                            self.out
+                                .push_str(&format!("{ip}case {}: {{\n", if *b { 1 } else { 0 }));
+                        }
+                        Pat::Int(n) => {
+                            self.out.push_str(&format!("{ip}case {n}: {{\n"));
+                        }
+                        Pat::EnumVariant {
+                            type_name, variant, ..
+                        } => {
+                            if is_tagged {
+                                self.out
+                                    .push_str(&format!("{ip}case {type_name}_{variant}_tag: {{\n"));
+                            } else {
+                                self.out
+                                    .push_str(&format!("{ip}case {type_name}_{variant}: {{\n"));
                             }
                         }
-                    } else {
-                        self.out
-                            .push_str(&format!("{ip}case {type_name}_{variant}: {{\n"));
+                        Pat::Or(_) => {}
+                    }
+                }
+                let guard_s = self.emit_expr(arm.guard.as_ref().unwrap(), &mut arm_ctx);
+                self.out
+                    .push_str(&format!("{bp}if (!({guard_s})) goto {skip_label};\n"));
+                // Emit bindings and body
+                self.emit_match_arm_bindings(
+                    &arm.pat,
+                    &match_var,
+                    is_tagged,
+                    &enum_decl,
+                    &bp,
+                    &mut arm_ctx,
+                );
+                for s in &arm.body.stmts {
+                    self.emit_stmt(s, &mut arm_ctx, indent + 2);
+                }
+                self.out.push_str(&format!("{bp}break;\n{ip}}}\n"));
+                self.out.push_str(&format!("{ip}{skip_label}:;\n"));
+                continue;
+            }
+
+            // No guard: emit normal case labels.
+            for (pi, pat) in pats.iter().enumerate() {
+                let is_last = pi == pats.len() - 1;
+                match pat {
+                    Pat::Wildcard | Pat::Binding(_) => {
+                        self.out.push_str(&format!("{ip}default: {{\n"));
+                    }
+                    Pat::Bool(b) => {
+                        self.out.push_str(&format!(
+                            "{ip}case {}: {}{{\n",
+                            if *b { 1 } else { 0 },
+                            if is_last { "" } else { "" }
+                        ));
+                        if !is_last {
+                            self.out.push_str(&format!("{ip}}}\n"));
+                            continue;
+                        }
+                    }
+                    Pat::Int(n) => {
+                        if is_last {
+                            self.out.push_str(&format!("{ip}case {n}: {{\n"));
+                        } else {
+                            self.out.push_str(&format!("{ip}case {n}:\n"));
+                            continue;
+                        }
+                    }
+                    Pat::EnumVariant {
+                        type_name, variant, ..
+                    } => {
+                        if is_tagged {
+                            if is_last {
+                                self.out
+                                    .push_str(&format!("{ip}case {type_name}_{variant}_tag: {{\n"));
+                            } else {
+                                self.out
+                                    .push_str(&format!("{ip}case {type_name}_{variant}_tag:\n"));
+                                continue;
+                            }
+                        } else if is_last {
+                            self.out
+                                .push_str(&format!("{ip}case {type_name}_{variant}: {{\n"));
+                        } else {
+                            self.out
+                                .push_str(&format!("{ip}case {type_name}_{variant}:\n"));
+                            continue;
+                        }
+                    }
+                    Pat::Or(_) => {
+                        // Nested or-pattern — flatten
+                        self.out.push_str(&format!("{ip}default: {{\n"));
                     }
                 }
             }
-
+            // Emit bindings for the primary (last) pattern.
+            self.emit_match_arm_bindings(
+                &arm.pat,
+                &match_var,
+                is_tagged,
+                &enum_decl,
+                &bp,
+                &mut arm_ctx,
+            );
             for s in &arm.body.stmts {
                 self.emit_stmt(s, &mut arm_ctx, indent + 2);
             }
@@ -1012,11 +1459,224 @@ impl Codegen {
     }
 
     // -----------------------------------------------------------------------
+    // Block / if / match as expressions
+    // -----------------------------------------------------------------------
+
+    /// Emit a block as a C expression.
+    /// Single-expr blocks emit the expression directly.
+    /// Multi-stmt blocks use a GNU statement expression `({ stmts; tail; })`.
+    fn emit_block_as_expr(&mut self, block: &Block, ctx: &mut Ctx) -> String {
+        if block.stmts.is_empty() {
+            return "(void)0".to_string();
+        }
+        let (last, rest) = block.stmts.split_last().unwrap();
+        let tail = self.emit_stmt_as_expr(last, ctx);
+        if rest.is_empty() {
+            return tail;
+        }
+        // Multi-stmt: save/restore self.out to capture the emitted statements.
+        let saved = std::mem::take(&mut self.out);
+        for s in rest {
+            self.emit_stmt(s, ctx, 0);
+        }
+        let inner = std::mem::take(&mut self.out);
+        self.out = saved;
+        let inner = inner.trim_end().to_string();
+        format!("({{ {inner} {tail}; }})")
+    }
+
+    /// Extract the value expression from a statement.
+    /// Return(Some(e)) or Expr(e) -> emit e.
+    /// If/Match statements -> emit as ternary.
+    fn emit_stmt_as_expr(&mut self, stmt: &Stmt, ctx: &mut Ctx) -> String {
+        match &stmt.kind {
+            StmtKind::Return(Some(e)) | StmtKind::Expr(e) => self.emit_expr(e, ctx),
+            StmtKind::If {
+                cond,
+                then_block,
+                else_block,
+            } => {
+                let cond_s = self.emit_expr(cond, ctx);
+                let then_s = self.emit_block_as_expr(then_block, ctx);
+                let else_s = else_block
+                    .as_ref()
+                    .map(|b| self.emit_block_as_expr(b, ctx))
+                    .unwrap_or_else(|| "(void)0".to_string());
+                format!("(({cond_s}) ? ({then_s}) : ({else_s}))")
+            }
+            StmtKind::Match { expr, arms } => self.emit_match_as_expr(expr, arms, ctx),
+            _ => "(void)0".to_string(),
+        }
+    }
+
+    /// Emit a match expression as a nested ternary chain.
+    /// Tagged enum variants with bindings use GNU statement expressions for binding decls.
+    fn emit_match_as_expr(&mut self, expr: &Expr, arms: &[MatchArm], ctx: &mut Ctx) -> String {
+        let enum_type_name: Option<String> = arms.iter().find_map(|a| {
+            if let Pat::EnumVariant { type_name, .. } = &a.pat {
+                Some(type_name.clone())
+            } else {
+                None
+            }
+        });
+        let enum_decl: Option<EnumDecl> = enum_type_name
+            .as_ref()
+            .and_then(|tn| self.enums.get(tn).cloned());
+        let is_tagged = enum_decl.as_ref().is_some_and(|e| {
+            e.variants
+                .iter()
+                .any(|v| !matches!(v.fields, VariantFields::Unit))
+        });
+
+        // Materialize scrutinee into temp var for tagged enums or complex expressions.
+        let (match_var, prefix) = if is_tagged || !matches!(&expr.kind, ExprKind::Var(_)) {
+            let expr_s = self.emit_expr(expr, ctx);
+            let type_str = enum_type_name.as_deref().unwrap_or("int64_t");
+            (
+                "_ms".to_string(),
+                format!("const {type_str} _ms = {expr_s}; "),
+            )
+        } else {
+            (self.emit_expr(expr, ctx), String::new())
+        };
+
+        // Build ternary chain from last arm to first.
+        let mut chain = "(void)0".to_string();
+        for arm in arms.iter().rev() {
+            let arm_body = self.emit_match_arm_as_expr(arm, &match_var, is_tagged, &enum_decl, ctx);
+            chain = match &arm.pat {
+                Pat::Wildcard | Pat::Binding(_) => arm_body,
+                Pat::Bool(b) => format!(
+                    "(({match_var}) == {} ? ({arm_body}) : ({chain}))",
+                    if *b { 1 } else { 0 }
+                ),
+                Pat::Int(n) => format!("(({match_var}) == {n} ? ({arm_body}) : ({chain}))"),
+                Pat::EnumVariant {
+                    type_name, variant, ..
+                } => {
+                    let cond = if is_tagged {
+                        format!("({match_var}).tag == {type_name}_{variant}_tag")
+                    } else {
+                        format!("({match_var}) == {type_name}_{variant}")
+                    };
+                    format!("(({cond}) ? ({arm_body}) : ({chain}))")
+                }
+                Pat::Or(alts) => {
+                    // Build compound condition: any alternative matches.
+                    let cond = alts
+                        .iter()
+                        .map(|p| match p {
+                            Pat::Wildcard | Pat::Binding(_) => "1".to_string(),
+                            Pat::Bool(b) => format!("({match_var}) == {}", if *b { 1 } else { 0 }),
+                            Pat::Int(n) => format!("({match_var}) == {n}"),
+                            Pat::EnumVariant {
+                                type_name, variant, ..
+                            } => {
+                                if is_tagged {
+                                    format!("({match_var}).tag == {type_name}_{variant}_tag")
+                                } else {
+                                    format!("({match_var}) == {type_name}_{variant}")
+                                }
+                            }
+                            Pat::Or(_) => "0".to_string(),
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" || ");
+                    format!("(({cond}) ? ({arm_body}) : ({chain}))")
+                }
+            };
+        }
+
+        if prefix.is_empty() {
+            chain
+        } else {
+            format!("({{ {prefix}{chain}; }})")
+        }
+    }
+
+    /// Emit a single match arm body as an expression.
+    /// Tagged enum variants with data bindings use GNU `({ bindings; body; })`.
+    fn emit_match_arm_as_expr(
+        &mut self,
+        arm: &MatchArm,
+        match_var: &str,
+        is_tagged: bool,
+        enum_decl: &Option<EnumDecl>,
+        ctx: &mut Ctx,
+    ) -> String {
+        if let Pat::EnumVariant {
+            variant, bindings, ..
+        } = &arm.pat
+            && is_tagged
+            && !matches!(bindings, PatBindings::None)
+        {
+            let mut binding_decls = String::new();
+            let mut arm_ctx = ctx.clone();
+            if let Some(edecl) = enum_decl
+                && let Some(ev) = edecl.variants.iter().find(|v| v.name == *variant)
+            {
+                match bindings {
+                    PatBindings::Tuple(names) => {
+                        if let VariantFields::Tuple(tys) = &ev.fields {
+                            for (i, name) in names.iter().enumerate() {
+                                if name == "_" {
+                                    continue;
+                                }
+                                let fty = tys
+                                    .get(i)
+                                    .map(ty_str)
+                                    .unwrap_or_else(|| "int64_t".to_string());
+                                binding_decls.push_str(&format!(
+                                    "const {fty} {name} = {match_var}.data.{variant}._{i}; "
+                                ));
+                                if let Some(Ty::Named(n)) = tys.get(i) {
+                                    arm_ctx.type_env.insert(name.clone(), n.clone());
+                                }
+                            }
+                        }
+                    }
+                    PatBindings::Named(binds) => {
+                        if let VariantFields::Named(fields) = &ev.fields {
+                            for (field_name, binding_name) in binds {
+                                if binding_name == "_" {
+                                    continue;
+                                }
+                                let fty = fields
+                                    .iter()
+                                    .find(|f| f.name == *field_name)
+                                    .map(|f| ty_str(&f.ty))
+                                    .unwrap_or_else(|| "int64_t".to_string());
+                                binding_decls.push_str(&format!(
+                                    "const {fty} {binding_name} = {match_var}.data.{variant}.{field_name}; "
+                                ));
+                                if let Some(f) = fields.iter().find(|f| f.name == *field_name)
+                                    && let Ty::Named(n) = &f.ty
+                                {
+                                    arm_ctx.type_env.insert(binding_name.clone(), n.clone());
+                                }
+                            }
+                        }
+                    }
+                    PatBindings::None => {}
+                }
+            }
+            let tail = self.emit_block_as_expr(&arm.body, &mut arm_ctx);
+            if binding_decls.is_empty() {
+                tail
+            } else {
+                format!("({{ {binding_decls}{tail}; }})")
+            }
+        } else {
+            self.emit_block_as_expr(&arm.body, ctx)
+        }
+    }
+
+    // -----------------------------------------------------------------------
     // Expressions
     // -----------------------------------------------------------------------
 
     /// Emit an expression, with an optional type hint for tuple/array literals.
-    fn emit_expr_hint(&self, expr: &Expr, ctx: &mut Ctx, hint: Option<&Ty>) -> String {
+    fn emit_expr_hint(&mut self, expr: &Expr, ctx: &mut Ctx, hint: Option<&Ty>) -> String {
         match &expr.kind {
             ExprKind::Tuple(elems) => {
                 let elem_tys: Vec<Ty> = match hint {
@@ -1055,7 +1715,7 @@ impl Codegen {
         }
     }
 
-    fn emit_expr(&self, expr: &Expr, ctx: &mut Ctx) -> String {
+    fn emit_expr(&mut self, expr: &Expr, ctx: &mut Ctx) -> String {
         match &expr.kind {
             ExprKind::Int(n) => format!("INT64_C({n})"),
             ExprKind::Float(f) => {
@@ -1136,7 +1796,7 @@ impl Codegen {
                 fields,
             } => {
                 let mangled = format!("{type_name}_{variant}");
-                if let Some(edecl) = self.enums.get(type_name.as_str()) {
+                if let Some(edecl) = self.enums.get(type_name.as_str()).cloned() {
                     let arg_exprs: Vec<String> =
                         if let Some(ev) = edecl.variants.iter().find(|v| v.name == *variant) {
                             if let VariantFields::Named(decl_fields) = &ev.fields {
@@ -1371,41 +2031,52 @@ impl Codegen {
                 }
             }
 
-            // `unsafe { stmts }` — emit as a GNU statement expression `({ stmts })`
-            // or just emit the block inline (last expr becomes the value).
-            ExprKind::Unsafe(block) => {
-                if block.stmts.is_empty() {
-                    "/* unsafe {} */".to_string()
-                } else if block.stmts.len() == 1 {
-                    // Single expression inside unsafe: emit directly
-                    match &block.stmts[0].kind {
-                        StmtKind::Return(Some(e)) | StmtKind::Expr(e) => self.emit_expr(e, ctx),
-                        _ => "/* unsafe block */".to_string(),
-                    }
-                } else {
-                    // Multi-statement unsafe: use GCC/Clang statement expression
-                    let mut out = "({ ".to_string();
-                    for (i, s) in block.stmts.iter().enumerate() {
-                        match &s.kind {
-                            StmtKind::Return(Some(e)) if i + 1 == block.stmts.len() => {
-                                out.push_str(&self.emit_expr(e, ctx));
-                                out.push_str("; ");
-                            }
-                            StmtKind::Expr(e) if i + 1 == block.stmts.len() => {
-                                out.push_str(&self.emit_expr(e, ctx));
-                                out.push_str("; ");
-                            }
-                            _ => {} // complex stmts in unsafe: skip for now
-                        }
-                    }
-                    out.push_str("})");
-                    out
+            // `unsafe { stmts }` — delegate to emit_block_as_expr.
+            ExprKind::Unsafe(block) => self.emit_block_as_expr(block, ctx),
+
+            ExprKind::Block(block) => self.emit_block_as_expr(block, ctx),
+
+            ExprKind::If {
+                cond,
+                then_block,
+                else_block,
+            } => {
+                let cond_s = self.emit_expr(cond, ctx);
+                let then_s = self.emit_block_as_expr(then_block, ctx);
+                let else_s = else_block
+                    .as_ref()
+                    .map(|b| self.emit_block_as_expr(b, ctx))
+                    .unwrap_or_else(|| "(void)0".to_string());
+                format!("(({cond_s}) ? ({then_s}) : ({else_s}))")
+            }
+
+            ExprKind::Match { expr, arms } => self.emit_match_as_expr(expr, arms, ctx),
+
+            ExprKind::Loop(body) => {
+                // `loop { ... }` as expression: use GNU statement expr with result variable.
+                // `break val` inside stores val into `_lv`, then `break`.
+                let saved = std::mem::take(&mut self.out);
+                let mut inner_ctx = ctx.clone();
+                inner_ctx.loop_result_var = Some("_lv".to_string());
+                for s in &body.stmts {
+                    self.emit_stmt(s, &mut inner_ctx, 0);
                 }
+                let inner = std::mem::take(&mut self.out);
+                self.out = saved;
+                let inner = inner.trim_end().to_string();
+                format!("({{ __auto_type _lv = 0; for (;;) {{ {inner} }} _lv; }})")
             }
         }
     }
 
-    fn emit_println(&self, format: &str, args: &[Expr], ctx: &mut Ctx) -> String {
+    fn emit_println(
+        &mut self,
+        format: &str,
+        args: &[Expr],
+        newline: bool,
+        stderr: bool,
+        ctx: &mut Ctx,
+    ) -> String {
         let mut fmt_parts: Vec<String> = Vec::new();
         let mut fmt_c = String::new();
         let mut chars = format.chars().peekable();
@@ -1431,8 +2102,11 @@ impl Codegen {
                 }
             }
         }
+        let nl = if newline { "\\n" } else { "" };
+        let stream = if stderr { "stderr" } else { "stdout" };
+        let fmt_str = format!("\"{fmt_c}{nl}\"");
         if args.is_empty() {
-            format!("printf(\"{fmt_c}\\n\");")
+            format!("fprintf({stream}, {fmt_str});")
         } else {
             let args_s: Vec<String> = args
                 .iter()
@@ -1451,7 +2125,7 @@ impl Codegen {
                     }
                 })
                 .collect();
-            format!("printf(\"{fmt_c}\\n\", {});", args_s.join(", "))
+            format!("fprintf({stream}, {fmt_str}, {});", args_s.join(", "))
         }
     }
 }
@@ -1737,7 +2411,25 @@ fn scan_expr(expr: &Expr, hint: Option<&Ty>, found: &mut Vec<Vec<Ty>>) {
                 scan_expr(e, None, found);
             }
         }
-        ExprKind::Unsafe(block) => scan_block(block, found),
+        ExprKind::Unsafe(block) | ExprKind::Block(block) => scan_block(block, found),
+        ExprKind::If {
+            cond,
+            then_block,
+            else_block,
+        } => {
+            scan_expr(cond, None, found);
+            scan_block(then_block, found);
+            if let Some(b) = else_block {
+                scan_block(b, found);
+            }
+        }
+        ExprKind::Match { expr, arms } => {
+            scan_expr(expr, None, found);
+            for arm in arms {
+                scan_block(&arm.body, found);
+            }
+        }
+        ExprKind::Loop(block) => scan_block(block, found),
         _ => {}
     }
 }
@@ -1886,7 +2578,11 @@ fn extern_fn_decl(f: &ExternFnDecl) -> String {
         param_parts.push("...".to_string());
     }
     let params = if param_parts.is_empty() {
-        if f.is_variadic { "...".to_string() } else { "void".to_string() }
+        if f.is_variadic {
+            "...".to_string()
+        } else {
+            "void".to_string()
+        }
     } else {
         param_parts.join(", ")
     };

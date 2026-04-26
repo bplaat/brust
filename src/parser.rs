@@ -381,7 +381,13 @@ impl Parser {
                         self.advance();
                         self.parse_extern_block(next.loc, is_pub, true)
                     }
-                    _ => Err(Error::new(next.loc, format!("expected `fn` or `extern` after `unsafe`, got {:?}", next.kind))),
+                    _ => Err(Error::new(
+                        next.loc,
+                        format!(
+                            "expected `fn` or `extern` after `unsafe`, got {:?}",
+                            next.kind
+                        ),
+                    )),
                 }
             }
             TokenKind::Type => {
@@ -450,7 +456,12 @@ impl Parser {
     /// Called after consuming `extern` (or `unsafe extern`).
     /// `is_unsafe` is true when `unsafe` preceded the `extern` keyword.
     /// Bare `extern "C" { }` without `unsafe` is rejected (edition 2024 rule).
-    fn parse_extern_block(&mut self, loc: Loc, _is_pub: bool, is_unsafe: bool) -> Result<Item, Error> {
+    fn parse_extern_block(
+        &mut self,
+        loc: Loc,
+        _is_pub: bool,
+        is_unsafe: bool,
+    ) -> Result<Item, Error> {
         // Handle: extern crate foo; / extern crate foo as bar;
         if matches!(self.peek().kind, TokenKind::Ident(ref s) if s == "crate") {
             // Skip to semicolon
@@ -470,11 +481,17 @@ impl Parser {
             }
             TokenKind::StringLit(abi) => {
                 let abi = abi.clone();
-                return Err(Error::new(loc, format!("unsupported ABI `\"{abi}\"`: only \"C\" is supported")));
+                return Err(Error::new(
+                    loc,
+                    format!("unsupported ABI `\"{abi}\"`: only \"C\" is supported"),
+                ));
             }
             // Not a string: skip the rest of the unknown extern form
             _ => {
-                while !matches!(self.peek().kind, TokenKind::Semicolon | TokenKind::LBrace | TokenKind::Eof) {
+                while !matches!(
+                    self.peek().kind,
+                    TokenKind::Semicolon | TokenKind::LBrace | TokenKind::Eof
+                ) {
                     self.advance();
                 }
                 if self.peek().kind == TokenKind::Semicolon {
@@ -487,10 +504,21 @@ impl Parser {
                     let mut depth = 1usize;
                     loop {
                         match self.peek().kind.clone() {
-                            TokenKind::LBrace => { depth += 1; self.advance(); }
-                            TokenKind::RBrace => { depth -= 1; self.advance(); if depth == 0 { break; } }
+                            TokenKind::LBrace => {
+                                depth += 1;
+                                self.advance();
+                            }
+                            TokenKind::RBrace => {
+                                depth -= 1;
+                                self.advance();
+                                if depth == 0 {
+                                    break;
+                                }
+                            }
                             TokenKind::Eof => break,
-                            _ => { self.advance(); }
+                            _ => {
+                                self.advance();
+                            }
                         }
                     }
                 }
@@ -500,7 +528,10 @@ impl Parser {
 
         // Extern "C" blocks must be at top level (C symbols must not be mangled).
         if !self.mod_stack.is_empty() {
-            return Err(Error::new(loc, "`extern \"C\"` blocks must be at the top level, not inside a module".to_string()));
+            return Err(Error::new(
+                loc,
+                "`extern \"C\"` blocks must be at the top level, not inside a module".to_string(),
+            ));
         }
 
         // Edition 2024: extern "C" blocks must be declared `unsafe extern "C"`.
@@ -546,7 +577,10 @@ impl Parser {
                     // Unnamed param: what we read was actually the type name -- re-parse
                     // Treat single ident without colon as a named type param with name "_"
                     let ty = Ty::Named(self.qualify(pname));
-                    params.push(Param { name: "_".to_string(), ty });
+                    params.push(Param {
+                        name: "_".to_string(),
+                        ty,
+                    });
                 }
             }
             self.expect(&TokenKind::RParen)?;
@@ -557,7 +591,13 @@ impl Parser {
                 Ty::Unit
             };
             self.expect(&TokenKind::Semicolon)?;
-            fns.push(ExternFnDecl { name, params, return_ty, is_variadic, loc: fn_loc });
+            fns.push(ExternFnDecl {
+                name,
+                params,
+                return_ty,
+                is_variadic,
+                loc: fn_loc,
+            });
         }
         self.expect(&TokenKind::RBrace)?;
         Ok(Item::ExternBlock(fns))
@@ -1014,11 +1054,20 @@ impl Parser {
             TokenKind::For => self.parse_for(),
             TokenKind::Break => {
                 self.advance();
+                // `break val` — optional value expression
+                let val = if self.peek().kind != TokenKind::Semicolon
+                    && self.peek().kind != TokenKind::RBrace
+                    && !self.at_eof()
+                {
+                    Some(self.parse_expr()?)
+                } else {
+                    None
+                };
                 if self.peek().kind == TokenKind::Semicolon {
                     self.advance();
                 }
                 Ok(Stmt {
-                    kind: StmtKind::Break,
+                    kind: StmtKind::Break(val),
                     loc,
                 })
             }
@@ -1054,7 +1103,19 @@ impl Parser {
                     loc,
                 })
             }
-            TokenKind::Ident(name) if name == "println" => self.parse_println(),
+            TokenKind::Ident(name)
+                if (name == "println"
+                    || name == "print"
+                    || name == "eprintln"
+                    || name == "eprint")
+                    && self
+                        .tokens
+                        .get(self.pos + 1)
+                        .map(|t| t.kind == TokenKind::Bang)
+                        .unwrap_or(false) =>
+            {
+                self.parse_println()
+            }
             TokenKind::Ident(_) | TokenKind::SelfKw => self.parse_ident_stmt(),
             _ => {
                 let expr = self.parse_expr()?;
@@ -1123,6 +1184,7 @@ impl Parser {
     fn parse_ident_stmt(&mut self) -> Result<Stmt, Error> {
         let loc = self.loc();
         let expr = self.parse_expr()?;
+        // Plain assignment: `lhs = rhs;`
         if self.peek().kind == TokenKind::Eq {
             self.advance();
             let rhs = self.parse_expr()?;
@@ -1146,6 +1208,56 @@ impl Parser {
                     loc,
                 });
             }
+        }
+        // Compound assignment: `name op= rhs;`  Desugar to `name = name op rhs`.
+        let compound_op = match self.peek().kind {
+            TokenKind::PlusEq => Some(BinOp::Add),
+            TokenKind::MinusEq => Some(BinOp::Sub),
+            TokenKind::StarEq => Some(BinOp::Mul),
+            TokenKind::SlashEq => Some(BinOp::Div),
+            TokenKind::PercentEq => Some(BinOp::Rem),
+            TokenKind::AmpEq => Some(BinOp::BitAnd),
+            TokenKind::PipeEq => Some(BinOp::BitOr),
+            TokenKind::CaretEq => Some(BinOp::BitXor),
+            TokenKind::ShlEq => Some(BinOp::Shl),
+            TokenKind::ShrEq => Some(BinOp::Shr),
+            _ => None,
+        };
+        if let Some(op) = compound_op {
+            self.advance();
+            let rhs = self.parse_expr()?;
+            self.expect(&TokenKind::Semicolon)?;
+            let expr_loc = expr.loc;
+            // For simple variable targets, desugar `x op= rhs` → `x = x op rhs`.
+            if let ExprKind::Var(ref name) = expr.kind {
+                let lhs_copy = Expr {
+                    kind: ExprKind::Var(name.clone()),
+                    loc: expr_loc,
+                };
+                let desugared_rhs = Expr {
+                    kind: ExprKind::BinOp {
+                        op,
+                        lhs: Box::new(lhs_copy),
+                        rhs: Box::new(rhs),
+                    },
+                    loc: expr_loc,
+                };
+                let ExprKind::Var(name) = expr.kind else {
+                    unreachable!()
+                };
+                return Ok(Stmt {
+                    kind: StmtKind::Assign {
+                        name,
+                        expr: desugared_rhs,
+                    },
+                    loc,
+                });
+            }
+            // Complex lvalue (arr[i], obj.field): emit as `lhs op= rhs` in C via CompoundAssign.
+            return Ok(Stmt {
+                kind: StmtKind::CompoundAssign { op, lhs: expr, rhs },
+                loc,
+            });
         }
         if self.peek().kind == TokenKind::RBrace {
             return Ok(Stmt {
@@ -1182,6 +1294,34 @@ impl Parser {
     fn parse_if(&mut self) -> Result<Stmt, Error> {
         let loc = self.loc();
         self.expect(&TokenKind::If)?;
+        // `if let pat = expr { ... } [else { ... }]`
+        if self.peek().kind == TokenKind::Let {
+            self.advance();
+            let pat = self.parse_pat()?;
+            self.expect(&TokenKind::Eq)?;
+            let expr = self.parse_expr()?;
+            let then_block = self.parse_block()?;
+            let else_block = if self.peek().kind == TokenKind::Else {
+                self.advance();
+                if self.peek().kind == TokenKind::If {
+                    let inner = self.parse_if()?;
+                    Some(Block { stmts: vec![inner] })
+                } else {
+                    Some(self.parse_block()?)
+                }
+            } else {
+                None
+            };
+            return Ok(Stmt {
+                kind: StmtKind::IfLet {
+                    pat,
+                    expr,
+                    then_block,
+                    else_block,
+                },
+                loc,
+            });
+        }
         let cond = self.parse_expr()?;
         let then_block = self.parse_block()?;
         let else_block = if self.peek().kind == TokenKind::Else {
@@ -1238,6 +1378,13 @@ impl Parser {
         while self.peek().kind != TokenKind::RBrace && !self.at_eof() {
             let arm_loc = self.loc();
             let pat = self.parse_pat()?;
+            // Optional match guard: `if expr`
+            let guard = if self.peek().kind == TokenKind::If {
+                self.advance();
+                Some(self.parse_expr()?)
+            } else {
+                None
+            };
             self.expect(&TokenKind::FatArrow)?;
             let body = if self.peek().kind == TokenKind::LBrace {
                 self.parse_block()?
@@ -1250,6 +1397,7 @@ impl Parser {
             }
             arms.push(MatchArm {
                 pat,
+                guard,
                 body,
                 loc: arm_loc,
             });
@@ -1265,14 +1413,28 @@ impl Parser {
         let loc = self.loc();
         let tok = self.peek().clone();
         match &tok.kind {
-            TokenKind::Ident(name) if name == "println" => {
-                self.expect_ident()?;
+            TokenKind::Ident(name)
+                if matches!(name.as_str(), "println" | "print" | "eprintln" | "eprint")
+                    && self
+                        .tokens
+                        .get(self.pos + 1)
+                        .map(|t| t.kind == TokenKind::Bang)
+                        .unwrap_or(false) =>
+            {
+                let macro_name = self.expect_ident()?;
+                let newline = macro_name == "println" || macro_name == "eprintln";
+                let stderr = macro_name == "eprintln" || macro_name == "eprint";
                 self.expect(&TokenKind::Bang)?;
                 self.expect(&TokenKind::LParen)?;
                 let str_tok = self.peek().clone();
                 let format = match &str_tok.kind {
                     TokenKind::StringLit(s) => s.clone(),
-                    _ => return Err(Error::new(str_tok.loc, "println! expects a string literal")),
+                    _ => {
+                        return Err(Error::new(
+                            str_tok.loc,
+                            format!("{macro_name}! expects a string literal"),
+                        ));
+                    }
                 };
                 self.advance();
                 let mut args = Vec::new();
@@ -1285,7 +1447,12 @@ impl Parser {
                     self.advance();
                 }
                 Ok(Stmt {
-                    kind: StmtKind::Println { format, args },
+                    kind: StmtKind::Println {
+                        format,
+                        args,
+                        newline,
+                        stderr,
+                    },
                     loc,
                 })
             }
@@ -1308,11 +1475,32 @@ impl Parser {
     }
 
     fn parse_pat(&mut self) -> Result<Pat, Error> {
+        let first = self.parse_single_pat()?;
+        // Or-pattern: `pat1 | pat2 | ...`
+        if self.peek().kind == TokenKind::Pipe {
+            let mut alternatives = vec![first];
+            while self.peek().kind == TokenKind::Pipe {
+                self.advance();
+                alternatives.push(self.parse_single_pat()?);
+            }
+            Ok(Pat::Or(alternatives))
+        } else {
+            Ok(first)
+        }
+    }
+
+    fn parse_single_pat(&mut self) -> Result<Pat, Error> {
         let tok = self.peek().clone();
         match &tok.kind {
             TokenKind::Ident(name) if name == "_" => {
                 self.advance();
                 Ok(Pat::Wildcard)
+            }
+            TokenKind::Ident(name) if name.chars().next().is_some_and(|c| c.is_lowercase()) => {
+                // Binding pattern: `x` — binds the matched value to a variable.
+                let name = name.clone();
+                self.advance();
+                Ok(Pat::Binding(name))
             }
             TokenKind::Ident(name) if name.chars().next().is_some_and(|c| c.is_uppercase()) => {
                 let type_name = name.clone();
@@ -1401,13 +1589,20 @@ impl Parser {
 
     fn parse_println(&mut self) -> Result<Stmt, Error> {
         let loc = self.loc();
-        self.expect_ident()?;
+        let macro_name = self.expect_ident()?;
+        let newline = macro_name == "println" || macro_name == "eprintln";
+        let stderr = macro_name == "eprintln" || macro_name == "eprint";
         self.expect(&TokenKind::Bang)?;
         self.expect(&TokenKind::LParen)?;
         let str_tok = self.peek().clone();
         let format = match &str_tok.kind {
             TokenKind::StringLit(s) => s.clone(),
-            _ => return Err(Error::new(str_tok.loc, "println! expects a string literal")),
+            _ => {
+                return Err(Error::new(
+                    str_tok.loc,
+                    format!("{macro_name}! expects a string literal"),
+                ));
+            }
         };
         self.advance();
         let mut args = Vec::new();
@@ -1418,7 +1613,12 @@ impl Parser {
         self.expect(&TokenKind::RParen)?;
         self.expect(&TokenKind::Semicolon)?;
         Ok(Stmt {
-            kind: StmtKind::Println { format, args },
+            kind: StmtKind::Println {
+                format,
+                args,
+                newline,
+                stderr,
+            },
             loc,
         })
     }
@@ -2131,6 +2331,93 @@ impl Parser {
                 let block = self.parse_block()?;
                 Ok(Expr {
                     kind: ExprKind::Unsafe(block),
+                    loc,
+                })
+            }
+            TokenKind::LBrace => {
+                // Block used as an expression: `{ stmts; expr }`
+                // parse_block() already consumes `{` and `}`.
+                let block = self.parse_block()?;
+                Ok(Expr {
+                    kind: ExprKind::Block(block),
+                    loc,
+                })
+            }
+            TokenKind::If => {
+                self.advance(); // consume `if`
+                let cond = self.parse_expr()?;
+                let then_block = self.parse_block()?;
+                let else_block = if self.peek().kind == TokenKind::Else {
+                    self.advance();
+                    if self.peek().kind == TokenKind::If {
+                        // else if: parse recursively as expression, wrap in block
+                        let inner_expr = self.parse_primary()?;
+                        Some(Block {
+                            stmts: vec![Stmt {
+                                kind: StmtKind::Return(Some(inner_expr)),
+                                loc,
+                            }],
+                        })
+                    } else {
+                        Some(self.parse_block()?)
+                    }
+                } else {
+                    None
+                };
+                Ok(Expr {
+                    kind: ExprKind::If {
+                        cond: Box::new(cond),
+                        then_block,
+                        else_block,
+                    },
+                    loc,
+                })
+            }
+            TokenKind::Match => {
+                self.advance(); // consume `match`
+                let expr = self.parse_expr()?;
+                self.expect(&TokenKind::LBrace)?;
+                let mut arms = Vec::new();
+                while self.peek().kind != TokenKind::RBrace && !self.at_eof() {
+                    let arm_loc = self.loc();
+                    let pat = self.parse_pat()?;
+                    let guard = if self.peek().kind == TokenKind::If {
+                        self.advance();
+                        Some(self.parse_expr()?)
+                    } else {
+                        None
+                    };
+                    self.expect(&TokenKind::FatArrow)?;
+                    let body = if self.peek().kind == TokenKind::LBrace {
+                        self.parse_block()?
+                    } else {
+                        let stmt = self.parse_arm_stmt()?;
+                        Block { stmts: vec![stmt] }
+                    };
+                    if self.peek().kind == TokenKind::Comma {
+                        self.advance();
+                    }
+                    arms.push(MatchArm {
+                        pat,
+                        guard,
+                        body,
+                        loc: arm_loc,
+                    });
+                }
+                self.expect(&TokenKind::RBrace)?;
+                Ok(Expr {
+                    kind: ExprKind::Match {
+                        expr: Box::new(expr),
+                        arms,
+                    },
+                    loc,
+                })
+            }
+            TokenKind::Loop => {
+                self.advance(); // consume `loop`
+                let block = self.parse_block()?;
+                Ok(Expr {
+                    kind: ExprKind::Loop(block),
                     loc,
                 })
             }
