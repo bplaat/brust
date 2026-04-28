@@ -75,10 +75,18 @@ impl Parser {
     fn parse_item(&mut self) -> Result<Item, Error> {
         let tok = self.peek().clone();
         match &tok.kind {
-            TokenKind::Fn => Ok(Item::Fn(self.parse_fn()?)),
+            TokenKind::Fn     => Ok(Item::Fn(self.parse_fn()?)),
             TokenKind::Struct => Ok(Item::Struct(self.parse_struct()?)),
-            TokenKind::Impl => Ok(Item::Impl(self.parse_impl()?)),
-            TokenKind::Enum => Ok(Item::Enum(self.parse_enum()?)),
+            TokenKind::Impl   => Ok(Item::Impl(self.parse_impl()?)),
+            TokenKind::Enum   => Ok(Item::Enum(self.parse_enum()?)),
+            TokenKind::Type   => {
+                self.advance();
+                let name = self.expect_ident()?;
+                self.expect(&TokenKind::Eq)?;
+                let ty = self.parse_ty()?;
+                self.expect(&TokenKind::Semicolon)?;
+                Ok(Item::TypeAlias { name, ty })
+            }
             _ => Err(Error::new(
                 tok.line,
                 tok.col,
@@ -250,6 +258,11 @@ impl Parser {
     fn parse_ty(&mut self) -> Result<Ty, Error> {
         let tok = self.peek().clone();
         match &tok.kind {
+            // Never type: !
+            TokenKind::Bang => {
+                self.advance();
+                Ok(Ty::Never)
+            }
             TokenKind::Amp => {
                 self.advance();
                 // &str

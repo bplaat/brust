@@ -19,6 +19,7 @@ pub enum TokenKind {
     Match,
     Unsafe,
     As,
+    Type,
     // Identifiers and literals
     Ident(String),
     IntLit(i64),
@@ -507,7 +508,8 @@ impl<'a> Lexer<'a> {
             "enum" => TokenKind::Enum,
             "match" => TokenKind::Match,
             "unsafe" => TokenKind::Unsafe,
-            "as" => TokenKind::As,
+            "as"     => TokenKind::As,
+            "type"   => TokenKind::Type,
             _ => TokenKind::Ident(name),
         }
     }
