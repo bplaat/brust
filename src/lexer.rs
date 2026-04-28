@@ -17,6 +17,8 @@ pub enum TokenKind {
     SelfKw,  // `self`
     Enum,
     Match,
+    Unsafe,
+    As,
     // Identifiers and literals
     Ident(String),
     IntLit(i64),
@@ -287,6 +289,8 @@ impl<'a> Lexer<'a> {
             "self"   => TokenKind::SelfKw,
             "enum"   => TokenKind::Enum,
             "match"  => TokenKind::Match,
+            "unsafe" => TokenKind::Unsafe,
+            "as"     => TokenKind::As,
             _ => TokenKind::Ident(name),
         }
     }

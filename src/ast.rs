@@ -77,6 +77,10 @@ pub enum Ty {
     Unit,            // ()
     Tuple(Vec<Ty>),  // (T0, T1, ...)
     Named(String),   // user-defined struct/enum type
+    Ref(Box<Ty>),    // &T
+    RefMut(Box<Ty>), // &mut T
+    RawConst(Box<Ty>), // *const T
+    RawMut(Box<Ty>),   // *mut T
 }
 
 pub struct Block {
@@ -142,6 +146,14 @@ pub enum Expr {
     MethodCall { expr: Box<Expr>, method: String, args: Vec<Expr> },
     UnOp { op: UnOp, operand: Box<Expr> },
     BinOp { op: BinOp, lhs: Box<Expr>, rhs: Box<Expr> },
+    /// `&expr` — address-of
+    AddrOf { mutable: bool, expr: Box<Expr> },
+    /// `*expr` — raw pointer / reference dereference
+    Deref(Box<Expr>),
+    /// `expr as Ty` — type cast
+    Cast { expr: Box<Expr>, ty: Ty },
+    /// `unsafe { stmts }` — unsafe block
+    Unsafe(Block),
 }
 
 #[derive(Clone, Copy)]

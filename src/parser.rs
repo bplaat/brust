@@ -175,28 +175,30 @@ impl Parser {
                 self.expect(&TokenKind::Comma)?;
                 if self.peek().kind == TokenKind::RParen { break; }
             }
-            if self.peek().kind == TokenKind::Amp {
-                self.advance();
-                if self.peek().kind == TokenKind::Mut { self.advance(); }
-            }
             let name = self.expect_ident()?;
             self.expect(&TokenKind::Colon)?;
-            if self.peek().kind == TokenKind::Amp {
-                self.advance();
-                if self.peek().kind == TokenKind::Mut { self.advance(); }
-            }
             params.push(Param { name, ty: self.parse_ty()? });
         }
         Ok(params)
     }
 
     fn parse_ty(&mut self) -> Result<Ty, Error> {
-        if self.peek().kind == TokenKind::Amp {
-            self.advance();
-            if self.peek().kind == TokenKind::Mut { self.advance(); }
-        }
         let tok = self.peek().clone();
         match &tok.kind {
+            TokenKind::Amp => {
+                self.advance();
+                if self.peek().kind == TokenKind::Mut { self.advance(); Ok(Ty::RefMut(Box::new(self.parse_ty()?))) }
+                else { Ok(Ty::Ref(Box::new(self.parse_ty()?))) }
+            }
+            TokenKind::Star => {
+                self.advance();
+                let tok2 = self.peek().clone();
+                match &tok2.kind {
+                    TokenKind::Ident(kw) if kw == "const" => { self.advance(); Ok(Ty::RawConst(Box::new(self.parse_ty()?))) }
+                    TokenKind::Mut => { self.advance(); Ok(Ty::RawMut(Box::new(self.parse_ty()?))) }
+                    _ => Err(Error::new(tok2.line, tok2.col, "expected `const` or `mut` after `*` in type".to_string())),
+                }
+            }
             TokenKind::Ident(name) => {
                 let ty = match name.as_str() {
                     "i8"    => Ty::I8,    "i16"   => Ty::I16,
@@ -247,11 +249,32 @@ impl Parser {
             TokenKind::If     => self.parse_if(),
             TokenKind::While  => self.parse_while(),
             TokenKind::Match  => self.parse_match(),
+            TokenKind::Unsafe => {
+                // `unsafe { ... }` as a statement wraps the block
+                self.advance();
+                let block = self.parse_block()?;
+                // Inline the unsafe block's stmts as a regular Expr::Unsafe to preserve tail-return
+                let expr = Expr::Unsafe(block);
+                if self.peek().kind == TokenKind::RBrace {
+                    return Ok(Stmt::Return(Some(expr)));
+                }
+                if self.peek().kind == TokenKind::Semicolon { self.advance(); }
+                Ok(Stmt::Expr(expr))
+            }
             TokenKind::Ident(name) if name == "println" => self.parse_println(),
             TokenKind::Ident(_) | TokenKind::SelfKw => self.parse_ident_stmt(),
-            // Any other expression (int literal, bool, unary, tuple, ...) — may be tail return
+            // Any other expression (int literal, bool, unary, deref, tuple, ...) — may be assignment or tail return
             _ => {
                 let expr = self.parse_expr()?;
+                // Handle `*ptr = rhs;` and `expr.field = rhs;` assignments
+                if self.peek().kind == TokenKind::Eq {
+                    self.advance();
+                    let rhs = self.parse_expr()?;
+                    self.expect(&TokenKind::Semicolon)?;
+                    return Ok(Stmt::Expr(Expr::BinOp {
+                        op: BinOp::Eq, lhs: Box::new(expr), rhs: Box::new(rhs),
+                    }));
+                }
                 if self.peek().kind == TokenKind::RBrace {
                     return Ok(Stmt::Return(Some(expr)));
                 }
@@ -551,23 +574,40 @@ impl Parser {
     }
 
     fn parse_multiplicative(&mut self) -> Result<Expr, Error> {
-        let mut lhs = self.parse_unary()?;
+        let mut lhs = self.parse_cast()?;
         loop {
             let op = match self.peek().kind {
                 TokenKind::Star => BinOp::Mul, TokenKind::Slash => BinOp::Div,
                 TokenKind::Percent => BinOp::Rem, _ => break,
             };
             self.advance();
-            lhs = Expr::BinOp { op, lhs: Box::new(lhs), rhs: Box::new(self.parse_unary()?) };
+            lhs = Expr::BinOp { op, lhs: Box::new(lhs), rhs: Box::new(self.parse_cast()?) };
         }
         Ok(lhs)
     }
 
+    // `x as T` — higher precedence than arithmetic, lower than unary
+    fn parse_cast(&mut self) -> Result<Expr, Error> {
+        let mut expr = self.parse_unary()?;
+        while self.peek().kind == TokenKind::As {
+            self.advance();
+            let ty = self.parse_ty()?;
+            expr = Expr::Cast { expr: Box::new(expr), ty };
+        }
+        Ok(expr)
+    }
+
     fn parse_unary(&mut self) -> Result<Expr, Error> {
         match self.peek().kind {
-            TokenKind::Minus => { self.advance(); Ok(Expr::UnOp { op: UnOp::Neg,    operand: Box::new(self.parse_postfix()?) }) }
-            TokenKind::Bang  => { self.advance(); Ok(Expr::UnOp { op: UnOp::Not,    operand: Box::new(self.parse_postfix()?) }) }
-            TokenKind::Tilde => { self.advance(); Ok(Expr::UnOp { op: UnOp::BitNot, operand: Box::new(self.parse_postfix()?) }) }
+            TokenKind::Minus  => { self.advance(); Ok(Expr::UnOp { op: UnOp::Neg,    operand: Box::new(self.parse_unary()?) }) }
+            TokenKind::Bang   => { self.advance(); Ok(Expr::UnOp { op: UnOp::Not,    operand: Box::new(self.parse_unary()?) }) }
+            TokenKind::Tilde  => { self.advance(); Ok(Expr::UnOp { op: UnOp::BitNot, operand: Box::new(self.parse_unary()?) }) }
+            TokenKind::Star   => { self.advance(); Ok(Expr::Deref(Box::new(self.parse_unary()?))) }
+            TokenKind::Amp    => {
+                self.advance();
+                let mutable = if self.peek().kind == TokenKind::Mut { self.advance(); true } else { false };
+                Ok(Expr::AddrOf { mutable, expr: Box::new(self.parse_unary()?) })
+            }
             _ => self.parse_postfix(),
         }
     }
@@ -590,7 +630,9 @@ impl Parser {
                         expr = Expr::Field { expr: Box::new(expr), field };
                     }
                 }
-            } else { break; }
+            } else {
+                break;
+            }
         }
         Ok(expr)
     }
@@ -600,10 +642,6 @@ impl Parser {
         let mut args = Vec::new();
         while self.peek().kind != TokenKind::RParen && !self.at_eof() {
             if !args.is_empty() { self.expect(&TokenKind::Comma)?; }
-            if self.peek().kind == TokenKind::Amp {
-                self.advance();
-                if self.peek().kind == TokenKind::Mut { self.advance(); }
-            }
             args.push(self.parse_expr()?);
         }
         self.expect(&TokenKind::RParen)?;
@@ -687,6 +725,12 @@ impl Parser {
                     self.expect(&TokenKind::RParen)?;
                     Ok(Expr::Tuple(elems))
                 } else { self.expect(&TokenKind::RParen)?; Ok(first) }
+            }
+
+            TokenKind::Unsafe => {
+                self.advance();
+                let block = self.parse_block()?;
+                Ok(Expr::Unsafe(block))
             }
 
             _ => Err(Error::new(tok.line, tok.col, format!("expected expression, got {:?}", tok.kind))),
