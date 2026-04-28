@@ -1,6 +1,6 @@
 use crate::ast::{
-    Block, BinOp, Expr, FieldDecl, FnDecl, File, ImplBlock, Item, Param, Receiver,
-    Stmt, StructDecl, Ty, UnOp,
+    Block, BinOp, Expr, EnumDecl, FieldDecl, FnDecl, File, ImplBlock, Item, MatchArm, Param,
+    Pat, Receiver, Stmt, StructDecl, Ty, UnOp,
 };
 use crate::error::Error;
 use crate::lexer::{Token, TokenKind};
@@ -75,8 +75,25 @@ impl Parser {
             TokenKind::Fn     => Ok(Item::Fn(self.parse_fn()?)),
             TokenKind::Struct => Ok(Item::Struct(self.parse_struct()?)),
             TokenKind::Impl   => Ok(Item::Impl(self.parse_impl()?)),
+            TokenKind::Enum   => Ok(Item::Enum(self.parse_enum()?)),
             _ => Err(Error::new(tok.line, tok.col, format!("expected item, got {:?}", tok.kind))),
         }
+    }
+
+    fn parse_enum(&mut self) -> Result<EnumDecl, Error> {
+        self.expect(&TokenKind::Enum)?;
+        let name = self.expect_ident()?;
+        self.expect(&TokenKind::LBrace)?;
+        let mut variants = Vec::new();
+        while self.peek().kind != TokenKind::RBrace && !self.at_eof() {
+            if !variants.is_empty() {
+                self.expect(&TokenKind::Comma)?;
+                if self.peek().kind == TokenKind::RBrace { break; }
+            }
+            variants.push(self.expect_ident()?);
+        }
+        self.expect(&TokenKind::RBrace)?;
+        Ok(EnumDecl { name, variants })
     }
 
     fn parse_struct(&mut self) -> Result<StructDecl, Error> {
@@ -236,6 +253,7 @@ impl Parser {
             TokenKind::Return => self.parse_return(),
             TokenKind::If     => self.parse_if(),
             TokenKind::While  => self.parse_while(),
+            TokenKind::Match  => self.parse_match(),
             TokenKind::Ident(name) if name == "println" => self.parse_println(),
             TokenKind::Ident(_) | TokenKind::SelfKw => self.parse_ident_stmt(),
             _ => Err(Error::new(tok.line, tok.col,
@@ -309,6 +327,91 @@ impl Parser {
             }
         } else { None };
         Ok(Stmt::If { cond, then_block, else_block })
+    }
+
+    fn parse_match(&mut self) -> Result<Stmt, Error> {
+        self.expect(&TokenKind::Match)?;
+        let expr = self.parse_expr()?;
+        self.expect(&TokenKind::LBrace)?;
+        let mut arms = Vec::new();
+        while self.peek().kind != TokenKind::RBrace && !self.at_eof() {
+            let pat = self.parse_pat()?;
+            self.expect(&TokenKind::FatArrow)?;
+            let body = if self.peek().kind == TokenKind::LBrace {
+                self.parse_block()?
+            } else {
+                // Single stmt/expr arm: no trailing semicolon required
+                let stmt = self.parse_arm_stmt()?;
+                Block { stmts: vec![stmt] }
+            };
+            // Optional trailing comma after arm
+            if self.peek().kind == TokenKind::Comma { self.advance(); }
+            arms.push(MatchArm { pat, body });
+        }
+        self.expect(&TokenKind::RBrace)?;
+        Ok(Stmt::Match { expr, arms })
+    }
+
+    /// Parse a single match arm statement (no trailing `;` required).
+    fn parse_arm_stmt(&mut self) -> Result<Stmt, Error> {
+        let tok = self.peek().clone();
+        match &tok.kind {
+            TokenKind::Ident(name) if name == "println" => {
+                self.expect_ident()?;
+                self.expect(&TokenKind::Bang)?;
+                self.expect(&TokenKind::LParen)?;
+                let str_tok = self.peek().clone();
+                let format = match &str_tok.kind {
+                    TokenKind::StringLit(s) => s.clone(),
+                    _ => return Err(Error::new(str_tok.line, str_tok.col,
+                        "println! expects a string literal as first argument")),
+                };
+                self.advance();
+                let mut args = Vec::new();
+                while self.peek().kind == TokenKind::Comma {
+                    self.advance();
+                    args.push(self.parse_expr()?);
+                }
+                self.expect(&TokenKind::RParen)?;
+                // Semicolon is optional in arm context
+                if self.peek().kind == TokenKind::Semicolon { self.advance(); }
+                Ok(Stmt::Println { format, args })
+            }
+            _ => {
+                let expr = self.parse_expr()?;
+                if self.peek().kind == TokenKind::Semicolon { self.advance(); }
+                Ok(Stmt::Expr(expr))
+            }
+        }
+    }
+
+    fn parse_pat(&mut self) -> Result<Pat, Error> {
+        let tok = self.peek().clone();
+        match &tok.kind {
+            // `_` wildcard
+            TokenKind::Ident(name) if name == "_" => { self.advance(); Ok(Pat::Wildcard) }
+            // `TypeName::Variant` (uppercase start = enum variant)
+            TokenKind::Ident(name) if name.chars().next().map_or(false, |c| c.is_uppercase()) => {
+                let type_name = name.clone();
+                self.advance();
+                self.expect(&TokenKind::ColonColon)?;
+                let variant = self.expect_ident()?;
+                Ok(Pat::EnumVariant { type_name, variant })
+            }
+            TokenKind::True  => { self.advance(); Ok(Pat::Bool(true)) }
+            TokenKind::False => { self.advance(); Ok(Pat::Bool(false)) }
+            TokenKind::IntLit(n) => { let n = *n; self.advance(); Ok(Pat::Int(n)) }
+            TokenKind::Minus => {
+                self.advance();
+                if let TokenKind::IntLit(n) = self.peek().kind.clone() {
+                    self.advance(); Ok(Pat::Int(-n))
+                } else {
+                    Err(Error::new(tok.line, tok.col, "expected integer after `-` in pattern"))
+                }
+            }
+            _ => Err(Error::new(tok.line, tok.col,
+                format!("expected pattern, got {:?}", tok.kind))),
+        }
     }
 
     fn parse_while(&mut self) -> Result<Stmt, Error> {
@@ -514,11 +617,16 @@ impl Parser {
                 let name = name.clone();
                 self.advance();
                 if self.peek().kind == TokenKind::ColonColon {
-                    // Associated call: `Type::method(args)`
+                    // Associated call: `Type::method(args)` or enum variant `Type::Variant`
                     self.advance();
                     let method = self.expect_ident()?;
-                    let args = self.parse_call_args()?;
-                    Ok(Expr::AssocCall { type_name: name, method, args })
+                    if self.peek().kind == TokenKind::LParen {
+                        let args = self.parse_call_args()?;
+                        Ok(Expr::AssocCall { type_name: name, method, args })
+                    } else {
+                        // Enum variant used as value: `Direction::North`
+                        Ok(Expr::AssocCall { type_name: name, method, args: vec![] })
+                    }
                 } else if self.peek().kind == TokenKind::LBrace
                     && name.chars().next().map_or(false, |c| c.is_uppercase())
                 {

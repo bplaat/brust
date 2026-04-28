@@ -7,6 +7,7 @@ pub enum Item {
     Fn(FnDecl),
     Struct(StructDecl),
     Impl(ImplBlock),
+    Enum(EnumDecl),
 }
 
 pub struct StructDecl {
@@ -17,6 +18,11 @@ pub struct StructDecl {
 pub struct FieldDecl {
     pub name: String,
     pub ty: Ty,
+}
+
+pub struct EnumDecl {
+    pub name: String,
+    pub variants: Vec<String>,
 }
 
 pub struct ImplBlock {
@@ -72,8 +78,27 @@ pub enum Stmt {
     If { cond: Expr, then_block: Block, else_block: Option<Block> },
     /// `while expr { ... }`
     While { cond: Expr, body: Block },
+    /// `match expr { pat => { ... }, ... }`
+    Match { expr: Expr, arms: Vec<MatchArm> },
     /// Expression used as a statement, e.g. a function call.
     Expr(Expr),
+}
+
+pub struct MatchArm {
+    pub pat: Pat,
+    pub body: Block,
+}
+
+/// Match patterns (simplified: no nested patterns).
+pub enum Pat {
+    /// `_` wildcard / default
+    Wildcard,
+    /// `true` or `false`
+    Bool(bool),
+    /// Integer literal
+    Int(i64),
+    /// `TypeName::Variant` — enum variant
+    EnumVariant { type_name: String, variant: String },
 }
 
 pub enum Expr {

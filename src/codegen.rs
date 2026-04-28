@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use crate::ast::{BinOp, Expr, FnDecl, File, ImplBlock, Item, Receiver, Stmt, StructDecl, Ty, UnOp};
+use crate::ast::{BinOp, EnumDecl, Expr, FnDecl, File, ImplBlock, Item, Receiver, Stmt, StructDecl, Ty, UnOp};
 
 // ---------------------------------------------------------------------------
 // Codegen context
@@ -37,11 +37,12 @@ pub fn generate(file: &File) -> String {
     out.push_str("#include <stdint.h>\n");
     out.push_str("#include <stdio.h>\n");
 
-    // Emit struct typedefs first
+    // Emit struct typedefs first, then enum typedefs
     for item in &file.items {
-        if let Item::Struct(s) = item {
-            out.push('\n');
-            emit_struct(&mut out, s);
+        match item {
+            Item::Struct(s) => { out.push('\n'); emit_struct(&mut out, s); }
+            Item::Enum(e)   => { out.push('\n'); emit_enum(&mut out, e); }
+            _ => {}
         }
     }
 
@@ -67,7 +68,7 @@ pub fn generate(file: &File) -> String {
         match item {
             Item::Fn(f) => emit_fn(&mut out, f, None),
             Item::Impl(imp) => emit_impl(&mut out, imp),
-            Item::Struct(_) => {} // already emitted
+            Item::Struct(_) | Item::Enum(_) => {} // already emitted
         }
     }
 
@@ -108,6 +109,15 @@ fn emit_struct(out: &mut String, s: &StructDecl) {
         out.push_str(&format!("    {} {};\n", ty_str(&f.ty), f.name));
     }
     out.push_str(&format!("}} {};\n", s.name));
+}
+
+fn emit_enum(out: &mut String, e: &EnumDecl) {
+    out.push_str(&format!("typedef enum {{\n"));
+    for (i, variant) in e.variants.iter().enumerate() {
+        let comma = if i + 1 < e.variants.len() { "," } else { "" };
+        out.push_str(&format!("    {}_{} = {}{}\n", e.name, variant, i, comma));
+    }
+    out.push_str(&format!("}} {};\n", e.name));
 }
 
 // ---------------------------------------------------------------------------
@@ -235,6 +245,24 @@ fn emit_stmt(out: &mut String, stmt: &Stmt, ctx: &mut Ctx, indent: usize) {
             out.push_str(&format!("{p}}}\n"));
         }
 
+        Stmt::Match { expr, arms } => {
+            out.push_str(&format!("{p}switch ({}) {{\n", emit_expr(expr, ctx)));
+            for arm in arms {
+                let case = match &arm.pat {
+                    crate::ast::Pat::Wildcard  => format!("{p}default:"),
+                    crate::ast::Pat::Bool(b)   => format!("{p}case {}:", if *b { 1 } else { 0 }),
+                    crate::ast::Pat::Int(n)     => format!("{p}case {}:", n),
+                    crate::ast::Pat::EnumVariant { type_name, variant } =>
+                        format!("{p}case {type_name}_{variant}:"),
+                };
+                out.push_str(&format!("{case} {{\n"));
+                for s in &arm.body.stmts { emit_stmt(out, s, ctx, indent + 2); }
+                out.push_str(&format!("{}    break;\n", p));
+                out.push_str(&format!("{}  }}\n", p));
+            }
+            out.push_str(&format!("{p}}}\n"));
+        }
+
         Stmt::Expr(expr) => {
             // Field assignment: BinOp::Eq used as assignment marker
             if let Expr::BinOp { op: BinOp::Eq, lhs, rhs } = expr {
@@ -327,8 +355,14 @@ fn emit_expr(expr: &Expr, ctx: &mut Ctx) -> String {
         }
 
         Expr::AssocCall { type_name, method, args } => {
-            let args_str: Vec<String> = args.iter().map(|a| emit_expr(a, ctx)).collect();
-            format!("{type_name}_{method}({})", args_str.join(", "))
+            if args.is_empty() {
+                // Enum variant or zero-arg associated function
+                // Emit as variant constant if no parens needed
+                format!("{type_name}_{method}")
+            } else {
+                let args_str: Vec<String> = args.iter().map(|a| emit_expr(a, ctx)).collect();
+                format!("{type_name}_{method}({})", args_str.join(", "))
+            }
         }
 
         Expr::MethodCall { expr, method, args } => {
