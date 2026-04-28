@@ -481,6 +481,28 @@ impl Lexer {
         Ok(TokenKind::CharLit(ch))
     }
 
+    /// Consume an optional integer type suffix (e.g. `u8`, `i64`, `usize`).
+    /// Must be called right after the digit sequence, before returning the token.
+    fn consume_int_suffix(&mut self) {
+        // Longest suffixes first to avoid consuming a prefix of a longer one.
+        const SUFFIXES: &[&[u8]] = &[
+            b"u128", b"i128", b"usize", b"isize",
+            b"u64", b"i64", b"u32", b"i32", b"u16", b"i16", b"u8", b"i8",
+        ];
+        for suffix in SUFFIXES {
+            let end = self.pos + suffix.len();
+            if self.src.get(self.pos..end) == Some(*suffix) {
+                // Only consume if not followed by another alphanumeric char.
+                if !self.src.get(end).copied().is_some_and(|c| c.is_ascii_alphanumeric() || c == b'_') {
+                    for _ in 0..suffix.len() {
+                        self.advance();
+                    }
+                    return;
+                }
+            }
+        }
+    }
+
     fn lex_number(&mut self, loc: Loc) -> Result<TokenKind, Error> {
         if self.peek() == Some(b'0') {
             let next = self.src.get(self.pos + 1).copied();
@@ -497,9 +519,11 @@ impl Lexer {
                         s.push(c as char);
                     }
                 }
-                return i64::from_str_radix(&s, 16)
+                let tok = i64::from_str_radix(&s, 16)
                     .map(TokenKind::IntLit)
-                    .map_err(|_| Error::new(loc, format!("hex literal '0x{s}' out of range")));
+                    .map_err(|_| Error::new(loc, format!("hex literal '0x{s}' out of range")))?;
+                self.consume_int_suffix();
+                return Ok(tok);
             }
             if next == Some(b'b') || next == Some(b'B') {
                 self.advance();
@@ -514,9 +538,11 @@ impl Lexer {
                         s.push(c as char);
                     }
                 }
-                return i64::from_str_radix(&s, 2)
+                let tok = i64::from_str_radix(&s, 2)
                     .map(TokenKind::IntLit)
-                    .map_err(|_| Error::new(loc, format!("binary literal '0b{s}' out of range")));
+                    .map_err(|_| Error::new(loc, format!("binary literal '0b{s}' out of range")))?;
+                self.consume_int_suffix();
+                return Ok(tok);
             }
         }
         let mut s = String::new();
@@ -562,9 +588,12 @@ impl Lexer {
                 .map(TokenKind::FloatLit)
                 .map_err(|_| Error::new(loc, format!("float literal '{s}' out of range")));
         }
-        s.parse::<i64>()
+        let tok = s
+            .parse::<i64>()
             .map(TokenKind::IntLit)
-            .map_err(|_| Error::new(loc, format!("integer literal '{s}' out of range")))
+            .map_err(|_| Error::new(loc, format!("integer literal '{s}' out of range")))?;
+        self.consume_int_suffix();
+        Ok(tok)
     }
 
     fn lex_ident_or_keyword(&mut self) -> TokenKind {

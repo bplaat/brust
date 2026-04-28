@@ -252,6 +252,13 @@ pub enum StmtKind {
     },
     /// `while expr { ... }`
     While { cond: Expr, body: Block },
+    /// `while let pat = expr { ... }`
+    WhileLet {
+        pat: Pat,
+        expr: Expr,
+        expr_ty: Option<Ty>,
+        body: Block,
+    },
     /// `loop { ... }` — infinite loop, exit via `break`
     Loop(Block),
     /// `for <var> in <expr> { ... }` — iterate over an array or range
@@ -260,6 +267,8 @@ pub enum StmtKind {
         iter: Expr,
         body: Block,
         elem_ty: Option<Ty>,
+        /// Type of the iterator expression, set by the type checker.
+        iter_ty: Option<Ty>,
     },
     /// `break [expr]` — exit the nearest enclosing loop, optionally with a value
     Break(Option<Expr>),

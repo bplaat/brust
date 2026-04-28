@@ -763,9 +763,10 @@ impl TypeChecker {
                 self.check_block(body, scope, return_ty);
             }
 
-            StmtKind::For { var, iter, body, elem_ty } => {
-                let iter_ty = self.infer_expr(iter, scope);
-                let inferred_elem_ty = match &iter_ty {
+            StmtKind::For { var, iter, body, elem_ty, iter_ty } => {
+                let it = self.infer_expr(iter, scope);
+                *iter_ty = Some(it.clone());
+                let inferred_elem_ty = match &it {
                     Ty::Array(elem, _) => *elem.clone(),
                     _ => Ty::I64,
                 };
@@ -827,6 +828,20 @@ impl TypeChecker {
                 if let Some(eb) = else_block {
                     self.check_block(eb, scope, return_ty);
                 }
+            }
+
+            StmtKind::WhileLet {
+                pat,
+                expr,
+                expr_ty,
+                body,
+            } => {
+                let inferred_expr_ty = self.infer_expr(expr, scope);
+                *expr_ty = Some(inferred_expr_ty.clone());
+                scope.push();
+                self.bind_pat_vars(pat, &inferred_expr_ty, scope);
+                self.check_block_stmts(&mut body.stmts, scope, return_ty);
+                scope.pop();
             }
 
             StmtKind::Expr(expr) => {
@@ -2122,7 +2137,7 @@ impl BorrowChecker {
                 self.check_block(body, scope);
             }
 
-            StmtKind::For { var, iter, body, .. } => {
+            StmtKind::For { var, iter: _, body, .. } => {
                 scope.insert(
                     var.clone(),
                     BVar {
@@ -2192,7 +2207,47 @@ impl BorrowChecker {
                 }
             }
 
-            StmtKind::Match { expr, arms, .. } => {
+            StmtKind::WhileLet {
+                pat,
+                expr,
+                body,
+                ..
+            } => {
+                self.check_expr(expr, scope, false);
+                let mut body_scope = scope.clone();
+                if let Pat::EnumVariant { bindings, .. } = pat {
+                    match bindings {
+                        PatBindings::Tuple(names) => {
+                            for n in names {
+                                body_scope.insert(
+                                    n.clone(),
+                                    BVar {
+                                        ty: Ty::Unit,
+                                        mutable: false,
+                                        moved: false,
+                                    },
+                                );
+                            }
+                        }
+                        PatBindings::Named(fields) => {
+                            for (_, binding) in fields {
+                                body_scope.insert(
+                                    binding.clone(),
+                                    BVar {
+                                        ty: Ty::Unit,
+                                        mutable: false,
+                                        moved: false,
+                                    },
+                                );
+                            }
+                        }
+                        PatBindings::None => {}
+                    }
+                }
+                self.check_block(body, &mut body_scope);
+            }
+
+            StmtKind::Match { expr: _, arms, .. } => {
                 for arm in arms {
                     let mut arm_scope = scope.clone();
                     // Add pattern bindings (type unknown here — use Unit).
@@ -2401,7 +2456,7 @@ impl BorrowChecker {
                     self.check_stmts(&b.stmts, scope);
                 }
             }
-            ExprKind::Match { expr, arms, .. } => {
+            ExprKind::Match { expr: _, arms, .. } => {
                 for arm in arms {
                     self.check_stmts(&arm.body.stmts, scope);
                 }
