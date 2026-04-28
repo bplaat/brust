@@ -6,6 +6,7 @@ pub enum TokenKind {
     Fn,
     Let,
     Mut,
+    Return,
     // Identifiers and literals
     Ident(String),
     IntLit(i64),
@@ -23,7 +24,9 @@ pub enum TokenKind {
     RBrace,
     Semicolon,
     Comma,
+    Colon,
     Eq,
+    Arrow, // ->
     Bang,
     Eof,
 }
@@ -111,10 +114,19 @@ impl<'a> Lexer<'a> {
             b'}' => { self.advance(); TokenKind::RBrace }
             b';' => { self.advance(); TokenKind::Semicolon }
             b',' => { self.advance(); TokenKind::Comma }
+            b':' => { self.advance(); TokenKind::Colon }
             b'=' => { self.advance(); TokenKind::Eq }
             b'!' => { self.advance(); TokenKind::Bang }
             b'+' => { self.advance(); TokenKind::Plus }
-            b'-' => { self.advance(); TokenKind::Minus }
+            b'-' => {
+                self.advance();
+                if self.peek() == Some(b'>') {
+                    self.advance();
+                    TokenKind::Arrow
+                } else {
+                    TokenKind::Minus
+                }
+            }
             b'*' => { self.advance(); TokenKind::Star }
             b'/' => { self.advance(); TokenKind::Slash }
             b'%' => { self.advance(); TokenKind::Percent }
@@ -167,9 +179,10 @@ impl<'a> Lexer<'a> {
             name.push(self.advance().unwrap() as char);
         }
         match name.as_str() {
-            "fn"  => TokenKind::Fn,
-            "let" => TokenKind::Let,
-            "mut" => TokenKind::Mut,
+            "fn"     => TokenKind::Fn,
+            "let"    => TokenKind::Let,
+            "mut"    => TokenKind::Mut,
+            "return" => TokenKind::Return,
             _ => TokenKind::Ident(name),
         }
     }

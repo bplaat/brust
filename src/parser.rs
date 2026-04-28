@@ -1,4 +1,4 @@
-use crate::ast::{Block, BinOp, Expr, FnDecl, File, Item, Stmt};
+use crate::ast::{Block, BinOp, Expr, FnDecl, File, Item, Param, Stmt, Ty};
 use crate::error::Error;
 use crate::lexer::{Token, TokenKind};
 
@@ -73,9 +73,56 @@ impl Parser {
         self.expect(&TokenKind::Fn)?;
         let name = self.expect_ident()?;
         self.expect(&TokenKind::LParen)?;
+        let params = self.parse_params()?;
         self.expect(&TokenKind::RParen)?;
+        // Optional return type: `-> Ty`
+        let return_ty = if self.peek().kind == TokenKind::Arrow {
+            self.advance();
+            self.parse_ty()?
+        } else {
+            Ty::Unit
+        };
         let body = self.parse_block()?;
-        Ok(FnDecl { name, body })
+        Ok(FnDecl { name, params, return_ty, body })
+    }
+
+    fn parse_params(&mut self) -> Result<Vec<Param>, Error> {
+        let mut params = Vec::new();
+        while self.peek().kind != TokenKind::RParen && !self.at_eof() {
+            if !params.is_empty() {
+                self.expect(&TokenKind::Comma)?;
+            }
+            let name = self.expect_ident()?;
+            self.expect(&TokenKind::Colon)?;
+            let ty = self.parse_ty()?;
+            params.push(Param { name, ty });
+        }
+        Ok(params)
+    }
+
+    fn parse_ty(&mut self) -> Result<Ty, Error> {
+        let tok = self.peek().clone();
+        match &tok.kind {
+            TokenKind::Ident(name) => {
+                let ty = match name.as_str() {
+                    "i32"  => Ty::I32,
+                    "i64"  => Ty::I64,
+                    "bool" => Ty::Bool,
+                    _ => return Err(Error::new(tok.line, tok.col,
+                        format!("unknown type '{name}'"))),
+                };
+                self.advance();
+                Ok(ty)
+            }
+            TokenKind::LParen => {
+                // Unit type `()`
+                self.advance();
+                self.expect(&TokenKind::RParen)?;
+                Ok(Ty::Unit)
+            }
+            _ => Err(Error::new(tok.line, tok.col,
+                format!("expected type, got {:?}", tok.kind))),
+        }
     }
 
     fn parse_block(&mut self) -> Result<Block, Error> {
@@ -91,10 +138,11 @@ impl Parser {
     fn parse_stmt(&mut self) -> Result<Stmt, Error> {
         let tok = self.peek().clone();
         match &tok.kind {
-            TokenKind::Let => self.parse_let(),
-            // Identifier: could be `println!` or an assignment `name = expr;`
+            TokenKind::Let    => self.parse_let(),
+            TokenKind::Return => self.parse_return(),
+            // Identifier: println!, assignment `x = ...`, or call expression `f(...)`
             TokenKind::Ident(name) if name == "println" => self.parse_println(),
-            TokenKind::Ident(_) => self.parse_assign(),
+            TokenKind::Ident(_) => self.parse_ident_stmt(),
             _ => Err(Error::new(tok.line, tok.col,
                 format!("unexpected token in statement: {:?}", tok.kind))),
         }
@@ -115,12 +163,37 @@ impl Parser {
         Ok(Stmt::Let { name, mutable, expr })
     }
 
-    fn parse_assign(&mut self) -> Result<Stmt, Error> {
+    /// Parse a statement starting with an identifier: assignment or call.
+    fn parse_ident_stmt(&mut self) -> Result<Stmt, Error> {
         let name = self.expect_ident()?;
-        self.expect(&TokenKind::Eq)?;
-        let expr = self.parse_expr()?;
-        self.expect(&TokenKind::Semicolon)?;
-        Ok(Stmt::Assign { name, expr })
+        if self.peek().kind == TokenKind::Eq {
+            // assignment: `name = expr;`
+            self.advance();
+            let expr = self.parse_expr()?;
+            self.expect(&TokenKind::Semicolon)?;
+            Ok(Stmt::Assign { name, expr })
+        } else if self.peek().kind == TokenKind::LParen {
+            // call statement: `name(args);`
+            let args = self.parse_call_args()?;
+            self.expect(&TokenKind::Semicolon)?;
+            Ok(Stmt::Expr(Expr::Call { name, args }))
+        } else {
+            let tok = self.peek().clone();
+            Err(Error::new(tok.line, tok.col,
+                format!("expected '=' or '(' after identifier, got {:?}", tok.kind)))
+        }
+    }
+
+    fn parse_return(&mut self) -> Result<Stmt, Error> {
+        self.expect(&TokenKind::Return)?;
+        if self.peek().kind == TokenKind::Semicolon {
+            self.advance();
+            Ok(Stmt::Return(None))
+        } else {
+            let expr = self.parse_expr()?;
+            self.expect(&TokenKind::Semicolon)?;
+            Ok(Stmt::Return(Some(expr)))
+        }
     }
 
     fn parse_println(&mut self) -> Result<Stmt, Error> {
@@ -199,6 +272,19 @@ impl Parser {
         self.parse_primary()
     }
 
+    fn parse_call_args(&mut self) -> Result<Vec<Expr>, Error> {
+        self.expect(&TokenKind::LParen)?;
+        let mut args = Vec::new();
+        while self.peek().kind != TokenKind::RParen && !self.at_eof() {
+            if !args.is_empty() {
+                self.expect(&TokenKind::Comma)?;
+            }
+            args.push(self.parse_expr()?);
+        }
+        self.expect(&TokenKind::RParen)?;
+        Ok(args)
+    }
+
     fn parse_primary(&mut self) -> Result<Expr, Error> {
         let tok = self.peek().clone();
         match &tok.kind {
@@ -210,7 +296,13 @@ impl Parser {
             TokenKind::Ident(name) => {
                 let name = name.clone();
                 self.advance();
-                Ok(Expr::Var(name))
+                // Call expression: `name(args...)`
+                if self.peek().kind == TokenKind::LParen {
+                    let args = self.parse_call_args()?;
+                    Ok(Expr::Call { name, args })
+                } else {
+                    Ok(Expr::Var(name))
+                }
             }
             TokenKind::LParen => {
                 self.advance();
