@@ -1349,6 +1349,23 @@ impl Parser {
     fn parse_while(&mut self) -> Result<Stmt, Error> {
         let loc = self.loc();
         self.expect(&TokenKind::While)?;
+        // `while let pat = expr { body }`
+        if self.peek().kind == TokenKind::Let {
+            self.advance();
+            let pat = self.parse_pat()?;
+            self.expect(&TokenKind::Eq)?;
+            let expr = self.parse_expr()?;
+            let body = self.parse_block()?;
+            return Ok(Stmt {
+                kind: StmtKind::WhileLet {
+                    pat,
+                    expr,
+                    expr_ty: None,
+                    body,
+                },
+                loc,
+            });
+        }
         let cond = self.parse_expr()?;
         let body = self.parse_block()?;
         Ok(Stmt {
@@ -1365,7 +1382,7 @@ impl Parser {
         let iter = self.parse_expr()?;
         let body = self.parse_block()?;
         Ok(Stmt {
-            kind: StmtKind::For { var, iter, body, elem_ty: None },
+            kind: StmtKind::For { var, iter, body, elem_ty: None, iter_ty: None },
             loc,
         })
     }

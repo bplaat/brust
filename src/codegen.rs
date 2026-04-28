@@ -28,6 +28,8 @@ struct Ctx {
     value_self_fns: std::collections::HashSet<String>,
     /// Variable name used to capture `break val` inside a `loop { }` expression.
     loop_result_var: Option<String>,
+    /// Nesting depth of `loop`/`while` statement loops, used to gate loop_result_var.
+    loop_depth: usize,
 }
 
 impl Ctx {
@@ -42,6 +44,7 @@ impl Ctx {
             type_aliases: HashMap::new(),
             value_self_fns: std::collections::HashSet::new(),
             loop_result_var: None,
+            loop_depth: 0,
         }
     }
 
@@ -63,6 +66,7 @@ impl Ctx {
             type_aliases: HashMap::new(),
             value_self_fns: std::collections::HashSet::new(),
             loop_result_var: None,
+            loop_depth: 0,
         }
     }
 }
@@ -74,6 +78,8 @@ impl Ctx {
 struct Codegen {
     /// Enum declarations indexed by name, for tagged union resolution in match.
     enums: HashMap<String, EnumDecl>,
+    /// Struct declarations indexed by name, for field type lookup in printf_spec.
+    structs: HashMap<String, StructDecl>,
     /// Function/method param types (mangled name -> param type list) for tuple arg hints.
     fn_params: HashMap<String, Vec<Ty>>,
     /// Function/method return types (mangled name -> return Ty) for printf spec inference.
@@ -91,6 +97,7 @@ struct Codegen {
 
 pub fn generate(file: &File) -> String {
     let mut enums: HashMap<String, EnumDecl> = HashMap::new();
+    let mut structs: HashMap<String, StructDecl> = HashMap::new();
     let mut fn_params: HashMap<String, Vec<Ty>> = HashMap::new();
     let mut fn_ret_tys: HashMap<String, Ty> = HashMap::new();
     let mut type_aliases: HashMap<String, Ty> = HashMap::new();
@@ -104,6 +111,7 @@ pub fn generate(file: &File) -> String {
         &file.items,
         "",
         &mut enums,
+        &mut structs,
         &mut fn_params,
         &mut fn_ret_tys,
         &mut never_fns,
@@ -118,6 +126,7 @@ pub fn generate(file: &File) -> String {
     }
     let mut cg = Codegen {
         enums,
+        structs,
         fn_params,
         fn_ret_tys,
         type_aliases,
@@ -158,6 +167,7 @@ fn collect_items(
     items: &[Item],
     prefix: &str,
     enums: &mut HashMap<String, EnumDecl>,
+    structs: &mut HashMap<String, StructDecl>,
     fn_params: &mut HashMap<String, Vec<Ty>>,
     fn_ret_tys: &mut HashMap<String, Ty>,
     never_fns: &mut std::collections::HashSet<String>,
@@ -181,10 +191,16 @@ fn collect_items(
                 let type_name = format!("{prefix}{}", imp.type_name);
                 for m in &imp.methods {
                     let ret_ty = m.return_ty.resolve_self(&type_name);
+                    let param_tys: Vec<Ty> = m
+                        .params
+                        .iter()
+                        .map(|p| p.ty.resolve_self(&type_name))
+                        .collect();
                     if let Some(trait_name) = &imp.trait_name {
                         // Trait impl: trampoline symbol is TypeName__TraitName__method.
                         let trampoline = format!("{type_name}__{trait_name}__{}", m.name);
                         fn_ret_tys.insert(trampoline.clone(), ret_ty);
+                        fn_params.insert(trampoline.clone(), param_tys);
                         trait_method_trampolines
                             .entry(type_name.clone())
                             .or_default()
@@ -195,19 +211,19 @@ fn collect_items(
                         if ret_ty == Ty::Never {
                             never_fns.insert(mangled.clone());
                         }
-                        fn_params.insert(
-                            mangled.clone(),
-                            m.params
-                                .iter()
-                                .map(|p| p.ty.resolve_self(&type_name))
-                                .collect(),
-                        );
+                        fn_params.insert(mangled.clone(), param_tys);
                         fn_ret_tys.insert(mangled.clone(), ret_ty);
                         if matches!(m.receiver, Some(Receiver::Value)) {
                             value_self_fns.insert(mangled);
                         }
                     }
                 }
+            }
+            Item::Struct(s) => {
+                let name = format!("{prefix}{}", s.name);
+                let mut prefixed = s.clone();
+                prefixed.name = name.clone();
+                structs.insert(name, prefixed);
             }
             Item::Enum(e) => {
                 let name = format!("{prefix}{}", e.name);
@@ -224,6 +240,7 @@ fn collect_items(
                     mod_items,
                     &format!("{prefix}{name}_"),
                     enums,
+                    structs,
                     fn_params,
                     fn_ret_tys,
                     never_fns,
@@ -808,10 +825,12 @@ impl Codegen {
             }
 
             StmtKind::Loop(body) => {
+                ctx.loop_depth += 1;
                 self.out.push_str(&format!("{p}for (;;) {{\n"));
                 for s in &body.stmts {
                     self.emit_stmt(s, ctx, indent + 1);
                 }
+                ctx.loop_depth -= 1;
                 self.out.push_str(&format!("{p}}}\n"));
             }
 
@@ -820,6 +839,7 @@ impl Codegen {
                 iter,
                 body,
                 elem_ty,
+                iter_ty,
             } => {
                 let p1 = "    ".repeat(indent + 1);
                 // `for i in lo..hi` -- emit as a numeric C for-loop.
@@ -835,8 +855,17 @@ impl Codegen {
                     self.out.push_str(&format!(
                         "{p}for (int64_t {var} = {lo}; {var} < {hi}; {var}++) {{\n"
                     ));
+                } else if let Some(Ty::Array(_, n)) = iter_ty {
+                    // Compile-time known array length: use it directly.
+                    let iter_s = self.emit_expr(iter, ctx);
+                    self.out.push_str(&format!(
+                        "{p}for (size_t _brust_i = 0; _brust_i < {n}; _brust_i++) {{\n"
+                    ));
+                    let decl = typed_or_auto_decl(elem_ty.as_ref(), var);
+                    self.out
+                        .push_str(&format!("{p1}{decl} = {iter_s}[_brust_i];\n"));
                 } else {
-                    // Array/slice iterator: use sizeof trick.
+                    // Fallback: sizeof trick (works for local stack-allocated C arrays).
                     let iter_s = self.emit_expr(iter, ctx);
                     self.out.push_str(&format!(
                         "{p}for (size_t _brust_i = 0; _brust_i < sizeof({iter_s})/sizeof({iter_s}[0]); _brust_i++) {{\n"
@@ -853,9 +882,9 @@ impl Codegen {
 
             StmtKind::Break(val) => {
                 if let Some(v) = val {
-                    // `break val` inside a loop expression: store result then break.
+                    // `break val` inside the outermost result-capturing loop.
                     let lv = ctx.loop_result_var.clone();
-                    if let Some(lv) = lv {
+                    if let Some(lv) = lv.filter(|_| ctx.loop_depth <= 1) {
                         let vs = self.emit_expr(v, ctx);
                         self.out.push_str(&format!("{p}{lv} = {vs};\n"));
                     }
@@ -894,6 +923,15 @@ impl Codegen {
                 expr_ty,
             } => {
                 self.emit_if_let(pat, expr, expr_ty.as_ref(), then_block, else_block, ctx, indent);
+            }
+
+            StmtKind::WhileLet {
+                pat,
+                expr,
+                expr_ty,
+                body,
+            } => {
+                self.emit_while_let(pat, expr, expr_ty.as_ref(), body, ctx, indent);
             }
 
             StmtKind::Match {
@@ -996,8 +1034,13 @@ impl Codegen {
         let expr_s = self.emit_expr(expr, ctx);
         match pat {
             Pat::Wildcard => {
-                // Always matches
-                self.out.push_str(&format!("{p}{{\n"));
+                // Always matches. Use `if (1)` when there is an else block so the
+                // generated C is valid (bare `{` cannot be followed by `else`).
+                if else_block.is_some() {
+                    self.out.push_str(&format!("{p}if (1) {{\n"));
+                } else {
+                    self.out.push_str(&format!("{p}{{\n"));
+                }
                 for s in &then_block.stmts {
                     self.emit_stmt(s, ctx, indent + 1);
                 }
@@ -1085,22 +1128,221 @@ impl Codegen {
                 }
                 self.emit_else(else_block, ctx, indent);
             }
-            Pat::Or(_) => {
-                // Or-patterns in if let: emit as `if (cond1 || cond2 || ...)`
-                // Not commonly needed, emit as always-false for now.
-                self.out.push_str(&format!("{p}if (0) {{\n"));
+            Pat::Or(alternatives) => {
+                // Materialize the scrutinee into a temp if it's not already a variable,
+                // to avoid evaluating it multiple times in the condition.
+                let cond_expr = match &expr.kind {
+                    ExprKind::Var(_) => expr_s.clone(),
+                    _ => {
+                        self.out
+                            .push_str(&format!("{p}__auto_type _iflet_or_val = {expr_s};\n"));
+                        "_iflet_or_val".to_string()
+                    }
+                };
+                let conditions: Vec<String> = alternatives
+                    .iter()
+                    .map(|alt| match alt {
+                        Pat::Wildcard | Pat::Binding(_) => "1".to_string(),
+                        Pat::Bool(b) => {
+                            if *b {
+                                cond_expr.clone()
+                            } else {
+                                format!("!({cond_expr})")
+                            }
+                        }
+                        Pat::Int(n) => format!("({cond_expr}) == {n}"),
+                        Pat::EnumVariant {
+                            type_name, variant, ..
+                        } => {
+                            format!("({cond_expr}).tag == {type_name}_{variant}_tag")
+                        }
+                        _ => "0".to_string(),
+                    })
+                    .collect();
+                let full_cond = conditions.join(" || ");
+                self.out.push_str(&format!("{p}if ({full_cond}) {{\n"));
+                for s in &then_block.stmts {
+                    self.emit_stmt(s, ctx, indent + 1);
+                }
                 self.emit_else(else_block, ctx, indent);
             }
             Pat::Binding(name) => {
                 // Binding pattern always matches; bind value in block.
                 let decl = typed_or_auto_decl(expr_ty, name);
-                self.out.push_str(&format!("{p}{{\n"));
+                // Use `if (1)` so a following `else` is valid C.
+                if else_block.is_some() {
+                    self.out.push_str(&format!("{p}if (1) {{\n"));
+                } else {
+                    self.out.push_str(&format!("{p}{{\n"));
+                }
                 self.out
                     .push_str(&format!("{ip}{decl} = {expr_s};\n"));
                 for s in &then_block.stmts {
                     self.emit_stmt(s, ctx, indent + 1);
                 }
                 self.emit_else(else_block, ctx, indent);
+            }
+        }
+    }
+
+    fn emit_while_let(
+        &mut self,
+        pat: &Pat,
+        expr: &Expr,
+        expr_ty: Option<&Ty>,
+        body: &Block,
+        ctx: &mut Ctx,
+        indent: usize,
+    ) {
+        let p = pad(indent);
+        let ip = pad(indent + 1);
+        match pat {
+            Pat::Wildcard => {
+                self.out.push_str(&format!("{p}for (;;) {{\n"));
+                for s in &body.stmts {
+                    self.emit_stmt(s, ctx, indent + 1);
+                }
+                self.out.push_str(&format!("{p}}}\n"));
+            }
+            Pat::Bool(b) => {
+                let expr_s = self.emit_expr(expr, ctx);
+                let cond = if *b { expr_s } else { format!("!({expr_s})") };
+                self.out.push_str(&format!("{p}while ({cond}) {{\n"));
+                for s in &body.stmts {
+                    self.emit_stmt(s, ctx, indent + 1);
+                }
+                self.out.push_str(&format!("{p}}}\n"));
+            }
+            Pat::Int(n) => {
+                let expr_s = self.emit_expr(expr, ctx);
+                self.out
+                    .push_str(&format!("{p}while (({expr_s}) == {n}) {{\n"));
+                for s in &body.stmts {
+                    self.emit_stmt(s, ctx, indent + 1);
+                }
+                self.out.push_str(&format!("{p}}}\n"));
+            }
+            Pat::Binding(name) => {
+                // Binding always matches: declare before loop, update inside condition.
+                let decl = typed_or_auto_decl(expr_ty, name);
+                let expr_s = self.emit_expr(expr, ctx);
+                self.out.push_str(&format!("{p}{decl} = {expr_s};\n"));
+                self.out.push_str(&format!("{p}for (;;) {{\n"));
+                for s in &body.stmts {
+                    self.emit_stmt(s, ctx, indent + 1);
+                }
+                // Update binding at end of loop body before re-checking.
+                let expr_s2 = self.emit_expr(expr, ctx);
+                self.out.push_str(&format!("{ip}{name} = {expr_s2};\n"));
+                self.out.push_str(&format!("{p}}}\n"));
+            }
+            Pat::EnumVariant {
+                type_name,
+                variant,
+                bindings,
+            } => {
+                // For Var scrutinees: check tag directly each iteration, bind from var.
+                // For other exprs: use a compound-assignment temp to avoid re-evaluating.
+                let (cond, use_temp) = match &expr.kind {
+                    ExprKind::Var(n) => (
+                        format!("{n}.tag == {type_name}_{variant}_tag"),
+                        false,
+                    ),
+                    _ => {
+                        let expr_s = self.emit_expr(expr, ctx);
+                        // Declare temp before loop; update it in the while condition.
+                        let ty_s = ty_str(&Ty::Named(type_name.clone()));
+                        self.out
+                            .push_str(&format!("{p}{ty_s} _wlet_tmp;\n"));
+                        let cond = format!(
+                            "(_wlet_tmp = {expr_s}).tag == {type_name}_{variant}_tag"
+                        );
+                        (cond, true)
+                    }
+                };
+                self.out.push_str(&format!("{p}while ({cond}) {{\n"));
+                let mut arm_ctx = ctx.clone();
+                let match_src = if use_temp {
+                    "_wlet_tmp"
+                } else if let ExprKind::Var(n) = &expr.kind {
+                    n.as_str()
+                } else {
+                    "_wlet_tmp"
+                };
+                if let Some(edecl) = self.enums.get(type_name).cloned() {
+                    if let Some(ev) = edecl.variants.iter().find(|v| v.name == *variant) {
+                        match bindings {
+                            PatBindings::Tuple(binds) => {
+                                if let VariantFields::Tuple(tys) = &ev.fields {
+                                    for (i, binding) in binds.iter().enumerate() {
+                                        if binding == "_" {
+                                            continue;
+                                        }
+                                        let fty = tys
+                                            .get(i)
+                                            .map(ty_str)
+                                            .unwrap_or_else(|| "int64_t".to_string());
+                                        self.out.push_str(&format!(
+                                            "{ip}{fty} {binding} = {match_src}.data.{variant}._{i};\n"
+                                        ));
+                                        if let Some(Ty::Named(n)) = tys.get(i) {
+                                            arm_ctx.type_env.insert(binding.clone(), n.clone());
+                                        }
+                                    }
+                                }
+                            }
+                            PatBindings::Named(fields_bind) => {
+                                if let VariantFields::Named(decl_fields) = &ev.fields {
+                                    for (field_name, binding) in fields_bind {
+                                        if let Some(df) =
+                                            decl_fields.iter().find(|f| f.name == *field_name)
+                                        {
+                                            let fty = ty_str(&df.ty);
+                                            self.out.push_str(&format!(
+                                                "{ip}{fty} {binding} = {match_src}.data.{variant}.{field_name};\n"
+                                            ));
+                                            if let Ty::Named(n) = &df.ty {
+                                                arm_ctx.type_env.insert(binding.clone(), n.clone());
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            PatBindings::None => {}
+                        }
+                    }
+                }
+                for s in &body.stmts {
+                    self.emit_stmt(s, &mut arm_ctx, indent + 1);
+                }
+                self.out.push_str(&format!("{p}}}\n"));
+            }
+            Pat::Or(alternatives) => {
+                let expr_s = self.emit_expr(expr, ctx);
+                let conditions: Vec<String> = alternatives
+                    .iter()
+                    .map(|alt| match alt {
+                        Pat::Wildcard | Pat::Binding(_) => "1".to_string(),
+                        Pat::Bool(b) => {
+                            if *b {
+                                expr_s.clone()
+                            } else {
+                                format!("!({expr_s})")
+                            }
+                        }
+                        Pat::Int(n) => format!("({expr_s}) == {n}"),
+                        Pat::EnumVariant {
+                            type_name, variant, ..
+                        } => format!("({expr_s}).tag == {type_name}_{variant}_tag"),
+                        _ => "0".to_string(),
+                    })
+                    .collect();
+                let full_cond = conditions.join(" || ");
+                self.out.push_str(&format!("{p}while ({full_cond}) {{\n"));
+                for s in &body.stmts {
+                    self.emit_stmt(s, ctx, indent + 1);
+                }
+                self.out.push_str(&format!("{p}}}\n"));
             }
         }
     }
@@ -1279,7 +1521,17 @@ impl Codegen {
                     };
                     self.out
                         .push_str(&format!("{p}{keyword} ({full_cond}) {{\n"));
-                    self.emit_match_arm_bindings(pat, "_ms", false, &None, &ip, &mut arm_ctx, scrutinee_ty);
+                    // Resolve enum decl for binding extraction.
+                    let (is_tagged, enum_decl) = if let Pat::EnumVariant { type_name, .. } = pat {
+                        let edecl = self.enums.get(type_name.as_str()).cloned();
+                        let is_t = edecl.as_ref().is_some_and(|e| {
+                            e.variants.iter().any(|v| !matches!(v.fields, VariantFields::Unit))
+                        });
+                        (is_t, edecl)
+                    } else {
+                        (false, None)
+                    };
+                    self.emit_match_arm_bindings(pat, "_ms", is_tagged, &enum_decl, &ip, &mut arm_ctx, scrutinee_ty);
                     for s in &arm.body.stmts {
                         self.emit_stmt(s, &mut arm_ctx, indent + 1);
                     }
@@ -1922,7 +2174,7 @@ impl Codegen {
                 }
                 let type_name = match &expr.kind {
                     ExprKind::Var(n) => ctx.type_env.get(n.as_str()).cloned(),
-                    _ => None,
+                    _ => self.infer_type_name(expr, ctx),
                 };
                 let args_s: Vec<String> = args.iter().map(|a| self.emit_expr(a, ctx)).collect();
                 let expr_c = self.emit_expr(expr, ctx);
@@ -2091,6 +2343,52 @@ impl Codegen {
         }
     }
 
+    /// Try to infer the struct/enum type name of an expression for method dispatch.
+    fn infer_type_name(&self, expr: &Expr, ctx: &Ctx) -> Option<String> {
+        match &expr.kind {
+            ExprKind::Var(n) => ctx.type_env.get(n.as_str()).cloned(),
+            ExprKind::Call { name, .. } => {
+                if let Some(Ty::Named(t)) = ctx.fn_ret_tys.get(name.as_str()) {
+                    Some(t.clone())
+                } else {
+                    None
+                }
+            }
+            ExprKind::AssocCall {
+                type_name, method, ..
+            } => {
+                let mangled = format!("{type_name}_{method}");
+                if let Some(Ty::Named(t)) = ctx.fn_ret_tys.get(mangled.as_str()) {
+                    Some(t.clone())
+                } else {
+                    None
+                }
+            }
+            ExprKind::MethodCall { expr: inner, method, .. } => {
+                if let Some(recv_type) = self.infer_type_name(inner, ctx) {
+                    let mangled = format!("{recv_type}_{method}");
+                    if let Some(Ty::Named(t)) = ctx.fn_ret_tys.get(mangled.as_str()) {
+                        return Some(t.clone());
+                    }
+                }
+                None
+            }
+            ExprKind::Field { expr: base, field } => {
+                if let Some(struct_name) = self.infer_type_name(base, ctx) {
+                    if let Some(sdecl) = self.structs.get(&struct_name) {
+                        if let Some(fd) = sdecl.fields.iter().find(|f| f.name == *field) {
+                            if let Ty::Named(t) = &fd.ty {
+                                return Some(t.clone());
+                            }
+                        }
+                    }
+                }
+                None
+            }
+            _ => None,
+        }
+    }
+
     fn emit_println(
         &mut self,
         format: &str,
@@ -2107,7 +2405,7 @@ impl Codegen {
             if ch == '{' && chars.peek() == Some(&'}') {
                 chars.next();
                 let spec = if let Some(arg) = args.get(arg_idx) {
-                    printf_spec(arg, ctx)
+                    printf_spec(self, arg, ctx)
                 } else {
                     "%lld".to_string()
                 };
@@ -2153,8 +2451,8 @@ impl Codegen {
 }
 
 /// Choose printf format specifier for an expression, returning `%f`, `%u`, `%s`, or `%lld`.
-/// Uses variable types, cast targets, and function return types to infer the right spec.
-fn printf_spec(expr: &Expr, ctx: &Ctx) -> String {
+/// Uses variable types, cast targets, struct field types, and function return types.
+fn printf_spec(codegen: &Codegen, expr: &Expr, ctx: &Ctx) -> String {
     match &expr.kind {
         ExprKind::Float(_) => "%f".to_string(),
         ExprKind::Char(_) => "%u".to_string(),
@@ -2170,11 +2468,22 @@ fn printf_spec(expr: &Expr, ctx: &Ctx) -> String {
         ExprKind::Var(name) => spec_for_ty(ctx.var_types.get(name), ctx),
 
         // Arithmetic inherits spec from the left operand.
-        ExprKind::BinOp { lhs, .. } => printf_spec(lhs, ctx),
-        ExprKind::UnOp { operand, .. } => printf_spec(operand, ctx),
+        ExprKind::BinOp { lhs, .. } => printf_spec(codegen, lhs, ctx),
+        ExprKind::UnOp { operand, .. } => printf_spec(codegen, operand, ctx),
 
-        // Field access: infer from the field expression's base if not possible, fall through.
-        ExprKind::Field { expr, .. } => printf_spec(expr, ctx),
+        // Field access: try to resolve field type from struct declarations.
+        ExprKind::Field { expr: base, field } => {
+            if let ExprKind::Var(n) = &base.kind {
+                if let Some(struct_name) = ctx.type_env.get(n) {
+                    if let Some(sdecl) = codegen.structs.get(struct_name) {
+                        if let Some(fd) = sdecl.fields.iter().find(|f| f.name == *field) {
+                            return spec_for_ty(Some(&fd.ty), ctx);
+                        }
+                    }
+                }
+            }
+            printf_spec(codegen, base, ctx)
+        }
 
         // Calls: look up the return type of the function/method.
         ExprKind::Call { name, .. } => spec_for_ty(ctx.fn_ret_tys.get(name.as_str()), ctx),
@@ -2200,7 +2509,7 @@ fn printf_spec(expr: &Expr, ctx: &Ctx) -> String {
             "%lld".to_string()
         }
 
-        ExprKind::Deref(inner) => printf_spec(inner, ctx),
+        ExprKind::Deref(inner) => printf_spec(codegen, inner, ctx),
 
         _ => "%lld".to_string(),
     }
@@ -2226,18 +2535,23 @@ fn spec_for_ty(ty: Option<&Ty>, ctx: &Ctx) -> String {
 
 fn collect_tuple_types(file: &File) -> Vec<Vec<Ty>> {
     let mut found: Vec<Vec<Ty>> = Vec::new();
-    for item in &file.items {
+    scan_items(&file.items, &mut found);
+    found
+}
+
+fn scan_items(items: &[Item], found: &mut Vec<Vec<Ty>>) {
+    for item in items {
         match item {
             Item::Fn(f) => {
-                scan_ty(&f.return_ty, &mut found);
+                scan_ty(&f.return_ty, found);
                 for p in &f.params {
-                    scan_ty(&p.ty, &mut found);
+                    scan_ty(&p.ty, found);
                 }
-                scan_block(&f.body, &mut found);
+                scan_block(&f.body, found);
             }
             Item::Struct(s) => {
                 for f in &s.fields {
-                    scan_ty(&f.ty, &mut found);
+                    scan_ty(&f.ty, found);
                 }
             }
             Item::Enum(e) => {
@@ -2246,12 +2560,12 @@ fn collect_tuple_types(file: &File) -> Vec<Vec<Ty>> {
                         VariantFields::Unit => {}
                         VariantFields::Tuple(tys) => {
                             for ty in tys {
-                                scan_ty(ty, &mut found);
+                                scan_ty(ty, found);
                             }
                         }
                         VariantFields::Named(fields) => {
                             for f in fields {
-                                scan_ty(&f.ty, &mut found);
+                                scan_ty(&f.ty, found);
                             }
                         }
                     }
@@ -2259,48 +2573,18 @@ fn collect_tuple_types(file: &File) -> Vec<Vec<Ty>> {
             }
             Item::Impl(imp) => {
                 for m in &imp.methods {
-                    scan_ty(&m.return_ty, &mut found);
+                    scan_ty(&m.return_ty, found);
                     for p in &m.params {
-                        scan_ty(&p.ty, &mut found);
+                        scan_ty(&p.ty, found);
                     }
-                    scan_block(&m.body, &mut found);
+                    scan_block(&m.body, found);
                 }
             }
-            Item::TypeAlias { ty, .. } => scan_ty(ty, &mut found),
+            Item::TypeAlias { ty, .. } => scan_ty(ty, found),
+            Item::Mod { items: mod_items, .. } => scan_items(mod_items, found),
             Item::Trait(_) | Item::Skip | Item::ExternBlock(_) => {}
-            Item::Mod {
-                items: mod_items, ..
-            } => {
-                for mod_item in mod_items {
-                    match mod_item {
-                        Item::Fn(f) => {
-                            scan_ty(&f.return_ty, &mut found);
-                            for p in &f.params {
-                                scan_ty(&p.ty, &mut found);
-                            }
-                            scan_block(&f.body, &mut found);
-                        }
-                        Item::Struct(s) => {
-                            for f in &s.fields {
-                                scan_ty(&f.ty, &mut found);
-                            }
-                        }
-                        Item::Impl(imp) => {
-                            for m in &imp.methods {
-                                scan_ty(&m.return_ty, &mut found);
-                                for p in &m.params {
-                                    scan_ty(&p.ty, &mut found);
-                                }
-                                scan_block(&m.body, &mut found);
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-            }
         }
     }
-    found
 }
 
 fn scan_ty(ty: &Ty, found: &mut Vec<Vec<Ty>>) {
@@ -2349,6 +2633,10 @@ fn scan_block(block: &crate::ast::Block, found: &mut Vec<Vec<Ty>>) {
             }
             StmtKind::While { cond, body } => {
                 scan_expr(cond, None, found);
+                scan_block(body, found);
+            }
+            StmtKind::WhileLet { expr, body, .. } => {
+                scan_expr(expr, None, found);
                 scan_block(body, found);
             }
             StmtKind::Match { expr, arms, .. } => {
