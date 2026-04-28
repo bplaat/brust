@@ -1,17 +1,16 @@
+use crate::loc::Loc;
 use std::fmt;
 
 #[derive(Debug)]
 pub struct Error {
-    pub line: usize,
-    pub col: usize,
+    pub loc: Loc,
     pub message: String,
 }
 
 impl Error {
-    pub fn new(line: usize, col: usize, message: impl Into<String>) -> Self {
+    pub fn new(loc: Loc, message: impl Into<String>) -> Self {
         Self {
-            line,
-            col,
+            loc,
             message: message.into(),
         }
     }
@@ -19,6 +18,10 @@ impl Error {
 
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}:{}: error: {}", self.line, self.col, self.message)
+        write!(
+            f,
+            "{}:{}: error: {}",
+            self.loc.line, self.loc.col, self.message
+        )
     }
 }

@@ -1,4 +1,5 @@
 use crate::error::Error;
+use crate::loc::Loc;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum TokenKind {
@@ -14,7 +15,7 @@ pub enum TokenKind {
     False,
     Struct,
     Impl,
-    SelfKw, // `self`
+    SelfKw,
     Enum,
     Match,
     Unsafe,
@@ -35,12 +36,12 @@ pub enum TokenKind {
     Slash,
     Percent,
     // Bitwise operators
-    Amp,   // &
-    Pipe,  // |
-    Caret, // ^
-    Tilde, // ~
-    Shl,   // <<
-    Shr,   // >>
+    Amp,
+    Pipe,
+    Caret,
+    Tilde,
+    Shl,
+    Shr,
     // Comparison operators
     EqEq,
     BangEq,
@@ -56,16 +57,16 @@ pub enum TokenKind {
     RParen,
     LBrace,
     RBrace,
-    LBracket, // [
-    RBracket, // ]
+    LBracket,
+    RBracket,
     Semicolon,
     Comma,
     Dot,
     Colon,
     ColonColon,
     Eq,
-    Arrow,    // ->
-    FatArrow, // =>
+    Arrow,
+    FatArrow,
     Bang,
     Eof,
 }
@@ -73,15 +74,14 @@ pub enum TokenKind {
 #[derive(Debug, Clone)]
 pub struct Token {
     pub kind: TokenKind,
-    pub line: usize,
-    pub col: usize,
+    pub loc: Loc,
 }
 
 pub struct Lexer<'a> {
     src: &'a [u8],
     pos: usize,
-    line: usize,
-    col: usize,
+    line: u32,
+    col: u32,
 }
 
 impl<'a> Lexer<'a> {
@@ -125,13 +125,11 @@ impl<'a> Lexer<'a> {
 
     fn skip_whitespace_and_comments(&mut self) {
         loop {
-            // Skip whitespace
-            while self.peek().map_or(false, |c| c.is_ascii_whitespace()) {
+            while self.peek().is_some_and(|c| c.is_ascii_whitespace()) {
                 self.advance();
             }
-            // Skip line comments
             if self.src.get(self.pos..self.pos + 2) == Some(b"//") {
-                while self.peek().map_or(false, |c| c != b'\n') {
+                while self.peek().is_some_and(|c| c != b'\n') {
                     self.advance();
                 }
             } else {
@@ -143,15 +141,13 @@ impl<'a> Lexer<'a> {
     fn next_token(&mut self) -> Result<Token, Error> {
         self.skip_whitespace_and_comments();
 
-        let line = self.line;
-        let col = self.col;
+        let loc = Loc::new(self.line, self.col);
 
         let ch = match self.peek() {
             None => {
                 return Ok(Token {
                     kind: TokenKind::Eof,
-                    line,
-                    col,
+                    loc,
                 });
             }
             Some(c) => c,
@@ -299,29 +295,28 @@ impl<'a> Lexer<'a> {
                 self.advance();
                 TokenKind::Tilde
             }
-            b'"' => self.lex_string(line, col)?,
-            b'\'' => self.lex_char(line, col)?,
-            c if c.is_ascii_digit() => self.lex_number(line, col)?,
+            b'"' => self.lex_string(loc)?,
+            b'\'' => self.lex_char(loc)?,
+            c if c.is_ascii_digit() => self.lex_number(loc)?,
             c if c.is_ascii_alphabetic() || c == b'_' => self.lex_ident_or_keyword(),
             _ => {
                 self.advance();
                 return Err(Error::new(
-                    line,
-                    col,
+                    loc,
                     format!("unexpected character '{}'", ch as char),
                 ));
             }
         };
 
-        Ok(Token { kind, line, col })
+        Ok(Token { kind, loc })
     }
 
-    fn lex_string(&mut self, line: usize, col: usize) -> Result<TokenKind, Error> {
-        self.advance(); // consume opening "
+    fn lex_string(&mut self, loc: Loc) -> Result<TokenKind, Error> {
+        self.advance();
         let mut s = String::new();
         loop {
             match self.advance() {
-                None => return Err(Error::new(line, col, "unterminated string literal")),
+                None => return Err(Error::new(loc, "unterminated string literal")),
                 Some(b'"') => break,
                 Some(b'\\') => match self.advance() {
                     Some(b'n') => s.push('\n'),
@@ -329,7 +324,7 @@ impl<'a> Lexer<'a> {
                     Some(b'\\') => s.push('\\'),
                     Some(b'"') => s.push('"'),
                     Some(c) => s.push(c as char),
-                    None => return Err(Error::new(line, col, "unterminated escape sequence")),
+                    None => return Err(Error::new(loc, "unterminated escape sequence")),
                 },
                 Some(c) => s.push(c as char),
             }
@@ -337,10 +332,10 @@ impl<'a> Lexer<'a> {
         Ok(TokenKind::StringLit(s))
     }
 
-    fn lex_char(&mut self, line: usize, col: usize) -> Result<TokenKind, Error> {
-        self.advance(); // consume opening '
+    fn lex_char(&mut self, loc: Loc) -> Result<TokenKind, Error> {
+        self.advance();
         let ch: u32 = match self.advance() {
-            None => return Err(Error::new(line, col, "unterminated char literal")),
+            None => return Err(Error::new(loc, "unterminated char literal")),
             Some(b'\\') => match self.advance() {
                 Some(b'n') => '\n' as u32,
                 Some(b't') => '\t' as u32,
@@ -350,9 +345,8 @@ impl<'a> Lexer<'a> {
                 Some(b'"') => '"' as u32,
                 Some(b'0') => 0,
                 Some(b'u') => {
-                    // \u{XXXXXX}
                     if self.advance() != Some(b'{') {
-                        return Err(Error::new(line, col, "expected '{' in unicode escape"));
+                        return Err(Error::new(loc, "expected '{' in unicode escape"));
                     }
                     let mut hex = String::new();
                     loop {
@@ -364,40 +358,35 @@ impl<'a> Lexer<'a> {
                             Some(c) if (c as char).is_ascii_hexdigit() => {
                                 hex.push(self.advance().unwrap() as char);
                             }
-                            _ => return Err(Error::new(line, col, "invalid unicode escape")),
+                            _ => return Err(Error::new(loc, "invalid unicode escape")),
                         }
                     }
                     u32::from_str_radix(&hex, 16)
-                        .map_err(|_| Error::new(line, col, "unicode escape out of range"))?
+                        .map_err(|_| Error::new(loc, "unicode escape out of range"))?
                 }
                 Some(c) => {
-                    return Err(Error::new(
-                        line,
-                        col,
-                        format!("unknown escape '\\{}'", c as char),
-                    ));
+                    return Err(Error::new(loc, format!("unknown escape '\\{}'", c as char)));
                 }
-                None => return Err(Error::new(line, col, "unterminated escape")),
+                None => return Err(Error::new(loc, "unterminated escape")),
             },
             Some(c) => c as u32,
         };
         if self.advance() != Some(b'\'') {
-            return Err(Error::new(line, col, "expected closing ' in char literal"));
+            return Err(Error::new(loc, "expected closing ' in char literal"));
         }
         Ok(TokenKind::CharLit(ch))
     }
 
-    fn lex_number(&mut self, line: usize, col: usize) -> Result<TokenKind, Error> {
-        // Check for 0x (hex) or 0b (binary) prefix
+    fn lex_number(&mut self, loc: Loc) -> Result<TokenKind, Error> {
         if self.peek() == Some(b'0') {
             let next = self.src.get(self.pos + 1).copied();
             if next == Some(b'x') || next == Some(b'X') {
                 self.advance();
-                self.advance(); // consume '0x'
+                self.advance();
                 let mut s = String::new();
                 while self
                     .peek()
-                    .map_or(false, |c| c.is_ascii_hexdigit() || c == b'_')
+                    .is_some_and(|c| c.is_ascii_hexdigit() || c == b'_')
                 {
                     let c = self.advance().unwrap();
                     if c != b'_' {
@@ -406,17 +395,15 @@ impl<'a> Lexer<'a> {
                 }
                 return i64::from_str_radix(&s, 16)
                     .map(TokenKind::IntLit)
-                    .map_err(|_| {
-                        Error::new(line, col, format!("hex literal '0x{s}' out of range"))
-                    });
+                    .map_err(|_| Error::new(loc, format!("hex literal '0x{s}' out of range")));
             }
             if next == Some(b'b') || next == Some(b'B') {
                 self.advance();
-                self.advance(); // consume '0b'
+                self.advance();
                 let mut s = String::new();
                 while self
                     .peek()
-                    .map_or(false, |c| c == b'0' || c == b'1' || c == b'_')
+                    .is_some_and(|c| c == b'0' || c == b'1' || c == b'_')
                 {
                     let c = self.advance().unwrap();
                     if c != b'_' {
@@ -425,22 +412,16 @@ impl<'a> Lexer<'a> {
                 }
                 return i64::from_str_radix(&s, 2)
                     .map(TokenKind::IntLit)
-                    .map_err(|_| {
-                        Error::new(line, col, format!("binary literal '0b{s}' out of range"))
-                    });
+                    .map_err(|_| Error::new(loc, format!("binary literal '0b{s}' out of range")));
             }
         }
         let mut s = String::new();
-        while self
-            .peek()
-            .map_or(false, |c| c.is_ascii_digit() || c == b'_')
-        {
+        while self.peek().is_some_and(|c| c.is_ascii_digit() || c == b'_') {
             let c = self.advance().unwrap();
             if c != b'_' {
                 s.push(c as char);
             }
         }
-        // Float: digit sequence followed by `.` (not `..`) or `e`/`E`
         let is_float = self.peek() == Some(b'.')
             && self.src.get(self.pos + 1).copied() != Some(b'.')
             || matches!(self.peek(), Some(b'e') | Some(b'E'));
@@ -448,10 +429,7 @@ impl<'a> Lexer<'a> {
             if self.peek() == Some(b'.') {
                 s.push('.');
                 self.advance();
-                while self
-                    .peek()
-                    .map_or(false, |c| c.is_ascii_digit() || c == b'_')
-                {
+                while self.peek().is_some_and(|c| c.is_ascii_digit() || c == b'_') {
                     let c = self.advance().unwrap();
                     if c != b'_' {
                         s.push(c as char);
@@ -464,11 +442,10 @@ impl<'a> Lexer<'a> {
                 if matches!(self.peek(), Some(b'+') | Some(b'-')) {
                     s.push(self.advance().unwrap() as char);
                 }
-                while self.peek().map_or(false, |c| c.is_ascii_digit()) {
+                while self.peek().is_some_and(|c| c.is_ascii_digit()) {
                     s.push(self.advance().unwrap() as char);
                 }
             }
-            // Consume optional `f32`/`f64` suffix
             if self.src.get(self.pos..self.pos + 3) == Some(b"f32")
                 || self.src.get(self.pos..self.pos + 3) == Some(b"f64")
             {
@@ -479,18 +456,18 @@ impl<'a> Lexer<'a> {
             return s
                 .parse::<f64>()
                 .map(TokenKind::FloatLit)
-                .map_err(|_| Error::new(line, col, format!("float literal '{s}' out of range")));
+                .map_err(|_| Error::new(loc, format!("float literal '{s}' out of range")));
         }
         s.parse::<i64>()
             .map(TokenKind::IntLit)
-            .map_err(|_| Error::new(line, col, format!("integer literal '{s}' out of range")))
+            .map_err(|_| Error::new(loc, format!("integer literal '{s}' out of range")))
     }
 
     fn lex_ident_or_keyword(&mut self) -> TokenKind {
         let mut name = String::new();
         while self
             .peek()
-            .map_or(false, |c| c.is_ascii_alphanumeric() || c == b'_')
+            .is_some_and(|c| c.is_ascii_alphanumeric() || c == b'_')
         {
             name.push(self.advance().unwrap() as char);
         }
@@ -510,10 +487,10 @@ impl<'a> Lexer<'a> {
             "enum" => TokenKind::Enum,
             "match" => TokenKind::Match,
             "unsafe" => TokenKind::Unsafe,
-            "as"     => TokenKind::As,
-            "type"   => TokenKind::Type,
-            "mod"    => TokenKind::Mod,
-            "pub"    => TokenKind::Pub,
+            "as" => TokenKind::As,
+            "type" => TokenKind::Type,
+            "mod" => TokenKind::Mod,
+            "pub" => TokenKind::Pub,
             _ => TokenKind::Ident(name),
         }
     }
