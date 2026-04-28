@@ -374,8 +374,8 @@ pub struct Expr {
 
 /// All expression forms.
 pub enum ExprKind {
-    Int(i64),
-    Float(f64),
+    Int(i64, Option<Ty>),
+    Float(f64, Option<Ty>),
     Bool(bool),
     Char(u32),
     Str(String),

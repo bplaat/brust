@@ -2554,20 +2554,56 @@ impl Codegen {
                     .collect();
                 format!("{{{}}}", items.join(", "))
             }
-            // Int literal with numeric type hint: emit a plain number (no INT64_C macro)
-            ExprKind::Int(n) => match hint {
+            // Suffixed int literal: emit using the suffix type directly.
+            ExprKind::Int(n, Some(ty)) => Self::emit_int_c(*n, ty),
+            // Unsuffixed int literal with numeric type hint: emit a plain number.
+            ExprKind::Int(n, None) => match hint {
                 Some(Ty::I8 | Ty::I16 | Ty::I32 | Ty::U8 | Ty::U16 | Ty::U32) => format!("{n}"),
-                Some(Ty::U64 | Ty::Usize) => format!("{n}"),
+                Some(Ty::U64 | Ty::Usize) => format!("UINT64_C({n})"),
                 _ => format!("INT64_C({n})"),
             },
+            // Suffixed float literal: emit using the suffix type directly.
+            ExprKind::Float(f, Some(ty)) => Self::emit_float_c(*f, ty),
+            // Unsuffixed float literal with F32 hint: emit as float.
+            ExprKind::Float(f, None) if matches!(hint, Some(Ty::F32)) => {
+                let s = if f.fract() == 0.0 {
+                    format!("{f:.1}")
+                } else {
+                    format!("{f}")
+                };
+                format!("{s}f")
+            }
             _ => self.emit_expr(expr, ctx),
+        }
+    }
+
+    fn emit_int_c(n: i64, ty: &Ty) -> String {
+        match ty {
+            Ty::I8 | Ty::I16 | Ty::I32 | Ty::U8 | Ty::U16 | Ty::U32 => format!("{n}"),
+            Ty::U64 | Ty::Usize => format!("UINT64_C({n})"),
+            _ => format!("INT64_C({n})"),
+        }
+    }
+
+    fn emit_float_c(f: f64, ty: &Ty) -> String {
+        let s = if f.fract() == 0.0 {
+            format!("{f:.1}")
+        } else {
+            format!("{f}")
+        };
+        if matches!(ty, Ty::F32) {
+            format!("{s}f")
+        } else {
+            s
         }
     }
 
     fn emit_expr(&mut self, expr: &Expr, ctx: &mut Ctx) -> String {
         match &expr.kind {
-            ExprKind::Int(n) => format!("INT64_C({n})"),
-            ExprKind::Float(f) => {
+            ExprKind::Int(n, Some(ty)) => Self::emit_int_c(*n, ty),
+            ExprKind::Int(n, None) => format!("INT64_C({n})"),
+            ExprKind::Float(f, Some(ty)) => Self::emit_float_c(*f, ty),
+            ExprKind::Float(f, None) => {
                 if f.fract() == 0.0 {
                     format!("{f:.1}")
                 } else {
@@ -3117,7 +3153,7 @@ impl Codegen {
 /// Uses variable types, cast targets, struct field types, and function return types.
 fn printf_spec(codegen: &Codegen, expr: &Expr, ctx: &Ctx) -> String {
     match &expr.kind {
-        ExprKind::Float(_) => "%f".to_string(),
+        ExprKind::Float(_, _) => "%f".to_string(),
         ExprKind::Bool(_) => "%B".to_string(),
         ExprKind::Char(_) => "%u".to_string(),
         ExprKind::Str(_) => "%s".to_string(),

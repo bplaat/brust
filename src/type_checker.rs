@@ -1289,10 +1289,12 @@ impl TypeChecker {
     fn infer_expr(&mut self, expr: &mut Expr, scope: &Scope) -> Ty {
         self.cur_loc = expr.loc;
         match &mut expr.kind {
-            // Literals: integer/float literals use canonical types that are
-            // widened by ty_compat to any compatible integer/float type.
-            ExprKind::Int(_) => Ty::I64,
-            ExprKind::Float(_) => Ty::F64,
+            // Literals: suffixed integers infer as their explicit type; unsuffixed
+            // integer/float literals use canonical types widened by ty_compat.
+            ExprKind::Int(_, Some(ty)) => ty.clone(),
+            ExprKind::Int(_, None) => Ty::I64,
+            ExprKind::Float(_, Some(ty)) => ty.clone(),
+            ExprKind::Float(_, None) => Ty::F64,
             ExprKind::Bool(_) => Ty::Bool,
             ExprKind::Char(_) => Ty::Char,
             ExprKind::Str(_) => Ty::Str,

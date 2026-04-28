@@ -4,11 +4,33 @@ use crate::ast::{
     TraitDecl, TraitMethodSig, Ty, UnOp, VariantFields,
 };
 use crate::error::Error;
-use crate::lexer::{Lexer, Token, TokenKind};
+use crate::lexer::{FloatSuffix, IntSuffix, Lexer, Token, TokenKind};
 use crate::loc::Loc;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::rc::Rc;
+
+fn float_suffix_to_ty(suffix: FloatSuffix) -> Ty {
+    match suffix {
+        FloatSuffix::F32 => Ty::F32,
+        FloatSuffix::F64 => Ty::F64,
+    }
+}
+
+fn int_suffix_to_ty(suffix: IntSuffix) -> Ty {
+    match suffix {
+        IntSuffix::I8 => Ty::I8,
+        IntSuffix::I16 => Ty::I16,
+        IntSuffix::I32 => Ty::I32,
+        IntSuffix::I64 => Ty::I64,
+        IntSuffix::Isize => Ty::Isize,
+        IntSuffix::U8 => Ty::U8,
+        IntSuffix::U16 => Ty::U16,
+        IntSuffix::U32 => Ty::U32,
+        IntSuffix::U64 => Ty::U64,
+        IntSuffix::Usize => Ty::Usize,
+    }
+}
 
 fn starts_uppercase(s: &str) -> bool {
     s.chars().next().is_some_and(|c| c.is_uppercase())
@@ -946,7 +968,7 @@ impl Parser {
                 let elem_ty = self.parse_ty()?;
                 self.expect(&TokenKind::Semicolon)?;
                 let n_tok = self.peek().clone();
-                if let TokenKind::IntLit(n) = n_tok.kind {
+                if let TokenKind::IntLit(n, _) = n_tok.kind {
                     self.advance();
                     self.expect(&TokenKind::RBracket)?;
                     Ok(Ty::Array(Box::new(elem_ty), n as usize))
@@ -1816,13 +1838,13 @@ impl Parser {
                 self.advance();
                 Ok(Pat::Bool(false))
             }
-            TokenKind::IntLit(n) => {
+            TokenKind::IntLit(n, _) => {
                 let n = *n;
                 self.advance();
                 // Range pattern: `lo..=hi`
                 if self.peek().kind == TokenKind::DotDotEq {
                     self.advance();
-                    if let TokenKind::IntLit(hi) = self.peek().kind.clone() {
+                    if let TokenKind::IntLit(hi, _) = self.peek().kind.clone() {
                         self.advance();
                         return Ok(Pat::Range { lo: n, hi });
                     }
@@ -1849,13 +1871,13 @@ impl Parser {
             }
             TokenKind::Minus => {
                 self.advance();
-                if let TokenKind::IntLit(n) = self.peek().kind.clone() {
+                if let TokenKind::IntLit(n, _) = self.peek().kind.clone() {
                     self.advance();
                     let lo = -n;
                     // Range pattern starting with negative: `-lo..=hi`
                     if self.peek().kind == TokenKind::DotDotEq {
                         self.advance();
-                        if let TokenKind::IntLit(hi) = self.peek().kind.clone() {
+                        if let TokenKind::IntLit(hi, _) = self.peek().kind.clone() {
                             self.advance();
                             return Ok(Pat::Range { lo, hi });
                         }
@@ -2159,7 +2181,7 @@ impl Parser {
             if self.peek().kind == TokenKind::Dot {
                 self.advance();
                 let loc = expr.loc;
-                if let TokenKind::IntLit(idx) = self.peek().kind.clone() {
+                if let TokenKind::IntLit(idx, _) = self.peek().kind.clone() {
                     self.advance();
                     expr = Expr {
                         kind: ExprKind::Field {
@@ -2282,19 +2304,21 @@ impl Parser {
         let loc = self.loc();
         let tok = self.peek().clone();
         match &tok.kind {
-            TokenKind::IntLit(n) => {
+            TokenKind::IntLit(n, suffix) => {
                 let n = *n;
+                let ty = suffix.clone().map(int_suffix_to_ty);
                 self.advance();
                 Ok(Expr {
-                    kind: ExprKind::Int(n),
+                    kind: ExprKind::Int(n, ty),
                     loc,
                 })
             }
-            TokenKind::FloatLit(f) => {
+            TokenKind::FloatLit(f, suffix) => {
                 let f = *f;
+                let ty = suffix.clone().map(float_suffix_to_ty);
                 self.advance();
                 Ok(Expr {
-                    kind: ExprKind::Float(f),
+                    kind: ExprKind::Float(f, ty),
                     loc,
                 })
             }

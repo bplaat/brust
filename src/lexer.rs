@@ -37,8 +37,8 @@ pub enum TokenKind {
     Static,
     // Identifiers and literals
     Ident(String),
-    IntLit(i64),
-    FloatLit(f64),
+    IntLit(i64, Option<IntSuffix>),
+    FloatLit(f64, Option<FloatSuffix>),
     CharLit(u32),
     StringLit(String),
     // Arithmetic operators
@@ -96,6 +96,26 @@ pub enum TokenKind {
     FatArrow,
     Bang,
     Eof,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum FloatSuffix {
+    F32,
+    F64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum IntSuffix {
+    I8,
+    I16,
+    I32,
+    I64,
+    Isize,
+    U8,
+    U16,
+    U32,
+    U64,
+    Usize,
 }
 
 #[derive(Debug, Clone)]
@@ -406,29 +426,21 @@ impl Lexer {
                 self.advance();
                 TokenKind::Tilde
             }
-            b'"' => self.lex_string(loc)?,
-            b'\'' => self.lex_char(loc)?,
+            b'"' => self.lex_string(loc, false)?,
+            b'\'' => self.lex_char(loc, false)?,
             c if c.is_ascii_digit() => self.lex_number(loc)?,
             // b'...' byte char literal and b"..." byte string literal
             b'b' if self.src.get(self.pos + 1).copied() == Some(b'\'') => {
                 self.advance(); // consume 'b'
-                // b'X' has integer type (u8); value must fit in 0..=255.
-                match self.lex_char(loc)? {
-                    TokenKind::CharLit(c) => {
-                        if c > 255 {
-                            return Err(Error::new(
-                                loc,
-                                "byte literal value must be in the range 0..=255",
-                            ));
-                        }
-                        TokenKind::IntLit(c as i64)
-                    }
+                // b'X' has integer type u8; byte_mode enforces ASCII-only and 0..=255 range.
+                match self.lex_char(loc, true)? {
+                    TokenKind::CharLit(c) => TokenKind::IntLit(c as i64, Some(IntSuffix::U8)),
                     other => other,
                 }
             }
             b'b' if self.src.get(self.pos + 1).copied() == Some(b'"') => {
                 self.advance(); // consume 'b'
-                self.lex_string(loc)?
+                self.lex_string(loc, true)?
             }
             c if c.is_ascii_alphabetic() || c == b'_' => self.lex_ident_or_keyword(),
             _ => {
@@ -485,8 +497,11 @@ impl Lexer {
                     self.advance();
                     break;
                 }
-                Some(c) if (c as char).is_ascii_hexdigit() => {
-                    hex.push(self.advance().unwrap() as char);
+                Some(c) if (c as char).is_ascii_hexdigit() || c == b'_' => {
+                    let c = self.advance().unwrap();
+                    if c != b'_' {
+                        hex.push(c as char);
+                    }
                 }
                 _ => return Err(Error::new(loc, "invalid character in unicode escape")),
             }
@@ -511,7 +526,33 @@ impl Lexer {
         Ok(char::from_u32(v).unwrap())
     }
 
-    fn lex_string(&mut self, loc: Loc) -> Result<TokenKind, Error> {
+    /// Parse the `NN` portion of a `\xNN` escape and return the resulting char.
+    /// The leading `\x` must already have been consumed.
+    /// `byte_mode` controls whether values above 0x7F are accepted (for byte literals).
+    fn parse_hex_escape(&mut self, loc: Loc, byte_mode: bool) -> Result<char, Error> {
+        let hi = match self.peek() {
+            Some(c) if (c as char).is_ascii_hexdigit() => {
+                self.advance().unwrap() as char
+            }
+            _ => return Err(Error::new(loc, "expected two hex digits in \\x escape")),
+        };
+        let lo = match self.peek() {
+            Some(c) if (c as char).is_ascii_hexdigit() => {
+                self.advance().unwrap() as char
+            }
+            _ => return Err(Error::new(loc, "expected two hex digits in \\x escape")),
+        };
+        let v = u8::from_str_radix(&format!("{hi}{lo}"), 16).unwrap();
+        if !byte_mode && v > 0x7F {
+            return Err(Error::new(
+                loc,
+                "this form of character escape may only be used with characters in the range [\\x00-\\x7f]",
+            ));
+        }
+        Ok(v as char)
+    }
+
+    fn lex_string(&mut self, loc: Loc, byte_mode: bool) -> Result<TokenKind, Error> {
         self.advance(); // consume opening "
         let mut s = String::new();
         loop {
@@ -530,6 +571,13 @@ impl Lexer {
                         Some(b'\\') => s.push('\\'),
                         Some(b'"') => s.push('"'),
                         Some(b'0') => s.push('\0'),
+                        Some(b'x') => s.push(self.parse_hex_escape(loc, byte_mode)?),
+                        Some(b'u') if byte_mode => {
+                            return Err(Error::new(
+                                loc,
+                                "unicode escapes are not allowed in byte string literals",
+                            ));
+                        }
                         Some(b'u') => s.push(self.parse_unicode_escape(loc)?),
                         // Backslash-newline: skip the newline and all leading whitespace on the
                         // next line, matching Rust's string literal line continuation.
@@ -547,13 +595,22 @@ impl Lexer {
                         None => return Err(Error::new(loc, "unterminated escape sequence")),
                     }
                 }
-                Some(_) => s.push(self.next_utf8_char(loc)?),
+                Some(_) => {
+                    let ch = self.next_utf8_char(loc)?;
+                    if byte_mode && ch as u32 > 0x7F {
+                        return Err(Error::new(
+                            loc,
+                            "non-ASCII characters are not allowed in byte string literals",
+                        ));
+                    }
+                    s.push(ch);
+                }
             }
         }
         Ok(TokenKind::StringLit(s))
     }
 
-    fn lex_char(&mut self, loc: Loc) -> Result<TokenKind, Error> {
+    fn lex_char(&mut self, loc: Loc, byte_mode: bool) -> Result<TokenKind, Error> {
         self.advance(); // consume opening '
         let ch: char = if self.peek() == Some(b'\\') {
             self.advance(); // consume backslash
@@ -565,6 +622,13 @@ impl Lexer {
                 Some(b'\'') => '\'',
                 Some(b'"') => '"',
                 Some(b'0') => '\0',
+                Some(b'x') => self.parse_hex_escape(loc, byte_mode)?,
+                Some(b'u') if byte_mode => {
+                    return Err(Error::new(
+                        loc,
+                        "unicode escapes are not allowed in byte literals",
+                    ));
+                }
                 Some(b'u') => self.parse_unicode_escape(loc)?,
                 Some(c) => {
                     return Err(Error::new(loc, format!("unknown escape '\\{}'", c as char)));
@@ -572,8 +636,14 @@ impl Lexer {
                 None => return Err(Error::new(loc, "unterminated escape")),
             }
         } else {
-            // Non-escape character: decode the full UTF-8 sequence.
-            self.next_utf8_char(loc)?
+            let ch = self.next_utf8_char(loc)?;
+            if byte_mode && ch as u32 > 0x7F {
+                return Err(Error::new(
+                    loc,
+                    "non-ASCII characters are not allowed in byte literals",
+                ));
+            }
+            ch
         };
         if self.advance() != Some(b'\'') {
             return Err(Error::new(loc, "expected closing ' in char literal"));
@@ -583,29 +653,103 @@ impl Lexer {
 
     /// Consume an optional integer type suffix (e.g. `u8`, `i64`, `usize`).
     /// Must be called right after the digit sequence, before returning the token.
-    fn consume_int_suffix(&mut self) {
+    fn consume_int_suffix(&mut self) -> Option<IntSuffix> {
         // Longest suffixes first to avoid consuming a prefix of a longer one.
-        const SUFFIXES: &[&[u8]] = &[
-            b"u128", b"i128", b"usize", b"isize", b"u64", b"i64", b"u32", b"i32", b"u16", b"i16",
-            b"u8", b"i8",
+        const SUFFIXES: &[(&[u8], IntSuffix)] = &[
+            (b"usize", IntSuffix::Usize),
+            (b"isize", IntSuffix::Isize),
+            (b"u64", IntSuffix::U64),
+            (b"i64", IntSuffix::I64),
+            (b"u32", IntSuffix::U32),
+            (b"i32", IntSuffix::I32),
+            (b"u16", IntSuffix::U16),
+            (b"i16", IntSuffix::I16),
+            (b"u8", IntSuffix::U8),
+            (b"i8", IntSuffix::I8),
         ];
-        for suffix in SUFFIXES {
-            let end = self.pos + suffix.len();
-            if self.src.get(self.pos..end) == Some(*suffix) {
-                // Only consume if not followed by another alphanumeric char.
+        for (bytes, suffix) in SUFFIXES {
+            let end = self.pos + bytes.len();
+            if self.src.get(self.pos..end) == Some(*bytes) {
+                // Only consume if not followed by another alphanumeric char or underscore.
                 if !self
                     .src
                     .get(end)
                     .copied()
                     .is_some_and(|c| c.is_ascii_alphanumeric() || c == b'_')
                 {
-                    for _ in 0..suffix.len() {
+                    for _ in 0..bytes.len() {
                         self.advance();
                     }
-                    return;
+                    return Some(suffix.clone());
                 }
             }
         }
+        None
+    }
+
+    fn check_int_range(loc: Loc, value: i64, suffix: &IntSuffix) -> Result<(), Error> {
+        let ok = match suffix {
+            IntSuffix::I8 => (0..=127i64).contains(&value),
+            IntSuffix::I16 => (0..=32767i64).contains(&value),
+            IntSuffix::I32 => (0..=2147483647i64).contains(&value),
+            IntSuffix::I64 | IntSuffix::Isize => true,
+            IntSuffix::U8 => (0..=255i64).contains(&value),
+            IntSuffix::U16 => (0..=65535i64).contains(&value),
+            IntSuffix::U32 => (0..=4294967295i64).contains(&value),
+            IntSuffix::U64 | IntSuffix::Usize => value >= 0,
+        };
+        if ok {
+            Ok(())
+        } else {
+            let ty_name = match suffix {
+                IntSuffix::I8 => "i8",
+                IntSuffix::I16 => "i16",
+                IntSuffix::I32 => "i32",
+                IntSuffix::I64 => "i64",
+                IntSuffix::Isize => "isize",
+                IntSuffix::U8 => "u8",
+                IntSuffix::U16 => "u16",
+                IntSuffix::U32 => "u32",
+                IntSuffix::U64 => "u64",
+                IntSuffix::Usize => "usize",
+            };
+            Err(Error::new(
+                loc,
+                format!("literal value {value} is out of range for `{ty_name}`"),
+            ))
+        }
+    }
+
+    fn consume_float_suffix(&mut self) -> Option<FloatSuffix> {
+        // Allow optional leading underscore separator (e.g. `5_f32`).
+        let offset = if self.peek() == Some(b'_')
+            && self.src.get(self.pos + 1).copied() == Some(b'f')
+        {
+            1
+        } else {
+            0
+        };
+        for (bytes, suffix) in &[
+            (b"f32" as &[u8], FloatSuffix::F32),
+            (b"f64" as &[u8], FloatSuffix::F64),
+        ] {
+            let start = self.pos + offset;
+            let end = start + bytes.len();
+            if self.src.get(start..end) == Some(*bytes) {
+                if !self
+                    .src
+                    .get(end)
+                    .copied()
+                    .is_some_and(|c| c.is_ascii_alphanumeric() || c == b'_')
+                {
+                    for _ in 0..offset + bytes.len() {
+                        self.advance();
+                    }
+                    return Some(suffix.clone());
+                }
+            }
+        }
+        None
     }
 
     fn lex_number(&mut self, loc: Loc) -> Result<TokenKind, Error> {
@@ -627,11 +771,40 @@ impl Lexer {
                 if s.is_empty() {
                     return Err(Error::new(loc, "expected hex digits after '0x'"));
                 }
-                let tok = i64::from_str_radix(&s, 16)
-                    .map(TokenKind::IntLit)
+                let value = i64::from_str_radix(&s, 16)
                     .map_err(|_| Error::new(loc, format!("hex literal '0x{s}' out of range")))?;
-                self.consume_int_suffix();
-                return Ok(tok);
+                let suffix = self.consume_int_suffix();
+                if let Some(ref suf) = suffix {
+                    Self::check_int_range(loc, value, suf)?;
+                }
+                return Ok(TokenKind::IntLit(value, suffix));
+            }
+            if next == Some(b'o') || next == Some(b'O') {
+                self.advance();
+                self.advance();
+                let mut s = String::new();
+                while self
+                    .peek()
+                    .is_some_and(|c| matches!(c, b'0'..=b'7') || c == b'_')
+                {
+                    let c = self.advance().unwrap();
+                    if c != b'_' {
+                        s.push(c as char);
+                    }
+                }
+                if self.peek().is_some_and(|c| c.is_ascii_digit()) {
+                    return Err(Error::new(loc, "invalid digit in octal literal"));
+                }
+                if s.is_empty() {
+                    return Err(Error::new(loc, "expected octal digits after '0o'"));
+                }
+                let value = i64::from_str_radix(&s, 8)
+                    .map_err(|_| Error::new(loc, format!("octal literal '0o{s}' out of range")))?;
+                let suffix = self.consume_int_suffix();
+                if let Some(ref suf) = suffix {
+                    Self::check_int_range(loc, value, suf)?;
+                }
+                return Ok(TokenKind::IntLit(value, suffix));
             }
             if next == Some(b'b') || next == Some(b'B') {
                 self.advance();
@@ -649,11 +822,13 @@ impl Lexer {
                 if s.is_empty() {
                     return Err(Error::new(loc, "expected binary digits after '0b'"));
                 }
-                let tok = i64::from_str_radix(&s, 2)
-                    .map(TokenKind::IntLit)
+                let value = i64::from_str_radix(&s, 2)
                     .map_err(|_| Error::new(loc, format!("binary literal '0b{s}' out of range")))?;
-                self.consume_int_suffix();
-                return Ok(tok);
+                let suffix = self.consume_int_suffix();
+                if let Some(ref suf) = suffix {
+                    Self::check_int_range(loc, value, suf)?;
+                }
+                return Ok(TokenKind::IntLit(value, suffix));
             }
         }
         let mut s = String::new();
@@ -687,24 +862,27 @@ impl Lexer {
                     s.push(self.advance().unwrap() as char);
                 }
             }
-            if self.src.get(self.pos..self.pos + 3) == Some(b"f32")
-                || self.src.get(self.pos..self.pos + 3) == Some(b"f64")
-            {
-                self.advance();
-                self.advance();
-                self.advance();
-            }
+            let suffix = self.consume_float_suffix();
             return s
                 .parse::<f64>()
-                .map(TokenKind::FloatLit)
+                .map(|f| TokenKind::FloatLit(f, suffix))
                 .map_err(|_| Error::new(loc, format!("float literal '{s}' out of range")));
         }
-        let tok = s
+        // Check for float suffix on a decimal integer literal (e.g. `5f32` is a float).
+        if let Some(float_suffix) = self.consume_float_suffix() {
+            return s
+                .parse::<f64>()
+                .map(|f| TokenKind::FloatLit(f, Some(float_suffix)))
+                .map_err(|_| Error::new(loc, format!("float literal '{s}' out of range")));
+        }
+        let value = s
             .parse::<i64>()
-            .map(TokenKind::IntLit)
             .map_err(|_| Error::new(loc, format!("integer literal '{s}' out of range")))?;
-        self.consume_int_suffix();
-        Ok(tok)
+        let suffix = self.consume_int_suffix();
+        if let Some(ref suf) = suffix {
+            Self::check_int_range(loc, value, suf)?;
+        }
+        Ok(TokenKind::IntLit(value, suffix))
     }
 
     fn lex_ident_or_keyword(&mut self) -> TokenKind {

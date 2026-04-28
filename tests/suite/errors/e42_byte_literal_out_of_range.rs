@@ -1,5 +1,5 @@
-// err: byte literal value must be in the range 0..=255
+// err: unicode escapes are not allowed in byte literals
 
 fn main() {
-    let _x: u32 = b'\u{100}';
+    let _x: u8 = b'\u{100}';
 }
