@@ -15,14 +15,30 @@ pub struct StructDecl {
     pub fields: Vec<FieldDecl>,
 }
 
+#[derive(Clone, PartialEq)]
 pub struct FieldDecl {
     pub name: String,
     pub ty: Ty,
 }
 
+#[derive(Clone)]
 pub struct EnumDecl {
     pub name: String,
-    pub variants: Vec<String>,
+    pub variants: Vec<EnumVariant>,
+}
+
+#[derive(Clone)]
+pub struct EnumVariant {
+    pub name: String,
+    pub fields: VariantFields,
+}
+
+/// Shape of enum variant fields.
+#[derive(Clone)]
+pub enum VariantFields {
+    Unit,                   // Variant
+    Tuple(Vec<Ty>),         // Variant(T0, T1)
+    Named(Vec<FieldDecl>),  // Variant { x: T, y: T }
 }
 
 pub struct ImplBlock {
@@ -51,14 +67,16 @@ pub struct Param {
 }
 
 /// Types supported.
+#[derive(Clone, PartialEq)]
 pub enum Ty {
     // Signed integers
     I8, I16, I32, I64, Isize,
     // Unsigned integers
     U8, U16, U32, U64, Usize,
     Bool,
-    Unit,          // ()
-    Named(String), // user-defined struct type
+    Unit,            // ()
+    Tuple(Vec<Ty>),  // (T0, T1, ...)
+    Named(String),   // user-defined struct/enum type
 }
 
 pub struct Block {
@@ -72,7 +90,7 @@ pub enum Stmt {
     Let { name: String, mutable: bool, ty: Option<Ty>, expr: Expr },
     /// `name = expr;`
     Assign { name: String, expr: Expr },
-    /// `return [expr];`
+    /// `return [expr];` or implicit tail return
     Return(Option<Expr>),
     /// `if expr { ... } [else { ... }]`
     If { cond: Expr, then_block: Block, else_block: Option<Block> },
@@ -80,7 +98,7 @@ pub enum Stmt {
     While { cond: Expr, body: Block },
     /// `match expr { pat => { ... }, ... }`
     Match { expr: Expr, arms: Vec<MatchArm> },
-    /// Expression used as a statement, e.g. a function call.
+    /// Expression used as a statement (function call, method call, field assignment).
     Expr(Expr),
 }
 
@@ -89,29 +107,36 @@ pub struct MatchArm {
     pub body: Block,
 }
 
-/// Match patterns (simplified: no nested patterns).
+/// Match patterns.
 pub enum Pat {
-    /// `_` wildcard / default
     Wildcard,
-    /// `true` or `false`
     Bool(bool),
-    /// Integer literal
     Int(i64),
-    /// `TypeName::Variant` — enum variant
-    EnumVariant { type_name: String, variant: String },
+    EnumVariant { type_name: String, variant: String, bindings: PatBindings },
+}
+
+/// Bindings extracted in a match arm.
+pub enum PatBindings {
+    None,                          // unit variant: no bindings
+    Tuple(Vec<String>),            // Variant(a, b, _)
+    Named(Vec<(String, String)>),  // Variant { field: binding, ... } or shorthand { x, y }
 }
 
 pub enum Expr {
     Int(i64),
     Bool(bool),
     Var(String),
-    /// `Type { field: expr, ... }`
+    /// `(expr0, expr1, ...)`
+    Tuple(Vec<Expr>),
+    /// `Type { field: expr, ... }` — struct literal
     StructLit { name: String, fields: Vec<(String, Expr)> },
-    /// `expr.field`
+    /// `Type::Variant { field: expr, ... }` — struct-like enum variant literal
+    EnumStructLit { type_name: String, variant: String, fields: Vec<(String, Expr)> },
+    /// `expr.field` or `expr.0` (tuple index via numeric field name "0", "1", ...)
     Field { expr: Box<Expr>, field: String },
-    /// Free function or associated call: `name(args)` or `Type::name(args)`
+    /// Free function call: `name(args)`
     Call { name: String, args: Vec<Expr> },
-    /// Associated function: `Type::method(args)`
+    /// Associated function or enum variant: `Type::name(args)` or `Type::Variant`
     AssocCall { type_name: String, method: String, args: Vec<Expr> },
     /// Method call: `expr.method(args)`
     MethodCall { expr: Box<Expr>, method: String, args: Vec<Expr> },
@@ -122,18 +147,14 @@ pub enum Expr {
 #[derive(Clone, Copy)]
 pub enum UnOp {
     Neg,    // -x
-    Not,    // !x  logical NOT (bool) / bitwise NOT (int, same as ~)
-    BitNot, // ~x  explicit bitwise NOT
+    Not,    // !x  logical NOT
+    BitNot, // ~x  bitwise NOT
 }
 
 #[derive(Clone, Copy)]
 pub enum BinOp {
-    // Arithmetic
     Add, Sub, Mul, Div, Rem,
-    // Bitwise
     BitAnd, BitOr, BitXor, Shl, Shr,
-    // Comparison
     Eq, Ne, Lt, Gt, Le, Ge,
-    // Logical
     And, Or,
 }
