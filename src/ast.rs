@@ -146,6 +146,14 @@ pub enum StmtKind {
     },
     /// `while expr { ... }`
     While { cond: Expr, body: Block },
+    /// `loop { ... }` — infinite loop, exit via `break`
+    Loop(Block),
+    /// `for <var> in <expr> { ... }` — iterate over an array or range
+    For { var: String, iter: Expr, body: Block },
+    /// `break` — exit the nearest enclosing loop
+    Break,
+    /// `continue` — skip to the next iteration of the nearest enclosing loop
+    Continue,
     /// `match expr { pat => { ... }, ... }`
     Match { expr: Expr, arms: Vec<MatchArm> },
     /// Expression used as a statement (calls, assignments via BinOp::Eq, unsafe blocks).

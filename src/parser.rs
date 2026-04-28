@@ -523,6 +523,26 @@ impl Parser {
             TokenKind::Return => self.parse_return(),
             TokenKind::If => self.parse_if(),
             TokenKind::While => self.parse_while(),
+            TokenKind::Loop => {
+                self.advance();
+                let body = self.parse_block()?;
+                Ok(Stmt { kind: StmtKind::Loop(body), loc })
+            }
+            TokenKind::For => self.parse_for(),
+            TokenKind::Break => {
+                self.advance();
+                if self.peek().kind == TokenKind::Semicolon {
+                    self.advance();
+                }
+                Ok(Stmt { kind: StmtKind::Break, loc })
+            }
+            TokenKind::Continue => {
+                self.advance();
+                if self.peek().kind == TokenKind::Semicolon {
+                    self.advance();
+                }
+                Ok(Stmt { kind: StmtKind::Continue, loc })
+            }
             TokenKind::Match => self.parse_match(),
             TokenKind::Unsafe => {
                 self.advance();
@@ -703,6 +723,19 @@ impl Parser {
         let body = self.parse_block()?;
         Ok(Stmt {
             kind: StmtKind::While { cond, body },
+            loc,
+        })
+    }
+
+    fn parse_for(&mut self) -> Result<Stmt, Error> {
+        let loc = self.loc();
+        self.expect(&TokenKind::For)?;
+        let var = self.expect_ident()?;
+        self.expect(&TokenKind::In)?;
+        let iter = self.parse_expr()?;
+        let body = self.parse_block()?;
+        Ok(Stmt {
+            kind: StmtKind::For { var, iter, body },
             loc,
         })
     }
