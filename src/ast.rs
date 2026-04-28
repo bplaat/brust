@@ -17,6 +17,20 @@ pub struct Block {
 }
 
 pub enum Stmt {
-    /// `println!("literal string");`
-    Println(String),
+    /// `println!("format", args...);`
+    Println { format: String, args: Vec<Expr> },
+}
+
+pub enum Expr {
+    Int(i64),
+    BinOp { op: BinOp, lhs: Box<Expr>, rhs: Box<Expr> },
+}
+
+#[derive(Clone, Copy)]
+pub enum BinOp {
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Rem,
 }

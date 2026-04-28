@@ -1,4 +1,4 @@
-use crate::ast::{File, Item, Stmt};
+use crate::ast::{BinOp, Expr, File, Item, Stmt};
 
 pub fn generate(file: &File) -> String {
     let mut out = String::new();
@@ -6,7 +6,6 @@ pub fn generate(file: &File) -> String {
     for item in &file.items {
         match item {
             Item::Fn(f) => {
-                // Only main gets special C signature for now
                 if f.name == "main" {
                     out.push_str("int main(void) {\n");
                 } else {
@@ -14,10 +13,8 @@ pub fn generate(file: &File) -> String {
                 }
                 for stmt in &f.body.stmts {
                     match stmt {
-                        Stmt::Println(text) => {
-                            // Escape the string for C
-                            let escaped = c_escape(text);
-                            out.push_str(&format!("    printf(\"{escaped}\\n\");\n"));
+                        Stmt::Println { format, args } => {
+                            emit_println(&mut out, format, args);
                         }
                     }
                 }
@@ -31,17 +28,50 @@ pub fn generate(file: &File) -> String {
     out
 }
 
-/// Escape a string so it is safe inside a C double-quoted string.
-fn c_escape(s: &str) -> String {
-    let mut out = String::new();
-    for ch in s.chars() {
-        match ch {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\t' => out.push_str("\\t"),
-            c => out.push(c),
+fn emit_println(out: &mut String, format: &str, args: &[Expr]) {
+    // Replace each `{}` in the format string with `%lld`, escape for C.
+    let mut fmt_c = String::new();
+    let mut arg_idx = 0;
+    let mut chars = format.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '{' && chars.peek() == Some(&'}') {
+            chars.next(); // consume '}'
+            fmt_c.push_str("%lld");
+            arg_idx += 1;
+        } else {
+            // c_escape the character inline
+            match ch {
+                '"'  => fmt_c.push_str("\\\""),
+                '\\' => fmt_c.push_str("\\\\"),
+                '\n' => fmt_c.push_str("\\n"),
+                '\t' => fmt_c.push_str("\\t"),
+                c    => fmt_c.push(c),
+            }
         }
     }
-    out
+    let _ = arg_idx;
+
+    if args.is_empty() {
+        out.push_str(&format!("    printf(\"{fmt_c}\\n\");\n"));
+    } else {
+        let args_str: Vec<String> = args.iter().map(emit_expr).collect();
+        out.push_str(&format!("    printf(\"{fmt_c}\\n\", {});\n", args_str.join(", ")));
+    }
+}
+
+fn emit_expr(expr: &Expr) -> String {
+    match expr {
+        Expr::Int(n) => format!("{n}LL"),
+        Expr::BinOp { op, lhs, rhs } => {
+            let op_str = match op {
+                BinOp::Add => "+",
+                BinOp::Sub => "-",
+                BinOp::Mul => "*",
+                BinOp::Div => "/",
+                BinOp::Rem => "%",
+            };
+            // Wrap in parens to preserve brust precedence in C output
+            format!("({} {} {})", emit_expr(lhs), op_str, emit_expr(rhs))
+        }
+    }
 }
