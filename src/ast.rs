@@ -88,6 +88,9 @@ pub enum Ty {
     Bool,
     Char,              // Unicode scalar value (u32)
     Unit,              // ()
+    Str,               // &str (const char*)
+    Array(Box<Ty>, usize), // [T; N]
+    Slice(Box<Ty>),    // &[T] (v1: T*, no length)
     Tuple(Vec<Ty>),    // (T0, T1, ...)
     Named(String),     // user-defined struct/enum type
     Ref(Box<Ty>),      // &T
@@ -157,7 +160,15 @@ pub enum Expr {
     Float(f64),
     Bool(bool),
     Char(u32),
+    Str(String),
     Var(String),
+    /// `[expr, expr, ...]` — array literal
+    ArrayLit(Vec<Expr>),
+    /// `expr[index]`
+    Index {
+        expr: Box<Expr>,
+        index: Box<Expr>,
+    },
     /// `(expr0, expr1, ...)`
     Tuple(Vec<Expr>),
     /// `Type { field: expr, ... }` — struct literal

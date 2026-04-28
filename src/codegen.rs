@@ -220,14 +220,17 @@ impl Codegen {
         self.out.push_str(&format!("{sig} {{\n"));
 
         let mut params_env = HashMap::new();
+        let mut params_var_types = HashMap::new();
         for p in &f.params {
             if let Ty::Named(n) = &p.ty { params_env.insert(p.name.clone(), n.clone()); }
+            params_var_types.insert(p.name.clone(), p.ty.clone());
         }
 
         let mut ctx = match (&f.receiver, impl_type) {
             (Some(recv), Some(itype)) => Ctx::for_method(itype, recv, params_env),
             _ => Ctx { type_env: params_env, ..Ctx::new() },
         };
+        ctx.var_types = params_var_types;
         ctx.return_ty = Some(f.return_ty.clone());
 
         for stmt in &f.body.stmts {
@@ -256,16 +259,17 @@ impl Codegen {
             }
 
             Stmt::Let { name, mutable, ty, expr } => {
-                let c_ty = ty.as_ref().map(|t| ty_str(t)).unwrap_or_else(|| "int64_t".to_string());
                 // Track named types for method resolution
                 if let Some(Ty::Named(n)) = ty { ctx.type_env.insert(name.clone(), n.clone()); }
                 // Track all types for printf format specifier selection
                 if let Some(t) = ty { ctx.var_types.insert(name.clone(), t.clone()); }
-                // Don't add `const` prefix for pointer/ref types — constness lives in the type already
-                let is_ptr = matches!(ty, Some(Ty::Ref(_) | Ty::RefMut(_) | Ty::RawConst(_) | Ty::RawMut(_)));
+                // Don't add `const` prefix for pointer/ref/array types
+                let is_ptr = matches!(ty, Some(Ty::Ref(_) | Ty::RefMut(_) | Ty::RawConst(_) | Ty::RawMut(_) | Ty::Array(_, _) | Ty::Str));
                 let kw = if *mutable || is_ptr { "" } else { "const " };
                 let val = self.emit_expr_hint(expr, ctx, ty.as_ref());
-                self.out.push_str(&format!("{p}{kw}{c_ty} {name} = {val};\n"));
+                let decl = ty.as_ref().map(|t| ty_str_decl(t, name))
+                    .unwrap_or_else(|| format!("int64_t {name}"));
+                self.out.push_str(&format!("{p}{kw}{decl} = {val};\n"));
             }
 
             Stmt::Assign { name, expr } => {
@@ -447,7 +451,7 @@ impl Codegen {
     // Expressions
     // -----------------------------------------------------------------------
 
-    /// Emit an expression, with an optional type hint for tuple literals.
+    /// Emit an expression, with an optional type hint for tuple/array literals.
     fn emit_expr_hint(&self, expr: &Expr, ctx: &mut Ctx, hint: Option<&Ty>) -> String {
         match expr {
             Expr::Tuple(elems) => {
@@ -461,6 +465,19 @@ impl Codegen {
                     .collect();
                 format!("({name}){{{}}}", fields.join(", "))
             }
+            Expr::ArrayLit(elems) => {
+                let elem_hint = if let Some(Ty::Array(inner, _)) = hint { Some(inner.as_ref()) } else { None };
+                let items: Vec<String> = elems.iter()
+                    .map(|e| self.emit_expr_hint(e, ctx, elem_hint))
+                    .collect();
+                format!("{{{}}}", items.join(", "))
+            }
+            // Int literal with numeric type hint: emit a plain number (no INT64_C macro)
+            Expr::Int(n) => match hint {
+                Some(Ty::I8 | Ty::I16 | Ty::I32 | Ty::U8 | Ty::U16 | Ty::U32) => format!("{n}"),
+                Some(Ty::U64 | Ty::Usize) => format!("{n}"),
+                _ => format!("INT64_C({n})"),
+            },
             _ => self.emit_expr(expr, ctx),
         }
     }
@@ -469,12 +486,38 @@ impl Codegen {
         match expr {
             Expr::Int(n)  => format!("INT64_C({n})"),
             Expr::Float(f) => {
-                // Emit with enough precision; always include decimal point
                 if f.fract() == 0.0 { format!("{f:.1}") } else { format!("{f}") }
             }
             Expr::Char(c) => format!("UINT32_C({c})"),
             Expr::Bool(b) => if *b { "true".to_string() } else { "false".to_string() },
+            Expr::Str(s)  => {
+                // Escape the string for C
+                let mut out = "\"".to_string();
+                for ch in s.chars() {
+                    match ch {
+                        '"'  => out.push_str("\\\""),
+                        '\\' => out.push_str("\\\\"),
+                        '\n' => out.push_str("\\n"),
+                        '\t' => out.push_str("\\t"),
+                        '\r' => out.push_str("\\r"),
+                        c    => out.push(c),
+                    }
+                }
+                out.push('"');
+                out
+            }
             Expr::Var(name) => name.clone(),
+
+            Expr::ArrayLit(elems) => {
+                let items: Vec<String> = elems.iter()
+                    .map(|e| self.emit_expr(e, ctx))
+                    .collect();
+                format!("{{{}}}", items.join(", "))
+            }
+
+            Expr::Index { expr, index } => {
+                format!("{}[{}]", self.emit_expr(expr, ctx), self.emit_expr(index, ctx))
+            }
 
             Expr::Tuple(elems) if elems.is_empty() => "/* () */0".to_string(),
             Expr::Tuple(_) => self.emit_expr_hint(expr, ctx, None),
@@ -675,6 +718,8 @@ impl Codegen {
                         format!("(double)({e})")
                     } else if spec == "%u" {
                         format!("(unsigned int)({e})")
+                    } else if spec == "%s" {
+                        e // no cast for strings
                     } else {
                         format!("(long long)({e})")
                     }
@@ -690,11 +735,14 @@ fn printf_spec(expr: &Expr, ctx: &Ctx) -> String {
     match expr {
         Expr::Float(_) => "%f".to_string(),
         Expr::Char(_)  => "%u".to_string(),
+        Expr::Str(_)   => "%s".to_string(),
         Expr::Cast { ty: Ty::F32, .. } | Expr::Cast { ty: Ty::F64, .. } => "%f".to_string(),
         Expr::Cast { ty: Ty::Char, .. } => "%u".to_string(),
+        Expr::Cast { ty: Ty::Str, .. } => "%s".to_string(),
         Expr::Var(name) => match ctx.var_types.get(name) {
             Some(Ty::F32) | Some(Ty::F64) => "%f".to_string(),
             Some(Ty::Char) => "%u".to_string(),
+            Some(Ty::Str) => "%s".to_string(),
             _ => "%lld".to_string(),
         },
         _ => "%lld".to_string(),
@@ -812,13 +860,25 @@ fn ty_str(ty: &Ty) -> String {
         Ty::F32   => "float".into(),    Ty::F64  => "double".into(),
         Ty::Bool  => "bool".into(),
         Ty::Char  => "uint32_t".into(),
+        Ty::Str   => "const char*".into(),
         Ty::Unit  => "void".into(),
+        Ty::Array(inner, n) => format!("{}[{n}]", ty_str(inner)), // used differently in let/param
+        Ty::Slice(inner) => format!("{}*", ty_str(inner)),
         Ty::Named(n) => n.clone(),
         Ty::Tuple(tys) => tuple_typedef_name(tys),
         Ty::Ref(inner)      => format!("const {}*", ty_str(inner)),
         Ty::RefMut(inner)   => format!("{}*", ty_str(inner)),
         Ty::RawConst(inner) => format!("const {}*", ty_str(inner)),
         Ty::RawMut(inner)   => format!("{}*", ty_str(inner)),
+    }
+}
+
+fn ty_str_decl(ty: &Ty, name: &str) -> String {
+    // C array declarations need the size after the name, not after the type.
+    if let Ty::Array(inner, n) = ty {
+        format!("{} {name}[{n}]", ty_str(inner))
+    } else {
+        format!("{} {name}", ty_str(ty))
     }
 }
 
@@ -830,6 +890,9 @@ fn ty_key(ty: &Ty) -> String {
         Ty::U32   => "u32".into(),  Ty::U64  => "u64".into(),  Ty::Usize => "usize".into(),
         Ty::F32   => "f32".into(),  Ty::F64  => "f64".into(),
         Ty::Bool  => "bool".into(), Ty::Char => "char".into(), Ty::Unit => "unit".into(),
+        Ty::Str   => "str".into(),
+        Ty::Array(inner, n) => format!("arr_{}_{n}", ty_key(inner)),
+        Ty::Slice(inner) => format!("slice_{}", ty_key(inner)),
         Ty::Named(n) => n.clone(),
         Ty::Tuple(tys)      => format!("({})", tys.iter().map(ty_key).collect::<Vec<_>>().join("_")),
         Ty::Ref(inner)      => format!("ref_{}", ty_key(inner)),
@@ -855,7 +918,7 @@ fn emit_tuple_typedef(out: &mut String, tys: &[Ty]) {
 fn emit_struct(out: &mut String, s: &StructDecl) {
     out.push_str(&format!("typedef struct {} {{\n", s.name));
     for f in &s.fields {
-        out.push_str(&format!("    {} {};\n", ty_str(&f.ty), f.name));
+        out.push_str(&format!("    {};\n", ty_str_decl(&f.ty, &f.name)));
     }
     out.push_str(&format!("}} {};\n", s.name));
 }
@@ -875,7 +938,7 @@ fn fn_signature(f: &FnDecl, impl_type: Option<&str>) -> String {
         param_parts.push(self_param);
     }
     for p in &f.params {
-        param_parts.push(format!("{} {}", ty_str(&p.ty), p.name));
+        param_parts.push(ty_str_decl(&p.ty, &p.name));
     }
     let params = if param_parts.is_empty() { "void".to_string() } else { param_parts.join(", ") };
 

@@ -53,6 +53,8 @@ pub enum TokenKind {
     RParen,
     LBrace,
     RBrace,
+    LBracket, // [
+    RBracket, // ]
     Semicolon,
     Comma,
     Dot,
@@ -168,6 +170,14 @@ impl<'a> Lexer<'a> {
             b'}' => {
                 self.advance();
                 TokenKind::RBrace
+            }
+            b'[' => {
+                self.advance();
+                TokenKind::LBracket
+            }
+            b']' => {
+                self.advance();
+                TokenKind::RBracket
             }
             b';' => {
                 self.advance();

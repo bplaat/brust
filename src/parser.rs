@@ -252,11 +252,43 @@ impl Parser {
         match &tok.kind {
             TokenKind::Amp => {
                 self.advance();
+                // &str
+                if let TokenKind::Ident(kw) = &self.peek().kind.clone() {
+                    if kw == "str" { self.advance(); return Ok(Ty::Str); }
+                }
+                // &[T] slice
+                if self.peek().kind == TokenKind::LBracket {
+                    self.advance();
+                    let inner = self.parse_ty()?;
+                    self.expect(&TokenKind::RBracket)?;
+                    return Ok(Ty::Slice(Box::new(inner)));
+                }
                 if self.peek().kind == TokenKind::Mut {
                     self.advance();
+                    // &mut [T] slice
+                    if self.peek().kind == TokenKind::LBracket {
+                        self.advance();
+                        let inner = self.parse_ty()?;
+                        self.expect(&TokenKind::RBracket)?;
+                        return Ok(Ty::Slice(Box::new(inner)));
+                    }
                     Ok(Ty::RefMut(Box::new(self.parse_ty()?)))
                 } else {
                     Ok(Ty::Ref(Box::new(self.parse_ty()?)))
+                }
+            }
+            TokenKind::LBracket => {
+                // [T; N]
+                self.advance();
+                let elem_ty = self.parse_ty()?;
+                self.expect(&TokenKind::Semicolon)?;
+                let n_tok = self.peek().clone();
+                if let TokenKind::IntLit(n) = n_tok.kind {
+                    self.advance();
+                    self.expect(&TokenKind::RBracket)?;
+                    Ok(Ty::Array(Box::new(elem_ty), n as usize))
+                } else {
+                    Err(Error::new(n_tok.line, n_tok.col, "expected integer size in array type".to_string()))
                 }
             }
             TokenKind::Star => {
@@ -280,21 +312,13 @@ impl Parser {
             }
             TokenKind::Ident(name) => {
                 let ty = match name.as_str() {
-                    "i8" => Ty::I8,
-                    "i16" => Ty::I16,
-                    "i32" => Ty::I32,
-                    "i64" => Ty::I64,
-                    "isize" => Ty::Isize,
-                    "u8" => Ty::U8,
-                    "u16" => Ty::U16,
-                    "u32" => Ty::U32,
-                    "u64" => Ty::U64,
-                    "usize" => Ty::Usize,
-                    "f32" => Ty::F32,
-                    "f64" => Ty::F64,
-                    "bool" => Ty::Bool,
-                    "char" => Ty::Char,
-                    name => Ty::Named(name.to_string()),
+                    "i8"    => Ty::I8,    "i16"   => Ty::I16,
+                    "i32"   => Ty::I32,   "i64"   => Ty::I64,   "isize" => Ty::Isize,
+                    "u8"    => Ty::U8,    "u16"   => Ty::U16,
+                    "u32"   => Ty::U32,   "u64"   => Ty::U64,   "usize" => Ty::Usize,
+                    "f32"   => Ty::F32,   "f64"   => Ty::F64,
+                    "bool"  => Ty::Bool,  "char"  => Ty::Char,  "str"   => Ty::Str,
+                    name    => Ty::Named(name.to_string()),
                 };
                 self.advance();
                 Ok(ty)
@@ -910,6 +934,12 @@ impl Parser {
                         };
                     }
                 }
+            } else if self.peek().kind == TokenKind::LBracket {
+                // array/slice indexing: expr[index]
+                self.advance();
+                let index = self.parse_expr()?;
+                self.expect(&TokenKind::RBracket)?;
+                expr = Expr::Index { expr: Box::new(expr), index: Box::new(index) };
             } else {
                 break;
             }
@@ -948,6 +978,11 @@ impl Parser {
                 self.advance();
                 Ok(Expr::Char(c))
             }
+            TokenKind::StringLit(s) => {
+                let s = s.clone();
+                self.advance();
+                Ok(Expr::Str(s))
+            }
             TokenKind::True => {
                 self.advance();
                 Ok(Expr::Bool(true))
@@ -959,6 +994,20 @@ impl Parser {
             TokenKind::SelfKw => {
                 self.advance();
                 Ok(Expr::Var("self".to_string()))
+            }
+            // Array literal: [expr, expr, ...]
+            TokenKind::LBracket => {
+                self.advance();
+                let mut elems = Vec::new();
+                while self.peek().kind != TokenKind::RBracket && !self.at_eof() {
+                    if !elems.is_empty() {
+                        self.expect(&TokenKind::Comma)?;
+                        if self.peek().kind == TokenKind::RBracket { break; }
+                    }
+                    elems.push(self.parse_expr()?);
+                }
+                self.expect(&TokenKind::RBracket)?;
+                Ok(Expr::ArrayLit(elems))
             }
 
             TokenKind::Ident(name) => {
