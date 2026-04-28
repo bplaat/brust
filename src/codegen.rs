@@ -81,6 +81,8 @@ struct Codegen {
     enums: HashMap<String, EnumDecl>,
     /// Struct declarations indexed by name, for field type lookup in printf_spec.
     structs: HashMap<String, StructDecl>,
+    /// Trait declarations indexed by name, for default method bodies.
+    traits: HashMap<String, TraitDecl>,
     /// Function/method param types (mangled name -> param type list) for tuple arg hints.
     fn_params: HashMap<String, Vec<Ty>>,
     /// Function/method return types (mangled name -> return Ty) for printf spec inference.
@@ -129,9 +131,12 @@ pub fn generate(file: &File) -> String {
             fn_ret_tys.insert(format!("dyn_{trait_name}_{}", m.name), m.return_ty.clone());
         }
     }
+    // Register trait default methods in trampolines for impls that don't override them.
+    register_default_trampolines(&file.items, &traits, &mut fn_ret_tys, &mut trait_method_trampolines);
     let mut cg = Codegen {
         enums,
         structs,
+        traits,
         fn_params,
         fn_ret_tys,
         type_aliases,
@@ -206,8 +211,10 @@ fn collect_items(
                     if let Some(trait_name) = &imp.trait_name {
                         // Trait impl: trampoline symbol is TypeName__TraitName__method.
                         let trampoline = format!("{type_name}__{trait_name}__{}", m.name);
-                        fn_ret_tys.insert(trampoline.clone(), ret_ty);
+                        fn_ret_tys.insert(trampoline.clone(), ret_ty.clone());
                         fn_params.insert(trampoline.clone(), param_tys);
+                        // Also register under TypeName_method for printf_spec resolution.
+                        fn_ret_tys.insert(format!("{type_name}_{}", m.name), ret_ty);
                         trait_method_trampolines
                             .entry(type_name.clone())
                             .or_default()
@@ -272,6 +279,12 @@ impl Codegen {
     fn run(&mut self, file: &File) {
         self.out
             .push_str("#include <stdbool.h>\n#include <stdint.h>\n#include <stdio.h>\n");
+
+        // Emit abort declaration if the program uses todo!/panic!/unreachable!.
+        if uses_abort(&file.items) {
+            self.out
+                .push_str("extern void abort(void) __attribute__((noreturn));\n");
+        }
 
         // Collect and emit tuple typedefs (pre-scan)
         let tuple_types = collect_tuple_types(file);
@@ -661,6 +674,16 @@ impl Codegen {
 
     /// Emit trampoline functions and a static vtable instance for `impl TraitName for TypeName`.
     fn emit_trait_impl(&mut self, imp: &ImplBlock, type_name: &str, trait_name: &str) {
+        // Get trait declaration to find default method bodies.
+        let trait_decl = self.traits.get(trait_name).cloned();
+
+        // Collect the full set of methods: overridden ones from imp, defaults for the rest.
+        let all_methods: Vec<&str> = if let Some(td) = &trait_decl {
+            td.methods.iter().map(|m| m.name.as_str()).collect()
+        } else {
+            imp.methods.iter().map(|m| m.name.as_str()).collect()
+        };
+
         for m in &imp.methods {
             let trampoline = format!("{type_name}__{trait_name}__{}", m.name);
             let ret_ty = m.return_ty.resolve_self(type_name);
@@ -708,27 +731,86 @@ impl Codegen {
             self.out.push_str("}\n\n");
         }
 
+        // Emit default method implementations for methods not overridden in the impl.
+        if let Some(td) = &trait_decl {
+            for sig in &td.methods {
+                if imp.methods.iter().any(|m| m.name == sig.name) {
+                    continue; // overridden
+                }
+                let Some(body) = &sig.body else { continue };
+                let trampoline = format!("{type_name}__{trait_name}__{}", sig.name);
+                let ret_ty = sig.return_ty.resolve_self(type_name);
+                let ret = ty_str(&ret_ty);
+                let params: Vec<String> = std::iter::once("void* _self".to_string())
+                    .chain(
+                        sig.params
+                            .iter()
+                            .map(|p| ty_str_decl(&p.ty.resolve_self(type_name), &p.name)),
+                    )
+                    .collect();
+                self.out.push_str(&format!(
+                    "static {ret} {trampoline}({}) {{\n",
+                    params.join(", ")
+                ));
+                let const_kw = match sig.receiver {
+                    Receiver::Ref => "const ",
+                    _ => "",
+                };
+                self.out.push_str(&format!(
+                    "    {const_kw}{type_name}* self = ({const_kw}{type_name}*)_self;\n"
+                ));
+                let mut params_env = HashMap::new();
+                let mut params_var_types = HashMap::new();
+                for p in &sig.params {
+                    let ty = p.ty.resolve_self(type_name);
+                    if let Ty::Named(n) = &ty {
+                        params_env.insert(p.name.clone(), n.clone());
+                    }
+                    params_var_types.insert(p.name.clone(), ty);
+                }
+                let mut ctx = Ctx::for_method(type_name, &sig.receiver, params_env);
+                ctx.var_types = params_var_types;
+                ctx.return_ty = Some(ret_ty);
+                ctx.fn_ret_tys = self.fn_ret_tys.clone();
+                ctx.type_aliases = self.type_aliases.clone();
+                ctx.value_self_fns = self.value_self_fns.clone();
+                for stmt in &body.stmts {
+                    self.emit_stmt(stmt, &mut ctx, 1);
+                }
+                self.out.push_str("}\n\n");
+            }
+        }
+
         // Static vtable instance after all trampolines.
         self.out.push_str(&format!(
             "static const {trait_name}_vtable {type_name}__{trait_name}__vtable = {{\n"
         ));
-        for m in &imp.methods {
-            let trampoline = format!("{type_name}__{trait_name}__{}", m.name);
-            // Cast is needed when the trampoline's signature differs from the vtable's
-            // (e.g. the vtable uses void* for Self but the trampoline uses the concrete type).
-            let needs_cast =
-                m.return_ty.contains_self() || m.params.iter().any(|p| p.ty.contains_self());
+        for method_name in &all_methods {
+            let trampoline = format!("{type_name}__{trait_name}__{method_name}");
+            // Find the method sig (from imp or trait default).
+            let (ret_ty, params) =
+                if let Some(m) = imp.methods.iter().find(|m| m.name == *method_name) {
+                    (m.return_ty.clone(), m.params.clone())
+                } else if let Some(sig) = trait_decl
+                    .as_ref()
+                    .and_then(|td| td.methods.iter().find(|s| s.name == *method_name))
+                {
+                    (sig.return_ty.clone(), sig.params.clone())
+                } else {
+                    continue;
+                };
+            let needs_cast = ret_ty.contains_self() || params.iter().any(|p| p.ty.contains_self());
             if needs_cast {
-                let vtable_ret = ty_str(&m.return_ty);
+                let vtable_ret = ty_str(&ret_ty);
                 let vtable_params: Vec<String> = std::iter::once("void*".to_string())
-                    .chain(m.params.iter().map(|p| ty_str(&p.ty)))
+                    .chain(params.iter().map(|p| ty_str(&p.ty)))
                     .collect();
                 let cast = format!("({vtable_ret} (*)({}))", vtable_params.join(", "));
                 self.out
-                    .push_str(&format!("    .{} = {cast}{trampoline},\n", m.name));
+                    .push_str(&format!("    .{method_name} = {cast}{trampoline},\n"));
             } else {
                 self.out
-                    .push_str(&format!("    .{} = {trampoline},\n", m.name));
+                    .push_str(&format!("    .{method_name} = {trampoline},\n"));
             }
         }
         self.out.push_str("};\n\n");
@@ -1053,12 +1135,19 @@ impl Codegen {
                 {
                     // match expression used as a statement: emit as proper C switch.
                     self.emit_match(match_expr, arms, ctx, indent, None);
+                } else if let ExprKind::Abort { message } = &expr.kind {
+                    // todo!/panic!/unreachable! as a statement: emit fprintf+abort directly.
+                    let msg_s = message
+                        .as_ref()
+                        .map(|m| self.emit_expr(m, ctx))
+                        .unwrap_or_else(|| "\"abort\"".to_string());
+                    self.out.push_str(&format!("{p}fprintf(stderr, \"%s\\n\", {msg_s});\n"));
+                    self.out.push_str(&format!("{p}abort();\n"));
                 } else {
                     let s = self.emit_expr(expr, ctx);
                     self.out.push_str(&format!("{p}{s};\n"));
                 }
-            }
-        }
+            }        }
     }
 
     fn emit_else(&mut self, else_block: &Option<Block>, ctx: &mut Ctx, indent: usize) {
@@ -1651,6 +1740,39 @@ impl Codegen {
                 }
                 self.out.push_str(&format!("{p}}}\n"));
             }
+            Pat::Char(c) => {
+                let expr_s = self.emit_expr(expr, ctx);
+                self.out
+                    .push_str(&format!("{p}while (({expr_s}) == {c}) {{\n"));
+                for s in &body.stmts {
+                    self.emit_stmt(s, ctx, indent + 1);
+                }
+                self.out.push_str(&format!("{p}}}\n"));
+            }
+            Pat::CharRange { lo, hi } => {
+                let expr_s = self.emit_expr(expr, ctx);
+                self.out.push_str(&format!(
+                    "{p}while (({expr_s}) >= {lo} && ({expr_s}) <= {hi}) {{\n"
+                ));
+                for s in &body.stmts {
+                    self.emit_stmt(s, ctx, indent + 1);
+                }
+                self.out.push_str(&format!("{p}}}\n"));
+            }
+            Pat::At { name, pat: inner } => {
+                // @ binding in while-let: bind name, loop while inner pat matches.
+                let expr_s = self.emit_expr(expr, ctx);
+                let decl = typed_or_auto_decl(expr_ty, name);
+                self.out.push_str(&format!("{p}{decl} = {expr_s};\n"));
+                let cond = pat_simple_cond(inner, name);
+                self.out.push_str(&format!("{p}while ({cond}) {{\n"));
+                for s in &body.stmts {
+                    self.emit_stmt(s, ctx, indent + 1);
+                }
+                let expr_s2 = self.emit_expr(expr, ctx);
+                self.out.push_str(&format!("{ip}{name} = {expr_s2};\n"));
+                self.out.push_str(&format!("{p}}}\n"));
+            }
         }
     }
 
@@ -1670,6 +1792,13 @@ impl Codegen {
                 // Bind the whole matched value to `name`.
                 let decl = typed_or_auto_decl(scrutinee_ty, name);
                 self.out.push_str(&format!("{bp}{decl} = {match_var};\n"));
+                return;
+            }
+            Pat::At { name, pat: inner } => {
+                // Bind name to the whole scrutinee, then process inner pattern.
+                let decl = typed_or_auto_decl(scrutinee_ty, name);
+                self.out.push_str(&format!("{bp}{decl} = {match_var};\n"));
+                self.emit_match_arm_bindings(inner, match_var, is_tagged, enum_decl, bp, arm_ctx, scrutinee_ty);
                 return;
             }
             Pat::EnumVariant {
@@ -1866,7 +1995,10 @@ impl Codegen {
                     let pat_cond = match pat {
                         Pat::Bool(b) => format!("{ms} == {}", if *b { 1 } else { 0 }),
                         Pat::Int(n) => format!("{ms} == {n}"),
+                        Pat::Char(c) => format!("{ms} == {c}"),
+                        Pat::CharRange { lo, hi } => format!("{ms} >= {lo} && {ms} <= {hi}"),
                         Pat::Range { lo, hi } => format!("{ms} >= {lo} && {ms} <= {hi}"),
+                        Pat::At { pat: inner, .. } => pat_simple_cond(inner, &ms),
                         Pat::EnumVariant {
                             type_name, variant, ..
                         } => {
@@ -1884,7 +2016,10 @@ impl Codegen {
                                 Pat::Wildcard | Pat::Binding(_) => "1".to_string(),
                                 Pat::Bool(b) => format!("{ms} == {}", if *b { 1 } else { 0 }),
                                 Pat::Int(n) => format!("{ms} == {n}"),
+                                Pat::Char(c) => format!("{ms} == {c}"),
+                                Pat::CharRange { lo, hi } => format!("{ms} >= {lo} && {ms} <= {hi}"),
                                 Pat::Range { lo, hi } => format!("{ms} >= {lo} && {ms} <= {hi}"),
+                                Pat::At { pat: inner, .. } => pat_simple_cond(inner, &ms),
                                 Pat::EnumVariant {
                                     type_name, variant, ..
                                 } => {
@@ -1945,8 +2080,10 @@ impl Codegen {
         scrutinee_ty: Option<&Ty>,
     ) {
         // When any arm uses a binding or range pattern, C switch can't express it -- use if-else chain.
-        let needs_if_chain = arms.iter().any(|a| matches!(&a.pat, Pat::Binding(_) | Pat::Range { .. } | Pat::TupleStruct { .. } | Pat::Tuple(_)))
-            || arms.iter().any(|a| matches!(&a.pat, Pat::EnumVariant { type_name, variant, .. } if type_name == variant && self.structs.contains_key(type_name.as_str())));
+        let needs_if_chain = arms.iter().any(|a| matches!(&a.pat,
+            Pat::Binding(_) | Pat::Range { .. } | Pat::CharRange { .. } | Pat::Char(_)
+            | Pat::At { .. } | Pat::TupleStruct { .. } | Pat::Tuple(_)
+        )) || arms.iter().any(|a| matches!(&a.pat, Pat::EnumVariant { type_name, variant, .. } if type_name == variant && self.structs.contains_key(type_name.as_str())));
         if needs_if_chain {
             self.emit_match_if_chain(expr, arms, ctx, indent, scrutinee_ty);
             return;
@@ -2038,7 +2175,12 @@ impl Codegen {
                             }
                         }
                         Pat::Or(_) => {}
-                        Pat::Range { .. } | Pat::Tuple(_) | Pat::TupleStruct { .. } => {
+                        Pat::Range { .. }
+                        | Pat::Char(_)
+                        | Pat::CharRange { .. }
+                        | Pat::At { .. }
+                        | Pat::Tuple(_)
+                        | Pat::TupleStruct { .. } => {
                             // Handled by if-chain path; unreachable here.
                         }
                     }
@@ -2115,7 +2257,12 @@ impl Codegen {
                         // Nested or-pattern — flatten
                         self.out.push_str(&format!("{ip}default: {{\n"));
                     }
-                    Pat::Range { .. } | Pat::Tuple(_) | Pat::TupleStruct { .. } => {
+                    Pat::Range { .. }
+                    | Pat::Char(_)
+                    | Pat::CharRange { .. }
+                    | Pat::At { .. }
+                    | Pat::Tuple(_)
+                    | Pat::TupleStruct { .. } => {
                         // Handled by if-chain path; unreachable here.
                         self.out.push_str(&format!("{ip}default: {{\n"));
                     }
@@ -2228,12 +2375,16 @@ impl Codegen {
         for arm in arms.iter().rev() {
             let arm_body = self.emit_match_arm_as_expr(arm, &match_var, is_tagged, &enum_decl, ctx);
             chain = match &arm.pat {
-                Pat::Wildcard | Pat::Binding(_) => arm_body,
+                Pat::Wildcard | Pat::Binding(_) | Pat::At { .. } => arm_body,
                 Pat::Bool(b) => format!(
                     "(({match_var}) == {} ? ({arm_body}) : ({chain}))",
                     if *b { 1 } else { 0 }
                 ),
                 Pat::Int(n) => format!("(({match_var}) == {n} ? ({arm_body}) : ({chain}))"),
+                Pat::Char(c) => format!("(({match_var}) == {c} ? ({arm_body}) : ({chain}))"),
+                Pat::CharRange { lo, hi } => format!(
+                    "(({match_var}) >= {lo} && ({match_var}) <= {hi} ? ({arm_body}) : ({chain}))"
+                ),
                 Pat::EnumVariant {
                     type_name, variant, ..
                 } => {
@@ -2252,6 +2403,10 @@ impl Codegen {
                             Pat::Wildcard | Pat::Binding(_) => "1".to_string(),
                             Pat::Bool(b) => format!("({match_var}) == {}", if *b { 1 } else { 0 }),
                             Pat::Int(n) => format!("({match_var}) == {n}"),
+                            Pat::Char(c) => format!("({match_var}) == {c}"),
+                            Pat::CharRange { lo, hi } => {
+                                format!("({match_var}) >= {lo} && ({match_var}) <= {hi}")
+                            }
                             Pat::EnumVariant {
                                 type_name, variant, ..
                             } => {
@@ -2261,7 +2416,7 @@ impl Codegen {
                                     format!("({match_var}) == {type_name}_{variant}")
                                 }
                             }
-                            Pat::Or(_) => "0".to_string(),
+                            Pat::Or(_) | Pat::At { .. } => "0".to_string(),
                             Pat::Range { lo, hi } => {
                                 format!("({match_var}) >= {lo} && ({match_var}) <= {hi}")
                             }
@@ -2482,11 +2637,24 @@ impl Codegen {
             ExprKind::Tuple(elems) if elems.is_empty() => "/* () */0".to_string(),
             ExprKind::Tuple(_) => self.emit_expr_hint(expr, ctx, None),
 
-            ExprKind::StructLit { name, fields } => {
-                let inits: Vec<String> = fields
+            ExprKind::StructLit { name, fields, rest } => {
+                let mut inits: Vec<String> = fields
                     .iter()
                     .map(|(n, e)| format!(".{n} = {}", self.emit_expr(e, ctx)))
                     .collect();
+                if let Some(base) = rest {
+                    // Struct update syntax: fill missing fields from base expression.
+                    let base_s = self.emit_expr(base, ctx);
+                    if let Some(sdecl) = self.structs.get(name.as_str()).cloned() {
+                        let provided: std::collections::HashSet<&str> =
+                            fields.iter().map(|(n, _)| n.as_str()).collect();
+                        for df in &sdecl.fields {
+                            if !provided.contains(df.name.as_str()) {
+                                inits.push(format!(".{} = ({base_s}).{}", df.name, df.name));
+                            }
+                        }
+                    }
+                }
                 format!("({name}){{{}}}", inits.join(", "))
             }
 
@@ -2785,6 +2953,47 @@ impl Codegen {
                 let init = result_ty.as_ref().map(zero_init).unwrap_or("0");
                 format!("({{ {decl} = {init}; for (;;) {{ {inner} }} _lv; }})")
             }
+
+            ExprKind::IfLet {
+                pat,
+                expr,
+                expr_ty,
+                then_block,
+                else_block,
+            } => {
+                let id = self.tmp_counter;
+                self.tmp_counter += 1;
+                let ms = format!("_ilms{id}");
+                let expr_s = self.emit_expr(expr, ctx);
+                let ms_decl = typed_or_auto_decl(expr_ty.as_ref(), &ms);
+                let cond = pat_simple_cond(pat, &ms);
+                let mut inner_ctx = ctx.clone();
+                // Emit bindings + then expression into a block.
+                let saved = std::mem::take(&mut self.out);
+                emit_iflet_bindings(pat, &ms, expr_ty.as_ref(), &mut inner_ctx, &mut self.out);
+                let then_s = self.emit_block_as_expr(then_block, &mut inner_ctx);
+                let stmts_s = std::mem::take(&mut self.out);
+                self.out = saved;
+                let else_s = else_block
+                    .as_ref()
+                    .map(|b| self.emit_block_as_expr(b, ctx))
+                    .unwrap_or_else(|| "0".to_string());
+                // GNU statement expression: ({ TYPE ms = expr; cond ? ({ bindings; then; }) : else; })
+                if stmts_s.trim().is_empty() {
+                    format!("({{ {ms_decl} = {expr_s}; ({cond}) ? ({then_s}) : ({else_s}); }})")
+                } else {
+                    let stmts_s = stmts_s.trim_end().to_string();
+                    format!("({{ {ms_decl} = {expr_s}; ({cond}) ? ({{ {stmts_s} {then_s}; }}) : ({else_s}); }})")
+                }
+            }
+
+            ExprKind::Abort { message } => {
+                let msg_s = message
+                    .as_ref()
+                    .map(|m| self.emit_expr(m, ctx))
+                    .unwrap_or_else(|| "\"abort\"".to_string());
+                format!("({{ fprintf(stderr, \"%s\\n\", {msg_s}); abort(); 0; }})")
+            }
         }
     }
 
@@ -2889,11 +3098,16 @@ impl Codegen {
                         format!("(unsigned int)({e})")
                     } else if spec == "%s" {
                         e // no cast for strings
+                    } else if spec == "%B" {
+                        // Bool: emit as "true"/"false" string.
+                        format!("(({e}) ? \"true\" : \"false\")")
                     } else {
                         format!("(long long)({e})")
                     }
                 })
                 .collect();
+            // Replace internal %B spec with %s in the actual format string.
+            let fmt_str = fmt_str.replace("%B", "%s");
             format!("fprintf({stream}, {fmt_str}, {});", args_s.join(", "))
         }
     }
@@ -2904,11 +3118,13 @@ impl Codegen {
 fn printf_spec(codegen: &Codegen, expr: &Expr, ctx: &Ctx) -> String {
     match &expr.kind {
         ExprKind::Float(_) => "%f".to_string(),
+        ExprKind::Bool(_) => "%B".to_string(),
         ExprKind::Char(_) => "%u".to_string(),
         ExprKind::Str(_) => "%s".to_string(),
 
         ExprKind::Cast { ty, .. } => match ty {
             Ty::F32 | Ty::F64 => "%f".to_string(),
+            Ty::Bool => "%B".to_string(),
             Ty::Char => "%u".to_string(),
             Ty::Str => "%s".to_string(),
             _ => "%lld".to_string(),
@@ -2964,6 +3180,16 @@ fn printf_spec(codegen: &Codegen, expr: &Expr, ctx: &Ctx) -> String {
             "%lld".to_string()
         }
 
+        // Match expression: infer spec from first arm's tail expression.
+        ExprKind::Match { arms, .. } => {
+            if let Some(arm) = arms.first() {
+                if let Some(Stmt { kind: StmtKind::Return(Some(tail)), .. }) = arm.body.stmts.last() {
+                    return printf_spec(codegen, tail, ctx);
+                }
+            }
+            "%lld".to_string()
+        }
+
         ExprKind::Deref(inner) => printf_spec(codegen, inner, ctx),
 
         _ => "%lld".to_string(),
@@ -2974,6 +3200,7 @@ fn printf_spec(codegen: &Codegen, expr: &Expr, ctx: &Ctx) -> String {
 fn spec_for_ty(ty: Option<&Ty>, ctx: &Ctx) -> String {
     match ty {
         Some(Ty::F32) | Some(Ty::F64) => "%f".to_string(),
+        Some(Ty::Bool) => "%B".to_string(),
         Some(Ty::Char) => "%u".to_string(),
         Some(Ty::Str) => "%s".to_string(),
         // Resolve named type aliases one level (common case: type Meters = f64).
@@ -2992,6 +3219,80 @@ fn collect_tuple_types(file: &File) -> Vec<Vec<Ty>> {
     let mut found: Vec<Vec<Ty>> = Vec::new();
     scan_items(&file.items, &mut found);
     found
+}
+
+/// Register default method trampolines for trait impls that don't override them.
+/// This ensures printf_spec and infer_type_name can resolve their return types.
+fn register_default_trampolines(
+    items: &[Item],
+    traits: &HashMap<String, TraitDecl>,
+    fn_ret_tys: &mut HashMap<String, Ty>,
+    trampolines: &mut HashMap<String, HashMap<String, String>>,
+) {
+    for item in items {
+        match item {
+            Item::Impl(imp) => {
+                if let Some(trait_name) = &imp.trait_name {
+                    let type_name = &imp.type_name;
+                    if let Some(td) = traits.get(trait_name) {
+                        for sig in &td.methods {
+                            if sig.body.is_none() {
+                                continue; // abstract method, not a default
+                            }
+                            if imp.methods.iter().any(|m| m.name == sig.name) {
+                                continue; // overridden in impl
+                            }
+                            let trampoline =
+                                format!("{type_name}__{trait_name}__{}", sig.name);
+                            let ret_ty = sig.return_ty.resolve_self(type_name);
+                            fn_ret_tys.insert(trampoline.clone(), ret_ty.clone());
+                            fn_ret_tys.insert(format!("{type_name}_{}", sig.name), ret_ty);
+                            trampolines
+                                .entry(type_name.clone())
+                                .or_default()
+                                .insert(sig.name.clone(), trampoline);
+                        }
+                    }
+                }
+            }
+            Item::Mod { items: sub, .. } => {
+                register_default_trampolines(sub, traits, fn_ret_tys, trampolines);
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Return true if any expression in the program uses `ExprKind::Abort` (todo!/panic!/unreachable!).
+fn uses_abort(items: &[Item]) -> bool {
+    items.iter().any(|item| match item {
+        Item::Fn(f) => block_uses_abort(&f.body),
+        Item::Impl(imp) => imp.methods.iter().any(|m| block_uses_abort(&m.body)),
+        Item::Mod { items: sub, .. } => uses_abort(sub),
+        _ => false,
+    })
+}
+
+fn block_uses_abort(block: &crate::ast::Block) -> bool {
+    block.stmts.iter().any(stmt_uses_abort)
+}
+
+fn stmt_uses_abort(stmt: &crate::ast::Stmt) -> bool {
+    use crate::ast::StmtKind;
+    match &stmt.kind {
+        StmtKind::Expr(e) | StmtKind::Return(Some(e)) => expr_uses_abort(e),
+        StmtKind::Let { expr, .. } => expr_uses_abort(expr),
+        StmtKind::If { cond, then_block, else_block, .. } => {
+            expr_uses_abort(cond)
+                || block_uses_abort(then_block)
+                || else_block.as_ref().is_some_and(block_uses_abort)
+        }
+        _ => false,
+    }
+}
+
+fn expr_uses_abort(expr: &Expr) -> bool {
+    matches!(&expr.kind, ExprKind::Abort { .. })
 }
 
 fn scan_items(items: &[Item], found: &mut Vec<Vec<Ty>>) {
@@ -3229,6 +3530,63 @@ fn typed_or_auto_decl(ty: Option<&Ty>, name: &str) -> String {
     match ty {
         Some(t) if !matches!(t, Ty::Array(_, _) | Ty::Slice(_)) => ty_str_decl(t, name),
         _ => format!("__auto_type {name}"),
+    }
+}
+
+/// Return the C condition string for matching `pat` against `ms`.
+/// Used for if-let expressions and Or-pattern alternatives.
+fn pat_simple_cond(pat: &Pat, ms: &str) -> String {
+    match pat {
+        Pat::Wildcard | Pat::Binding(_) => "1".to_string(),
+        Pat::Bool(b) => format!("{ms} == {}", if *b { 1 } else { 0 }),
+        Pat::Int(n) => format!("{ms} == {n}"),
+        Pat::Char(c) => format!("{ms} == {c}"),
+        Pat::Range { lo, hi } => format!("{ms} >= {lo} && {ms} <= {hi}"),
+        Pat::CharRange { lo, hi } => format!("{ms} >= {lo} && {ms} <= {hi}"),
+        Pat::At { pat: inner, .. } => pat_simple_cond(inner, ms),
+        Pat::EnumVariant {
+            type_name, variant, ..
+        } => format!("{ms}.tag == {type_name}_{variant}_tag"),
+        Pat::Or(alts) => alts
+            .iter()
+            .map(|p| pat_simple_cond(p, ms))
+            .collect::<Vec<_>>()
+            .join(" || "),
+        _ => "1".to_string(),
+    }
+}
+
+/// Emit variable bindings introduced by a pattern binding matched against `ms`.
+fn emit_iflet_bindings(pat: &Pat, ms: &str, ty: Option<&Ty>, ctx: &mut Ctx, out: &mut String) {
+    match pat {
+        Pat::Binding(name) => {
+            let decl = typed_or_auto_decl(ty, name);
+            out.push_str(&format!("{decl} = {ms}; "));
+        }
+        Pat::At { name, pat: inner } => {
+            let decl = typed_or_auto_decl(ty, name);
+            out.push_str(&format!("{decl} = {ms}; "));
+            emit_iflet_bindings(inner, ms, ty, ctx, out);
+        }
+        Pat::EnumVariant {
+            type_name,
+            variant,
+            bindings,
+        } => {
+            if let PatBindings::Tuple(pats) = bindings {
+                for (i, sub) in pats.iter().enumerate() {
+                    if let Pat::Binding(name) = sub {
+                        if name != "_" {
+                            out.push_str(&format!(
+                                "__auto_type {name} = {ms}.data.{variant}._{i}; "
+                            ));
+                            ctx.type_env.insert(name.clone(), type_name.clone());
+                        }
+                    }
+                }
+            }
+        }
+        _ => {}
     }
 }
 

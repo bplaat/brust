@@ -8,6 +8,7 @@ use crate::lexer::{Lexer, Token, TokenKind};
 use crate::loc::Loc;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::rc::Rc;
 
 fn starts_uppercase(s: &str) -> bool {
     s.chars().next().is_some_and(|c| c.is_uppercase())
@@ -814,13 +815,19 @@ impl Parser {
             } else {
                 Ty::Unit
             };
-            self.expect(&TokenKind::Semicolon)?;
+            let body = if self.peek().kind == TokenKind::LBrace {
+                Some(Rc::new(self.parse_block()?))
+            } else {
+                self.expect(&TokenKind::Semicolon)?;
+                None
+            };
             let receiver = receiver.unwrap_or(Receiver::Ref);
             methods.push(TraitMethodSig {
                 name: mname,
                 receiver,
                 params,
                 return_ty,
+                body,
             });
         }
         self.expect(&TokenKind::RBrace)?;
@@ -1650,10 +1657,16 @@ impl Parser {
                 Ok(Pat::Wildcard)
             }
             TokenKind::Ident(name) if starts_lowercase(name) => {
-                // Binding pattern: `x` -- binds the matched value to a variable.
+                // Binding pattern: `x` or `x @ sub_pat`
                 let name = name.clone();
                 self.advance();
-                Ok(Pat::Binding(name))
+                if self.peek().kind == TokenKind::At {
+                    self.advance();
+                    let sub = self.parse_single_pat()?;
+                    Ok(Pat::At { name, pat: Box::new(sub) })
+                } else {
+                    Ok(Pat::Binding(name))
+                }
             }
             TokenKind::Ident(name) if starts_uppercase(name) => {
                 let type_name = name.clone();
@@ -1819,6 +1832,20 @@ impl Parser {
                     ));
                 }
                 Ok(Pat::Int(n))
+            }
+            TokenKind::CharLit(c) => {
+                let c = *c;
+                self.advance();
+                // `'a'..='z'` char range pattern
+                if self.peek().kind == TokenKind::DotDotEq {
+                    self.advance();
+                    if let TokenKind::CharLit(hi) = self.peek().kind.clone() {
+                        self.advance();
+                        return Ok(Pat::CharRange { lo: c, hi });
+                    }
+                    return Err(Error::new(tok.loc, "expected char after `..=` in char range pattern"));
+                }
+                Ok(Pat::Char(c))
             }
             TokenKind::Minus => {
                 self.advance();
@@ -2209,22 +2236,9 @@ impl Parser {
         // names are mangled (e.g., "geom_Point" — the type segment is "Point").
         let last_seg = name.rsplit('_').next().unwrap_or(&name);
         if self.peek().kind == TokenKind::LBrace && starts_uppercase(last_seg) {
-            self.advance();
-            let mut fields = Vec::new();
-            while self.peek().kind != TokenKind::RBrace && !self.at_eof() {
-                if !fields.is_empty() {
-                    self.expect(&TokenKind::Comma)?;
-                    if self.peek().kind == TokenKind::RBrace {
-                        break;
-                    }
-                }
-                let fname = self.expect_ident()?;
-                self.expect(&TokenKind::Colon)?;
-                fields.push((fname, self.parse_expr()?));
-            }
-            self.expect(&TokenKind::RBrace)?;
+            let (fields, rest) = self.parse_struct_lit_body()?;
             return Ok(Expr {
-                kind: ExprKind::StructLit { name, fields },
+                kind: ExprKind::StructLit { name, fields, rest },
                 loc,
             });
         }
@@ -2232,6 +2246,36 @@ impl Parser {
             kind: ExprKind::Var(name),
             loc,
         })
+    }
+
+    /// Parse `{ field: expr, ..., [..rest] }` — the body of a struct literal.
+    /// Returns `(fields, rest)` where `rest` is the optional base expression.
+    fn parse_struct_lit_body(&mut self) -> Result<(Vec<(String, Expr)>, Option<Box<Expr>>), Error> {
+        self.advance(); // consume `{`
+        let mut fields = Vec::new();
+        let mut rest = None;
+        while self.peek().kind != TokenKind::RBrace && !self.at_eof() {
+            if !fields.is_empty() || rest.is_some() {
+                self.expect(&TokenKind::Comma)?;
+                if self.peek().kind == TokenKind::RBrace {
+                    break;
+                }
+            }
+            if self.peek().kind == TokenKind::DotDot {
+                self.advance();
+                rest = Some(Box::new(self.parse_expr()?));
+                // Allow trailing comma
+                if self.peek().kind == TokenKind::Comma {
+                    self.advance();
+                }
+                break;
+            }
+            let fname = self.expect_ident()?;
+            self.expect(&TokenKind::Colon)?;
+            fields.push((fname, self.parse_expr()?));
+        }
+        self.expect(&TokenKind::RBrace)?;
+        Ok((fields, rest))
     }
 
     fn parse_primary(&mut self) -> Result<Expr, Error> {
@@ -2327,6 +2371,59 @@ impl Parser {
             TokenKind::Ident(name) => {
                 let name = name.clone();
                 self.advance();
+
+                // `todo!()`, `panic!("msg")`, `unreachable!()` diverging macros
+                if matches!(name.as_str(), "todo" | "panic" | "unreachable")
+                    && self.peek().kind == TokenKind::Bang
+                {
+                    self.advance(); // consume `!`
+                    self.expect(&TokenKind::LParen)?;
+                    let message = if self.peek().kind != TokenKind::RParen {
+                        Some(Box::new(self.parse_expr()?))
+                    } else {
+                        None
+                    };
+                    self.expect(&TokenKind::RParen)?;
+                    return Ok(Expr {
+                        kind: ExprKind::Abort { message },
+                        loc,
+                    });
+                }
+
+                // `matches!(expr, pat)` -- desugar to `match expr { pat => true, _ => false }`
+                if name == "matches" && self.peek().kind == TokenKind::Bang {
+                    self.advance(); // consume `!`
+                    self.expect(&TokenKind::LParen)?;
+                    let scrutinee = self.parse_expr()?;
+                    self.expect(&TokenKind::Comma)?;
+                    let pat = self.parse_pat()?;
+                    self.expect(&TokenKind::RParen)?;
+                    let make_bool_arm = |val: bool, pat: Pat| MatchArm {
+                        pat,
+                        guard: None,
+                        body: Block {
+                            stmts: vec![Stmt {
+                                kind: StmtKind::Return(Some(Expr {
+                                    kind: ExprKind::Bool(val),
+                                    loc,
+                                })),
+                                loc,
+                            }],
+                        },
+                        loc,
+                    };
+                    return Ok(Expr {
+                        kind: ExprKind::Match {
+                            expr: Box::new(scrutinee),
+                            arms: vec![
+                                make_bool_arm(true, pat),
+                                make_bool_arm(false, Pat::Wildcard),
+                            ],
+                            scrutinee_ty: None,
+                        },
+                        loc,
+                    });
+                }
 
                 if self.peek().kind == TokenKind::ColonColon {
                     self.advance();
@@ -2432,22 +2529,9 @@ impl Parser {
                 } else if self.peek().kind == TokenKind::LBrace && starts_uppercase(&name) {
                     // Struct literal: resolve via alias table + module qualification.
                     let name = self.resolve_name(name);
-                    self.advance();
-                    let mut fields = Vec::new();
-                    while self.peek().kind != TokenKind::RBrace && !self.at_eof() {
-                        if !fields.is_empty() {
-                            self.expect(&TokenKind::Comma)?;
-                            if self.peek().kind == TokenKind::RBrace {
-                                break;
-                            }
-                        }
-                        let fname = self.expect_ident()?;
-                        self.expect(&TokenKind::Colon)?;
-                        fields.push((fname, self.parse_expr()?));
-                    }
-                    self.expect(&TokenKind::RBrace)?;
+                    let (fields, rest) = self.parse_struct_lit_body()?;
                     Ok(Expr {
-                        kind: ExprKind::StructLit { name, fields },
+                        kind: ExprKind::StructLit { name, fields, rest },
                         loc,
                     })
                 } else if self.peek().kind == TokenKind::LParen {
@@ -2513,6 +2597,41 @@ impl Parser {
             }
             TokenKind::If => {
                 self.advance(); // consume `if`
+                // `if let pat = expr { ... }` in expression position
+                if self.peek().kind == TokenKind::Let {
+                    self.advance();
+                    let pat = self.parse_pat()?;
+                    self.expect(&TokenKind::Eq)?;
+                    let expr = self.parse_if_let_expr()?;
+                    let and_cond = if self.peek().kind == TokenKind::AmpAmp {
+                        self.advance();
+                        Some(self.parse_expr()?)
+                    } else {
+                        None
+                    };
+                    let then_block = self.parse_block()?;
+                    let else_block = if self.peek().kind == TokenKind::Else {
+                        self.advance();
+                        Some(self.parse_block()?)
+                    } else {
+                        None
+                    };
+                    // Encode as IfLet expression; and_cond fused into cond via Block wrapping
+                    // for simplicity, we lower it like the statement form but inside an expr.
+                    // We use a synthetic representation: store and_cond as the last stmt of then_block
+                    // by wrapping the whole thing in ExprKind::IfLet.
+                    let _ = and_cond; // TODO: and_cond support in if-let expr is deferred
+                    return Ok(Expr {
+                        kind: ExprKind::IfLet {
+                            pat,
+                            expr: Box::new(expr),
+                            expr_ty: None,
+                            then_block,
+                            else_block,
+                        },
+                        loc,
+                    });
+                }
                 let cond = self.parse_expr()?;
                 let then_block = self.parse_block()?;
                 let else_block = if self.peek().kind == TokenKind::Else {

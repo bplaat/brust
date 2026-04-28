@@ -1,3 +1,5 @@
+use std::rc::Rc;
+
 use crate::loc::Loc;
 
 /// A complete source file / compilation unit.
@@ -107,7 +109,7 @@ pub struct TraitDecl {
     pub is_pub: bool,
 }
 
-/// A method signature inside a trait declaration (no body).
+/// A method signature inside a trait declaration (with optional default body).
 #[derive(Clone)]
 pub struct TraitMethodSig {
     pub name: String,
@@ -115,6 +117,8 @@ pub struct TraitMethodSig {
     pub receiver: Receiver,
     pub params: Vec<Param>,
     pub return_ty: Ty,
+    /// Default method body; `None` means the method is abstract (must be implemented).
+    pub body: Option<Rc<Block>>,
 }
 
 pub struct FnDecl {
@@ -320,10 +324,22 @@ pub enum Pat {
     Wildcard,
     Bool(bool),
     Int(i64),
-    /// `lo..=hi` inclusive range pattern.
+    /// `lo..=hi` inclusive range pattern (integers).
     Range {
         lo: i64,
         hi: i64,
+    },
+    /// `'c'` char literal pattern.
+    Char(u32),
+    /// `'a'..='z'` inclusive char range pattern.
+    CharRange {
+        lo: u32,
+        hi: u32,
+    },
+    /// `name @ sub_pat` -- bind and test.
+    At {
+        name: String,
+        pat: Box<Pat>,
     },
     /// Binding pattern: `x` -- binds the matched value to a variable name.
     Binding(String),
@@ -378,10 +394,11 @@ pub enum ExprKind {
     },
     /// `(expr0, expr1, ...)`
     Tuple(Vec<Expr>),
-    /// `Type { field: expr, ... }` -- struct literal
+    /// `Type { field: expr, ... }` -- struct literal (with optional base `..rest`)
     StructLit {
         name: String,
         fields: Vec<(String, Expr)>,
+        rest: Option<Box<Expr>>,
     },
     /// `Type::Variant { field: expr, ... }` -- named enum variant literal
     EnumStructLit {
@@ -441,6 +458,18 @@ pub enum ExprKind {
         cond: Box<Expr>,
         then_block: Block,
         else_block: Option<Block>,
+    },
+    /// `if let pat = expr { then } [else { else }]` used in expression position
+    IfLet {
+        pat: Pat,
+        expr: Box<Expr>,
+        expr_ty: Option<Ty>,
+        then_block: Block,
+        else_block: Option<Block>,
+    },
+    /// `todo!()` / `panic!("msg")` / `unreachable!()` -- diverging macro expressions
+    Abort {
+        message: Option<Box<Expr>>,
     },
     /// `match expr { arms }` used in expression position
     Match {

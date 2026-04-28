@@ -84,6 +84,7 @@ pub enum TokenKind {
     RBracket,
     Semicolon,
     Comma,
+    At,
     Dot,
     DotDot,
     DotDotEq,
@@ -234,6 +235,10 @@ impl Lexer {
             b',' => {
                 self.advance();
                 TokenKind::Comma
+            }
+            b'@' => {
+                self.advance();
+                TokenKind::At
             }
             b'.' => {
                 self.advance();
@@ -404,6 +409,19 @@ impl Lexer {
             b'"' => self.lex_string(loc)?,
             b'\'' => self.lex_char(loc)?,
             c if c.is_ascii_digit() => self.lex_number(loc)?,
+            // b'...' byte char literal and b"..." byte string literal
+            b'b' if self.src.get(self.pos + 1).copied() == Some(b'\'') => {
+                self.advance(); // consume 'b'
+                // b'X' has integer type (u8), not char.
+                match self.lex_char(loc)? {
+                    TokenKind::CharLit(c) => TokenKind::IntLit(c as i64),
+                    other => other,
+                }
+            }
+            b'b' if self.src.get(self.pos + 1).copied() == Some(b'"') => {
+                self.advance(); // consume 'b'
+                self.lex_string(loc)?
+            }
             c if c.is_ascii_alphabetic() || c == b'_' => self.lex_ident_or_keyword(),
             _ => {
                 self.advance();

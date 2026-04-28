@@ -487,7 +487,10 @@ impl TypeChecker {
                     if let Some(trait_name) = &imp.trait_name {
                         if let Some(tr) = self.env.traits.get(trait_name).cloned() {
                             for sig in &tr.methods {
-                                if !imp.methods.iter().any(|m| m.name == sig.name) {
+                                // Methods with a default body don't need to be overridden.
+                                if sig.body.is_none()
+                                    && !imp.methods.iter().any(|m| m.name == sig.name)
+                                {
                                     self.err(format!(
                                         "`impl {trait_name} for {}` missing method `{}`",
                                         imp.type_name, sig.name
@@ -996,6 +999,23 @@ impl TypeChecker {
                 }
             }
 
+            Pat::Char(_) => {
+                if scrutinee_ty != &Ty::Char {
+                    self.err(format!("char pattern on `{}`", ty_display(scrutinee_ty)));
+                }
+            }
+
+            Pat::CharRange { .. } => {
+                if scrutinee_ty != &Ty::Char {
+                    self.err(format!("char range pattern on `{}`", ty_display(scrutinee_ty)));
+                }
+            }
+
+            Pat::At { name, pat } => {
+                scope.insert(name.clone(), scrutinee_ty.clone(), false);
+                self.bind_pat_vars(pat, scrutinee_ty, scope);
+            }
+
             Pat::Range { .. } => {
                 if !is_integer(scrutinee_ty) {
                     self.err(format!(
@@ -1379,7 +1399,7 @@ impl TypeChecker {
                 Ty::I64 // ranges are integer-valued by default
             }
 
-            ExprKind::StructLit { name, fields } => {
+            ExprKind::StructLit { name, fields, rest } => {
                 self.check_item_visibility(name);
                 if let Some(s) = self.env.structs.get(name.as_str()).cloned() {
                     let provided: HashSet<String> = fields.iter().map(|(n, _)| n.clone()).collect();
@@ -1399,10 +1419,20 @@ impl TypeChecker {
                             self.err(format!("no field `{fname}` in struct `{name}`"));
                         }
                     }
-                    // Check for missing required fields.
-                    for df in &s.fields {
-                        if !provided.contains(&df.name) {
-                            self.err(format!("missing field `{}` in `{name}`", df.name));
+                    if let Some(base) = rest {
+                        let base_ty = self.infer_expr(base, scope);
+                        if !self.compat(&base_ty, &Ty::Named(name.clone())) {
+                            self.err(format!(
+                                "struct update base has type `{}`, expected `{name}`",
+                                ty_display(&base_ty)
+                            ));
+                        }
+                    } else {
+                        // Check for missing required fields only when no rest expression.
+                        for df in &s.fields {
+                            if !provided.contains(&df.name) {
+                                self.err(format!("missing field `{}` in `{name}`", df.name));
+                            }
                         }
                     }
                 } else {
@@ -1841,6 +1871,42 @@ impl TypeChecker {
                     .unwrap_or(Ty::Unit);
                 *result_ty = Some(ty.clone());
                 ty
+            }
+
+            ExprKind::IfLet {
+                pat,
+                expr,
+                expr_ty,
+                then_block,
+                else_block,
+            } => {
+                let inferred_expr_ty = self.infer_expr(expr, scope);
+                *expr_ty = Some(inferred_expr_ty.clone());
+                let mut inner = scope.clone();
+                inner.push();
+                self.bind_pat_vars(pat, &inferred_expr_ty, &mut inner);
+                let then_ty = self.infer_block_value_ty(then_block, &inner);
+                inner.pop();
+                let else_ty = else_block
+                    .as_mut()
+                    .map(|b| self.infer_block_value_ty(b, scope))
+                    .unwrap_or(Ty::Unit);
+                if !ty_compat(&then_ty, &else_ty) && !ty_compat(&else_ty, &then_ty) {
+                    self.err(format!(
+                        "if-let branch type mismatch: `{}` vs `{}`",
+                        ty_display(&then_ty),
+                        ty_display(&else_ty)
+                    ));
+                }
+                then_ty
+            }
+
+            ExprKind::Abort { message } => {
+                if let Some(msg) = message {
+                    self.infer_expr(msg, scope);
+                }
+                // Abort diverges; treat as the expected type (Never approximation).
+                Ty::Never
             }
         }
     }
