@@ -412,9 +412,17 @@ impl Lexer {
             // b'...' byte char literal and b"..." byte string literal
             b'b' if self.src.get(self.pos + 1).copied() == Some(b'\'') => {
                 self.advance(); // consume 'b'
-                // b'X' has integer type (u8), not char.
+                // b'X' has integer type (u8); value must fit in 0..=255.
                 match self.lex_char(loc)? {
-                    TokenKind::CharLit(c) => TokenKind::IntLit(c as i64),
+                    TokenKind::CharLit(c) => {
+                        if c > 255 {
+                            return Err(Error::new(
+                                loc,
+                                "byte literal value must be in the range 0..=255",
+                            ));
+                        }
+                        TokenKind::IntLit(c as i64)
+                    }
                     other => other,
                 }
             }
@@ -435,74 +443,142 @@ impl Lexer {
         Ok(Token { kind, loc })
     }
 
+    /// Read one complete UTF-8 character from the source byte stream.
+    /// The source is always valid UTF-8 (constructed from a `&str`), so an
+    /// invalid sequence indicates a bug in the caller, not bad user input.
+    fn next_utf8_char(&mut self, loc: Loc) -> Result<char, Error> {
+        let first = match self.advance() {
+            None => return Err(Error::new(loc, "unexpected end of input")),
+            Some(b) => b,
+        };
+        if first < 0x80 {
+            return Ok(first as char);
+        }
+        let (n_cont, mut cp) = if first & 0xE0 == 0xC0 {
+            (1, u32::from(first & 0x1F))
+        } else if first & 0xF0 == 0xE0 {
+            (2, u32::from(first & 0x0F))
+        } else if first & 0xF8 == 0xF0 {
+            (3, u32::from(first & 0x07))
+        } else {
+            return Err(Error::new(loc, "invalid UTF-8 sequence in source"));
+        };
+        for _ in 0..n_cont {
+            match self.advance() {
+                Some(b) if b & 0xC0 == 0x80 => cp = (cp << 6) | u32::from(b & 0x3F),
+                _ => return Err(Error::new(loc, "invalid UTF-8 sequence in source")),
+            }
+        }
+        char::from_u32(cp).ok_or_else(|| Error::new(loc, "invalid Unicode codepoint in source"))
+    }
+
+    /// Parse the `{HEX}` portion of a `\u{HEX}` escape sequence and return the
+    /// resulting char. The leading `\u` must already have been consumed.
+    fn parse_unicode_escape(&mut self, loc: Loc) -> Result<char, Error> {
+        if self.advance() != Some(b'{') {
+            return Err(Error::new(loc, "expected '{' in unicode escape"));
+        }
+        let mut hex = String::new();
+        loop {
+            match self.peek() {
+                Some(b'}') => {
+                    self.advance();
+                    break;
+                }
+                Some(c) if (c as char).is_ascii_hexdigit() => {
+                    hex.push(self.advance().unwrap() as char);
+                }
+                _ => return Err(Error::new(loc, "invalid character in unicode escape")),
+            }
+        }
+        if hex.is_empty() {
+            return Err(Error::new(loc, "empty unicode escape sequence"));
+        }
+        let v = u32::from_str_radix(&hex, 16)
+            .map_err(|_| Error::new(loc, "unicode escape value out of range"))?;
+        if v > 0x10FFFF {
+            return Err(Error::new(
+                loc,
+                format!("unicode escape '\\u{{{hex}}}' is out of range (max is \\u{{10FFFF}})"),
+            ));
+        }
+        if (0xD800..=0xDFFF).contains(&v) {
+            return Err(Error::new(
+                loc,
+                format!("unicode escape '\\u{{{hex}}}' is a surrogate code point"),
+            ));
+        }
+        Ok(char::from_u32(v).unwrap())
+    }
+
     fn lex_string(&mut self, loc: Loc) -> Result<TokenKind, Error> {
-        self.advance();
+        self.advance(); // consume opening "
         let mut s = String::new();
         loop {
-            match self.advance() {
+            match self.peek() {
                 None => return Err(Error::new(loc, "unterminated string literal")),
-                Some(b'"') => break,
-                Some(b'\\') => match self.advance() {
-                    Some(b'n') => s.push('\n'),
-                    Some(b't') => s.push('\t'),
-                    Some(b'r') => s.push('\r'),
-                    Some(b'\\') => s.push('\\'),
-                    Some(b'"') => s.push('"'),
-                    Some(b'0') => s.push('\0'),
-                    Some(c) => {
-                        return Err(Error::new(loc, format!("unknown escape '\\{}'", c as char)));
+                Some(b'"') => {
+                    self.advance();
+                    break;
+                }
+                Some(b'\\') => {
+                    self.advance(); // consume backslash
+                    match self.advance() {
+                        Some(b'n') => s.push('\n'),
+                        Some(b't') => s.push('\t'),
+                        Some(b'r') => s.push('\r'),
+                        Some(b'\\') => s.push('\\'),
+                        Some(b'"') => s.push('"'),
+                        Some(b'0') => s.push('\0'),
+                        Some(b'u') => s.push(self.parse_unicode_escape(loc)?),
+                        // Backslash-newline: skip the newline and all leading whitespace on the
+                        // next line, matching Rust's string literal line continuation.
+                        Some(b'\n') => {
+                            while self.peek().is_some_and(|c| c.is_ascii_whitespace()) {
+                                self.advance();
+                            }
+                        }
+                        Some(c) => {
+                            return Err(Error::new(
+                                loc,
+                                format!("unknown escape '\\{}'", c as char),
+                            ));
+                        }
+                        None => return Err(Error::new(loc, "unterminated escape sequence")),
                     }
-                    None => return Err(Error::new(loc, "unterminated escape sequence")),
-                },
-                Some(c) => s.push(c as char),
+                }
+                Some(_) => s.push(self.next_utf8_char(loc)?),
             }
         }
         Ok(TokenKind::StringLit(s))
     }
 
     fn lex_char(&mut self, loc: Loc) -> Result<TokenKind, Error> {
-        self.advance();
-        let ch: u32 = match self.advance() {
-            None => return Err(Error::new(loc, "unterminated char literal")),
-            Some(b'\\') => match self.advance() {
-                Some(b'n') => '\n' as u32,
-                Some(b't') => '\t' as u32,
-                Some(b'r') => '\r' as u32,
-                Some(b'\\') => '\\' as u32,
-                Some(b'\'') => '\'' as u32,
-                Some(b'"') => '"' as u32,
-                Some(b'0') => 0,
-                Some(b'u') => {
-                    if self.advance() != Some(b'{') {
-                        return Err(Error::new(loc, "expected '{' in unicode escape"));
-                    }
-                    let mut hex = String::new();
-                    loop {
-                        match self.peek() {
-                            Some(b'}') => {
-                                self.advance();
-                                break;
-                            }
-                            Some(c) if (c as char).is_ascii_hexdigit() => {
-                                hex.push(self.advance().unwrap() as char);
-                            }
-                            _ => return Err(Error::new(loc, "invalid unicode escape")),
-                        }
-                    }
-                    u32::from_str_radix(&hex, 16)
-                        .map_err(|_| Error::new(loc, "unicode escape out of range"))?
-                }
+        self.advance(); // consume opening '
+        let ch: char = if self.peek() == Some(b'\\') {
+            self.advance(); // consume backslash
+            match self.advance() {
+                Some(b'n') => '\n',
+                Some(b't') => '\t',
+                Some(b'r') => '\r',
+                Some(b'\\') => '\\',
+                Some(b'\'') => '\'',
+                Some(b'"') => '"',
+                Some(b'0') => '\0',
+                Some(b'u') => self.parse_unicode_escape(loc)?,
                 Some(c) => {
                     return Err(Error::new(loc, format!("unknown escape '\\{}'", c as char)));
                 }
                 None => return Err(Error::new(loc, "unterminated escape")),
-            },
-            Some(c) => c as u32,
+            }
+        } else {
+            // Non-escape character: decode the full UTF-8 sequence.
+            self.next_utf8_char(loc)?
         };
         if self.advance() != Some(b'\'') {
             return Err(Error::new(loc, "expected closing ' in char literal"));
         }
-        Ok(TokenKind::CharLit(ch))
+        Ok(TokenKind::CharLit(ch as u32))
     }
 
     /// Consume an optional integer type suffix (e.g. `u8`, `i64`, `usize`).
@@ -548,6 +624,9 @@ impl Lexer {
                         s.push(c as char);
                     }
                 }
+                if s.is_empty() {
+                    return Err(Error::new(loc, "expected hex digits after '0x'"));
+                }
                 let tok = i64::from_str_radix(&s, 16)
                     .map(TokenKind::IntLit)
                     .map_err(|_| Error::new(loc, format!("hex literal '0x{s}' out of range")))?;
@@ -566,6 +645,9 @@ impl Lexer {
                     if c != b'_' {
                         s.push(c as char);
                     }
+                }
+                if s.is_empty() {
+                    return Err(Error::new(loc, "expected binary digits after '0b'"));
                 }
                 let tok = i64::from_str_radix(&s, 2)
                     .map(TokenKind::IntLit)
