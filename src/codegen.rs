@@ -16,6 +16,14 @@ pub fn generate(file: &File) -> String {
                         Stmt::Println { format, args } => {
                             emit_println(&mut out, format, args);
                         }
+                        Stmt::Let { name, mutable, expr } => {
+                            let kw = if *mutable { "" } else { "const " };
+                            out.push_str(&format!("    {kw}long long {name} = {};\n",
+                                emit_expr(expr)));
+                        }
+                        Stmt::Assign { name, expr } => {
+                            out.push_str(&format!("    {name} = {};\n", emit_expr(expr)));
+                        }
                     }
                 }
                 if f.name == "main" {
@@ -62,6 +70,7 @@ fn emit_println(out: &mut String, format: &str, args: &[Expr]) {
 fn emit_expr(expr: &Expr) -> String {
     match expr {
         Expr::Int(n) => format!("{n}LL"),
+        Expr::Var(name) => name.clone(),
         Expr::BinOp { op, lhs, rhs } => {
             let op_str = match op {
                 BinOp::Add => "+",

@@ -4,6 +4,8 @@ use crate::error::Error;
 pub enum TokenKind {
     // Keywords
     Fn,
+    Let,
+    Mut,
     // Identifiers and literals
     Ident(String),
     IntLit(i64),
@@ -21,6 +23,7 @@ pub enum TokenKind {
     RBrace,
     Semicolon,
     Comma,
+    Eq,
     Bang,
     Eof,
 }
@@ -108,6 +111,7 @@ impl<'a> Lexer<'a> {
             b'}' => { self.advance(); TokenKind::RBrace }
             b';' => { self.advance(); TokenKind::Semicolon }
             b',' => { self.advance(); TokenKind::Comma }
+            b'=' => { self.advance(); TokenKind::Eq }
             b'!' => { self.advance(); TokenKind::Bang }
             b'+' => { self.advance(); TokenKind::Plus }
             b'-' => { self.advance(); TokenKind::Minus }
@@ -163,7 +167,9 @@ impl<'a> Lexer<'a> {
             name.push(self.advance().unwrap() as char);
         }
         match name.as_str() {
-            "fn" => TokenKind::Fn,
+            "fn"  => TokenKind::Fn,
+            "let" => TokenKind::Let,
+            "mut" => TokenKind::Mut,
             _ => TokenKind::Ident(name),
         }
     }
