@@ -4,29 +4,33 @@ use crate::ast::{
     TraitMethodSig, Ty, UnOp, VariantFields,
 };
 use crate::error::Error;
-use crate::lexer::{Token, TokenKind};
+use crate::lexer::{Lexer, Token, TokenKind};
 use crate::loc::Loc;
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 
 pub struct Parser {
     tokens: Vec<Token>,
     pos: usize,
-    /// Name of the mod block currently being parsed, if any.
-    current_mod: Option<String>,
+    /// Stack of module names, innermost last (e.g. ["math"] or ["outer", "inner"]).
+    mod_stack: Vec<String>,
     /// Names declared at the top level of the current mod block (types + fns).
     mod_local_names: HashSet<String>,
     /// Use-alias table: short name -> brust internal (underscore-joined) name.
     use_aliases: HashMap<String, String>,
+    /// Directory of the root source file (used to resolve `mod foo;` imports).
+    source_dir: PathBuf,
 }
 
 impl Parser {
-    pub fn new(tokens: Vec<Token>) -> Self {
+    pub fn new(tokens: Vec<Token>, source_dir: PathBuf) -> Self {
         Self {
             tokens,
             pos: 0,
-            current_mod: None,
+            mod_stack: Vec::new(),
             mod_local_names: HashSet::new(),
             use_aliases: HashMap::new(),
+            source_dir,
         }
     }
 
@@ -70,16 +74,143 @@ impl Parser {
         names
     }
 
+    /// Scan tokens from `start` up to (but not including) `end_pos` and collect
+    /// the names of all top-level `fn`, `struct`, `enum`, and `type` declarations.
+    /// Used for file-based modules where there is no enclosing `}`.
+    fn collect_mod_local_names_bounded(&self, start: usize, end_pos: usize) -> HashSet<String> {
+        let mut names = HashSet::new();
+        let mut depth: usize = 0;
+        let mut i = start;
+        while i < end_pos {
+            match &self.tokens[i].kind {
+                TokenKind::LBrace => {
+                    depth += 1;
+                    i += 1;
+                }
+                TokenKind::RBrace => {
+                    if depth == 0 {
+                        break;
+                    }
+                    depth -= 1;
+                    i += 1;
+                }
+                TokenKind::Fn | TokenKind::Struct | TokenKind::Enum | TokenKind::Type
+                    if depth == 0 =>
+                {
+                    i += 1;
+                    if matches!(self.tokens.get(i).map(|t| &t.kind), Some(TokenKind::Pub)) {
+                        i += 1;
+                    }
+                    if let Some(TokenKind::Ident(name)) = self.tokens.get(i).map(|t| &t.kind) {
+                        names.insert(name.clone());
+                    }
+                    i += 1;
+                }
+                _ => {
+                    i += 1;
+                }
+            }
+        }
+        names
+    }
+
+    /// `{source_dir}/{name}/mod.rs`, lexes the content, and parses it as mod items.
+    fn load_mod_file(&mut self, name: &str, loc: Loc) -> Result<Vec<Item>, Error> {
+        // Candidate paths relative to current source_dir.
+        let flat = self.source_dir.join(format!("{name}.rs"));
+        let nested = self.source_dir.join(name).join("mod.rs");
+
+        let (path, new_source_dir) = if flat.exists() {
+            let dir = self.source_dir.clone();
+            (flat, dir)
+        } else if nested.exists() {
+            let dir = nested.parent().unwrap().to_path_buf();
+            (nested, dir)
+        } else {
+            return Err(Error::new(
+                loc,
+                format!("mod {name}: cannot find '{name}.rs' or '{name}/mod.rs'"),
+            ));
+        };
+
+        let src = std::fs::read_to_string(&path).map_err(|e| {
+            Error::new(
+                loc.clone(),
+                format!("mod {name}: cannot read '{}': {e}", path.display()),
+            )
+        })?;
+
+        let mut file_tokens = Lexer::new(&src)
+            .tokenize()
+            .map_err(|e| Error::new(loc.clone(), format!("mod {name}: lex error: {e}")))?;
+
+        // Remove the trailing EOF token before splicing.
+        if matches!(file_tokens.last().map(|t| &t.kind), Some(TokenKind::Eof)) {
+            file_tokens.pop();
+        }
+        let token_count = file_tokens.len();
+
+        // Splice at current position so the parser reads them next.
+        self.tokens.splice(self.pos..self.pos, file_tokens);
+        let end_pos = self.pos + token_count;
+
+        // Swap source_dir for nested mod resolution.
+        let saved_dir = std::mem::replace(&mut self.source_dir, new_source_dir);
+
+        // Pre-scan only the spliced token range to avoid reading into parent tokens.
+        let local_names = self.collect_mod_local_names_bounded(self.pos, end_pos);
+        self.mod_stack.push(name.to_string());
+        let saved_names = std::mem::replace(&mut self.mod_local_names, local_names);
+        let saved_aliases = std::mem::replace(&mut self.use_aliases, HashMap::new());
+        let mut items = Vec::new();
+        while self.pos < end_pos {
+            items.push(self.parse_item()?);
+        }
+        self.mod_stack.pop();
+        self.mod_local_names = saved_names;
+        self.use_aliases = saved_aliases;
+        self.source_dir = saved_dir;
+
+        Ok(items)
+    }
+
+    fn mod_prefix(&self) -> String {
+        if self.mod_stack.is_empty() {
+            String::new()
+        } else {
+            format!("{}_", self.mod_stack.join("_"))
+        }
+    }
+
     /// If `name` is a locally-declared name in the current module, return the
-    /// fully-qualified internal name (`{mod}_{name}`). Otherwise return `name`
+    /// fully-qualified internal name (`{mod_prefix}{name}`). Otherwise return `name`
     /// unchanged.
     fn qualify(&self, name: String) -> String {
-        if let Some(ref m) = self.current_mod
-            && self.mod_local_names.contains(&name)
-        {
-            return format!("{m}_{name}");
+        let prefix = self.mod_prefix();
+        if !prefix.is_empty() && self.mod_local_names.contains(&name) {
+            return format!("{prefix}{name}");
         }
         name
+    }
+
+    /// Resolve a `self::name` path: relative to current module.
+    fn resolve_self_path(&self, name: &str) -> String {
+        let prefix = self.mod_prefix();
+        format!("{prefix}{name}")
+    }
+
+    /// Resolve a `super::name` path: relative to the parent module.
+    fn resolve_super_path(&self, name: &str) -> String {
+        if self.mod_stack.len() <= 1 {
+            // Already at top level or one level deep: parent is root.
+            name.to_string()
+        } else {
+            let parent: Vec<_> = self.mod_stack[..self.mod_stack.len() - 1]
+                .iter()
+                .cloned()
+                .collect();
+            format!("{}_{name}", parent.join("_"))
+        }
     }
 
     /// Resolve a name: check use-aliases first, then apply module qualification.
@@ -90,7 +221,7 @@ impl Parser {
         self.qualify(name)
     }
 
-    /// Parse a path segment: an identifier or `self` keyword.
+    /// Parse a path segment: an identifier, `self`, or `super`.
     fn parse_use_segment(&mut self) -> Result<String, Error> {
         let tok = self.peek().clone();
         match &tok.kind {
@@ -102,6 +233,10 @@ impl Parser {
             TokenKind::SelfKw => {
                 self.advance();
                 Ok("self".to_string())
+            }
+            TokenKind::Super => {
+                self.advance();
+                Ok("super".to_string())
             }
             _ => Err(Error::new(
                 tok.loc,
@@ -223,24 +358,25 @@ impl Parser {
     }
 
     fn parse_item(&mut self) -> Result<Item, Error> {
-        if self.peek().kind == TokenKind::Pub {
+        let is_pub = self.peek().kind == TokenKind::Pub;
+        if is_pub {
             self.advance();
         }
 
         let tok = self.peek().clone();
         match &tok.kind {
-            TokenKind::Fn => Ok(Item::Fn(self.parse_fn()?)),
-            TokenKind::Struct => Ok(Item::Struct(self.parse_struct()?)),
+            TokenKind::Fn => Ok(Item::Fn(self.parse_fn(is_pub)?)),
+            TokenKind::Struct => Ok(Item::Struct(self.parse_struct(is_pub)?)),
             TokenKind::Impl => Ok(Item::Impl(self.parse_impl()?)),
-            TokenKind::Trait => Ok(Item::Trait(self.parse_trait()?)),
-            TokenKind::Enum => Ok(Item::Enum(self.parse_enum()?)),
+            TokenKind::Trait => Ok(Item::Trait(self.parse_trait(is_pub)?)),
+            TokenKind::Enum => Ok(Item::Enum(self.parse_enum(is_pub)?)),
             TokenKind::Type => {
                 self.advance();
                 let name = self.expect_ident()?;
                 self.expect(&TokenKind::Eq)?;
                 let ty = self.parse_ty()?;
                 self.expect(&TokenKind::Semicolon)?;
-                Ok(Item::TypeAlias { name, ty })
+                Ok(Item::TypeAlias { name, ty, is_pub })
             }
             TokenKind::Use => {
                 self.advance();
@@ -249,7 +385,7 @@ impl Parser {
                 Ok(Item::Skip)
             }
             TokenKind::Extern => {
-                // extern crate foo; or extern "C" { ... } -- skip both forms.
+                // extern crate foo; / extern crate foo as bar; / extern "C" { ... }
                 self.advance();
                 // Skip to `;` or consume a block `{ ... }`.
                 loop {
@@ -293,21 +429,39 @@ impl Parser {
             TokenKind::Mod => {
                 self.advance();
                 let name = self.expect_ident()?;
+
+                // mod foo; -- load from file
+                if self.peek().kind == TokenKind::Semicolon {
+                    self.advance();
+                    let items = self.load_mod_file(&name, tok.loc)?;
+                    return Ok(Item::Mod {
+                        name,
+                        items,
+                        is_pub,
+                    });
+                }
+
                 self.expect(&TokenKind::LBrace)?;
                 // Pre-scan the token stream for names declared inside this mod.
                 let local_names = self.collect_mod_local_names(self.pos);
-                // Save outer context and activate module scope.
-                let saved_mod = self.current_mod.replace(name.clone());
+                // Push onto the module stack and parse items.
+                self.mod_stack.push(name.clone());
                 let saved_names = std::mem::replace(&mut self.mod_local_names, local_names);
+                let saved_aliases = std::mem::replace(&mut self.use_aliases, HashMap::new());
                 let mut items = Vec::new();
                 while self.peek().kind != TokenKind::RBrace && !self.at_eof() {
                     items.push(self.parse_item()?);
                 }
                 self.expect(&TokenKind::RBrace)?;
                 // Restore outer context.
-                self.current_mod = saved_mod;
+                self.mod_stack.pop();
                 self.mod_local_names = saved_names;
-                Ok(Item::Mod { name, items })
+                self.use_aliases = saved_aliases;
+                Ok(Item::Mod {
+                    name,
+                    items,
+                    is_pub,
+                })
             }
             _ => Err(Error::new(
                 tok.loc,
@@ -316,7 +470,7 @@ impl Parser {
         }
     }
 
-    fn parse_enum(&mut self) -> Result<EnumDecl, Error> {
+    fn parse_enum(&mut self, is_pub: bool) -> Result<EnumDecl, Error> {
         let loc = self.loc();
         self.expect(&TokenKind::Enum)?;
         let name = self.expect_ident()?;
@@ -351,12 +505,17 @@ impl Parser {
                             break;
                         }
                     }
+                    let field_pub = self.peek().kind == TokenKind::Pub;
+                    if field_pub {
+                        self.advance();
+                    }
                     let fname = self.expect_ident()?;
                     self.expect(&TokenKind::Colon)?;
                     let fty = self.parse_ty()?;
                     named.push(FieldDecl {
                         name: fname,
                         ty: fty,
+                        is_pub: field_pub,
                     });
                 }
                 self.expect(&TokenKind::RBrace)?;
@@ -373,11 +532,12 @@ impl Parser {
         Ok(EnumDecl {
             name,
             variants,
+            is_pub,
             loc,
         })
     }
 
-    fn parse_struct(&mut self) -> Result<StructDecl, Error> {
+    fn parse_struct(&mut self, is_pub: bool) -> Result<StructDecl, Error> {
         let loc = self.loc();
         self.expect(&TokenKind::Struct)?;
         let name = self.expect_ident()?;
@@ -390,7 +550,8 @@ impl Parser {
                     break;
                 }
             }
-            if self.peek().kind == TokenKind::Pub {
+            let field_pub = self.peek().kind == TokenKind::Pub;
+            if field_pub {
                 self.advance();
             }
             let fname = self.expect_ident()?;
@@ -398,10 +559,16 @@ impl Parser {
             fields.push(FieldDecl {
                 name: fname,
                 ty: self.parse_ty()?,
+                is_pub: field_pub,
             });
         }
         self.expect(&TokenKind::RBrace)?;
-        Ok(StructDecl { name, fields, loc })
+        Ok(StructDecl {
+            name,
+            fields,
+            is_pub,
+            loc,
+        })
     }
 
     fn parse_impl(&mut self) -> Result<ImplBlock, Error> {
@@ -418,14 +585,23 @@ impl Parser {
         self.expect(&TokenKind::LBrace)?;
         let mut methods = Vec::new();
         while self.peek().kind != TokenKind::RBrace && !self.at_eof() {
-            methods.push(self.parse_fn()?);
+            // Parse per-method pub visibility.
+            let method_pub = self.peek().kind == TokenKind::Pub;
+            if method_pub {
+                self.advance();
+            }
+            methods.push(self.parse_fn(method_pub)?);
         }
         self.expect(&TokenKind::RBrace)?;
-        Ok(ImplBlock { type_name, trait_name, methods })
+        Ok(ImplBlock {
+            type_name,
+            trait_name,
+            methods,
+        })
     }
 
     /// Parse a trait declaration: `trait Foo { fn method(&self, ...) -> Ty; ... }`.
-    fn parse_trait(&mut self) -> Result<TraitDecl, Error> {
+    fn parse_trait(&mut self, is_pub: bool) -> Result<TraitDecl, Error> {
         self.expect(&TokenKind::Trait)?;
         let name = self.expect_ident()?;
         self.expect(&TokenKind::LBrace)?;
@@ -447,17 +623,23 @@ impl Parser {
             };
             self.expect(&TokenKind::Semicolon)?;
             let receiver = receiver.unwrap_or(Receiver::Ref);
-            methods.push(TraitMethodSig { name: mname, receiver, params, return_ty });
+            methods.push(TraitMethodSig {
+                name: mname,
+                receiver,
+                params,
+                return_ty,
+            });
         }
         self.expect(&TokenKind::RBrace)?;
-        Ok(TraitDecl { name, methods })
+        Ok(TraitDecl {
+            name,
+            methods,
+            is_pub,
+        })
     }
 
-    fn parse_fn(&mut self) -> Result<FnDecl, Error> {
+    fn parse_fn(&mut self, is_pub: bool) -> Result<FnDecl, Error> {
         let loc = self.loc();
-        if self.peek().kind == TokenKind::Pub {
-            self.advance();
-        }
         self.expect(&TokenKind::Fn)?;
         let name = self.expect_ident()?;
         self.expect(&TokenKind::LParen)?;
@@ -476,6 +658,7 @@ impl Parser {
             params,
             return_ty,
             body,
+            is_pub,
             loc,
         })
     }
@@ -689,6 +872,19 @@ impl Parser {
                     Ok(first)
                 }
             }
+            // self::Type and super::Type: module-relative paths.
+            TokenKind::SelfKw => {
+                self.advance();
+                self.expect(&TokenKind::ColonColon)?;
+                let name = self.expect_ident()?;
+                Ok(Ty::Named(self.resolve_self_path(&name)))
+            }
+            TokenKind::Super => {
+                self.advance();
+                self.expect(&TokenKind::ColonColon)?;
+                let name = self.expect_ident()?;
+                Ok(Ty::Named(self.resolve_super_path(&name)))
+            }
             _ => Err(Error::new(
                 tok.loc,
                 format!("expected type, got {:?}", tok.kind),
@@ -717,7 +913,10 @@ impl Parser {
             TokenKind::Loop => {
                 self.advance();
                 let body = self.parse_block()?;
-                Ok(Stmt { kind: StmtKind::Loop(body), loc })
+                Ok(Stmt {
+                    kind: StmtKind::Loop(body),
+                    loc,
+                })
             }
             TokenKind::For => self.parse_for(),
             TokenKind::Break => {
@@ -725,14 +924,20 @@ impl Parser {
                 if self.peek().kind == TokenKind::Semicolon {
                     self.advance();
                 }
-                Ok(Stmt { kind: StmtKind::Break, loc })
+                Ok(Stmt {
+                    kind: StmtKind::Break,
+                    loc,
+                })
             }
             TokenKind::Continue => {
                 self.advance();
                 if self.peek().kind == TokenKind::Semicolon {
                     self.advance();
                 }
-                Ok(Stmt { kind: StmtKind::Continue, loc })
+                Ok(Stmt {
+                    kind: StmtKind::Continue,
+                    loc,
+                })
             }
             TokenKind::Match => self.parse_match(),
             TokenKind::Unsafe => {
@@ -1146,7 +1351,10 @@ impl Parser {
             } else {
                 None
             };
-            return Ok(Expr { kind: ExprKind::Range { start: None, end }, loc });
+            return Ok(Expr {
+                kind: ExprKind::Range { start: None, end },
+                loc,
+            });
         }
         let lhs = self.parse_or()?;
         if self.peek().kind == TokenKind::DotDot {
@@ -1163,7 +1371,13 @@ impl Parser {
             } else {
                 None
             };
-            return Ok(Expr { kind: ExprKind::Range { start: Some(Box::new(lhs)), end }, loc });
+            return Ok(Expr {
+                kind: ExprKind::Range {
+                    start: Some(Box::new(lhs)),
+                    end,
+                },
+                loc,
+            });
         }
         Ok(lhs)
     }
@@ -1516,6 +1730,47 @@ impl Parser {
         Ok(args)
     }
 
+    /// Build an expression from an already-resolved path (from self:: or super::).
+    /// Handles struct literals (LBrace), function calls (LParen), and plain variable references.
+    fn parse_resolved_path_expr(&mut self, name: String, loc: Loc) -> Result<Expr, Error> {
+        if self.peek().kind == TokenKind::LParen {
+            let args = self.parse_call_args()?;
+            return Ok(Expr {
+                kind: ExprKind::Call { name, args },
+                loc,
+            });
+        }
+        // Check uppercase using the last underscore-delimited segment, since resolved
+        // names are mangled (e.g., "geom_Point" — the type segment is "Point").
+        let last_seg = name.rsplit('_').next().unwrap_or(&name);
+        if self.peek().kind == TokenKind::LBrace
+            && last_seg.chars().next().is_some_and(|c| c.is_uppercase())
+        {
+            self.advance();
+            let mut fields = Vec::new();
+            while self.peek().kind != TokenKind::RBrace && !self.at_eof() {
+                if !fields.is_empty() {
+                    self.expect(&TokenKind::Comma)?;
+                    if self.peek().kind == TokenKind::RBrace {
+                        break;
+                    }
+                }
+                let fname = self.expect_ident()?;
+                self.expect(&TokenKind::Colon)?;
+                fields.push((fname, self.parse_expr()?));
+            }
+            self.expect(&TokenKind::RBrace)?;
+            return Ok(Expr {
+                kind: ExprKind::StructLit { name, fields },
+                loc,
+            });
+        }
+        Ok(Expr {
+            kind: ExprKind::Var(name),
+            loc,
+        })
+    }
+
     fn parse_primary(&mut self) -> Result<Expr, Error> {
         let loc = self.loc();
         let tok = self.peek().clone();
@@ -1568,10 +1823,25 @@ impl Parser {
             }
             TokenKind::SelfKw => {
                 self.advance();
+                // self::name resolves to current-module-qualified name.
+                if self.peek().kind == TokenKind::ColonColon {
+                    self.advance();
+                    let name = self.expect_ident()?;
+                    let resolved = self.resolve_self_path(&name);
+                    return self.parse_resolved_path_expr(resolved, loc);
+                }
                 Ok(Expr {
                     kind: ExprKind::Var("self".to_string()),
                     loc,
                 })
+            }
+            TokenKind::Super => {
+                self.advance();
+                // super::name resolves to parent-module-qualified name.
+                self.expect(&TokenKind::ColonColon)?;
+                let name = self.expect_ident()?;
+                let resolved = self.resolve_super_path(&name);
+                self.parse_resolved_path_expr(resolved, loc)
             }
             TokenKind::LBracket => {
                 self.advance();

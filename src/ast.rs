@@ -2,7 +2,6 @@
 
 use crate::loc::Loc;
 
-
 /// A complete source file / compilation unit.
 pub struct File {
     pub items: Vec<Item>,
@@ -14,8 +13,16 @@ pub enum Item {
     Impl(ImplBlock),
     Trait(TraitDecl),
     Enum(EnumDecl),
-    TypeAlias { name: String, ty: Ty },
-    Mod { name: String, items: Vec<Item> },
+    TypeAlias {
+        name: String,
+        ty: Ty,
+        is_pub: bool,
+    },
+    Mod {
+        name: String,
+        items: Vec<Item>,
+        is_pub: bool,
+    },
     /// Discarded item: `use ...;`, `extern crate ...;`, etc.
     Skip,
 }
@@ -24,6 +31,7 @@ pub enum Item {
 pub struct StructDecl {
     pub name: String,
     pub fields: Vec<FieldDecl>,
+    pub is_pub: bool,
     pub loc: Loc,
 }
 
@@ -31,12 +39,14 @@ pub struct StructDecl {
 pub struct FieldDecl {
     pub name: String,
     pub ty: Ty,
+    pub is_pub: bool,
 }
 
 #[derive(Clone)]
 pub struct EnumDecl {
     pub name: String,
     pub variants: Vec<EnumVariant>,
+    pub is_pub: bool,
     pub loc: Loc,
 }
 
@@ -66,6 +76,7 @@ pub struct ImplBlock {
 pub struct TraitDecl {
     pub name: String,
     pub methods: Vec<TraitMethodSig>,
+    pub is_pub: bool,
 }
 
 /// A method signature inside a trait declaration (no body).
@@ -83,6 +94,7 @@ pub struct FnDecl {
     pub params: Vec<Param>,
     pub return_ty: Ty,
     pub body: Block,
+    pub is_pub: bool,
     pub loc: Loc,
 }
 
@@ -120,10 +132,10 @@ pub enum Ty {
     F64,
     // Primitives
     Bool,
-    Char,  // Unicode scalar value (u32 in C)
-    Unit,  // ()
-    Str,   // &str (const char* in C)
-    Never, // ! (diverging -- _Noreturn void in C)
+    Char,   // Unicode scalar value (u32 in C)
+    Unit,   // ()
+    Str,    // &str (const char* in C)
+    Never,  // ! (diverging -- _Noreturn void in C)
     SelfTy, // Self -- the implementing type in an impl/trait context
     // Compound types
     Array(Box<Ty>, usize),                   // [T; N]
@@ -163,7 +175,10 @@ impl Ty {
     pub fn contains_self(&self) -> bool {
         match self {
             Ty::SelfTy => true,
-            Ty::Ref(inner) | Ty::RefMut(inner) | Ty::RawConst(inner) | Ty::RawMut(inner)
+            Ty::Ref(inner)
+            | Ty::RefMut(inner)
+            | Ty::RawConst(inner)
+            | Ty::RawMut(inner)
             | Ty::Slice(inner) => inner.contains_self(),
             Ty::Array(inner, _) => inner.contains_self(),
             Ty::Tuple(tys) => tys.iter().any(|t| t.contains_self()),
@@ -211,7 +226,11 @@ pub enum StmtKind {
     /// `loop { ... }` — infinite loop, exit via `break`
     Loop(Block),
     /// `for <var> in <expr> { ... }` — iterate over an array or range
-    For { var: String, iter: Expr, body: Block },
+    For {
+        var: String,
+        iter: Expr,
+        body: Block,
+    },
     /// `break` — exit the nearest enclosing loop
     Break,
     /// `continue` — skip to the next iteration of the nearest enclosing loop

@@ -32,6 +32,7 @@ pub enum TokenKind {
     Dyn,
     Use,
     Extern,
+    Super,
     // Identifiers and literals
     Ident(String),
     IntLit(i64),
@@ -538,6 +539,7 @@ impl Lexer {
             "dyn" => TokenKind::Dyn,
             "use" => TokenKind::Use,
             "extern" => TokenKind::Extern,
+            "super" => TokenKind::Super,
             _ => TokenKind::Ident(name),
         }
     }

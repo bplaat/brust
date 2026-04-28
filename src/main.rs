@@ -28,10 +28,16 @@ fn main() {
     });
 
     // Parse
-    let file = parser::Parser::new(tokens).parse_file().unwrap_or_else(|e| {
-        eprintln!("{}", e);
-        process::exit(1);
-    });
+    let source_dir = Path::new(input_path)
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .to_path_buf();
+    let file = parser::Parser::new(tokens, source_dir)
+        .parse_file()
+        .unwrap_or_else(|e| {
+            eprintln!("{}", e);
+            process::exit(1);
+        });
 
     // Type and borrow check
     let tc_errors = type_checker::check(&file);

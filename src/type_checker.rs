@@ -15,6 +15,9 @@
 //!   - Functions with a non-unit return type must return on all paths.
 //!   - The last expression of a block is checked against the return type
 //!     (implicit tail-expression return).
+//!   - Module visibility: items inside a `mod` are private by default;
+//!     only `pub`-marked items and fields are accessible from outside
+//!     their declaring module.
 //!
 //! Phase 2 - borrow checker (minimal):
 //!   Track ownership of non-Copy named types per scope frame. Checks:
@@ -56,9 +59,16 @@ pub struct TyEnv {
     pub type_aliases: HashMap<String, Ty>,
     /// Trait declarations, for dyn method resolution and impl checking.
     pub traits: HashMap<String, TraitDecl>,
+    /// Qualified name -> module prefix it belongs to (only for items inside a mod).
+    pub item_module: HashMap<String, String>,
+    /// Set of qualified names inside a module that are marked `pub`.
+    pub pub_items: HashSet<String>,
+    /// Struct qualified name -> set of pub field names.
+    pub pub_fields: HashMap<String, HashSet<String>>,
 }
 
 impl TyEnv {
+    /// Build the global type environment by scanning all top-level items in the file.
     pub fn build(file: &File) -> Self {
         let mut env = Self {
             structs: HashMap::new(),
@@ -66,20 +76,48 @@ impl TyEnv {
             fns: HashMap::new(),
             type_aliases: HashMap::new(),
             traits: HashMap::new(),
+            item_module: HashMap::new(),
+            pub_items: HashSet::new(),
+            pub_fields: HashMap::new(),
         };
         env.collect_items(&file.items, "");
         env
     }
 
+    /// Recursively collect declarations from `items` into the environment.
+    /// `prefix` is the module path so far (e.g. `"math_"` for items inside `mod math`).
+    /// Populates `structs`, `enums`, `fns`, `type_aliases`, `traits`,
+    /// `item_module`, `pub_items`, and `pub_fields`.
     fn collect_items(&mut self, items: &[Item], prefix: &str) {
+        let in_mod = !prefix.is_empty();
         for item in items {
             match item {
                 Item::Struct(s) => {
-                    self.structs
-                        .insert(format!("{prefix}{}", s.name), s.clone());
+                    let full = format!("{prefix}{}", s.name);
+                    if in_mod {
+                        self.item_module.insert(full.clone(), prefix.to_string());
+                        if s.is_pub {
+                            self.pub_items.insert(full.clone());
+                        }
+                    }
+                    // Track pub fields for visibility checking.
+                    let pub_set: HashSet<String> = s
+                        .fields
+                        .iter()
+                        .filter(|f| f.is_pub)
+                        .map(|f| f.name.clone())
+                        .collect();
+                    self.pub_fields.insert(full.clone(), pub_set);
+                    self.structs.insert(full, s.clone());
                 }
                 Item::Enum(e) => {
                     let full = format!("{prefix}{}", e.name);
+                    if in_mod {
+                        self.item_module.insert(full.clone(), prefix.to_string());
+                        if e.is_pub {
+                            self.pub_items.insert(full.clone());
+                        }
+                    }
                     self.enums.insert(full.clone(), e.clone());
                     // Register variant constructors as functions.
                     for v in &e.variants {
@@ -97,11 +135,23 @@ impl TyEnv {
                 }
                 Item::Fn(f) => {
                     let name = format!("{prefix}{}", f.name);
+                    if in_mod {
+                        self.item_module.insert(name.clone(), prefix.to_string());
+                        if f.is_pub {
+                            self.pub_items.insert(name.clone());
+                        }
+                    }
                     let params = f.params.iter().map(|p| p.ty.clone()).collect();
                     self.fns.insert(name, (params, f.return_ty.clone()));
                 }
                 Item::Trait(t) => {
                     let full = format!("{prefix}{}", t.name);
+                    if in_mod {
+                        self.item_module.insert(full.clone(), prefix.to_string());
+                        if t.is_pub {
+                            self.pub_items.insert(full.clone());
+                        }
+                    }
                     let mut trait_clone = t.clone();
                     trait_clone.name = full.clone();
                     self.traits.insert(full, trait_clone);
@@ -110,31 +160,57 @@ impl TyEnv {
                     let type_name = format!("{prefix}{}", imp.type_name);
                     for m in &imp.methods {
                         let ret_ty = m.return_ty.resolve_self(&type_name);
+                        let mangled = format!("{type_name}_{}", m.name);
+                        if in_mod {
+                            self.item_module.insert(mangled.clone(), prefix.to_string());
+                            if m.is_pub {
+                                self.pub_items.insert(mangled.clone());
+                            }
+                        }
                         if imp.trait_name.is_some() {
-                            // Trait impl methods: also register under TypeName_method for
-                            // unambiguous resolution when calling on concrete types.
-                            let mangled = format!("{type_name}_{}", m.name);
-                            // Only insert if there's no inherent method with the same name.
                             self.fns.entry(mangled).or_insert_with(|| {
-                                let params = m.params.iter().map(|p| p.ty.resolve_self(&type_name)).collect();
+                                let params = m
+                                    .params
+                                    .iter()
+                                    .map(|p| p.ty.resolve_self(&type_name))
+                                    .collect();
                                 (params, ret_ty)
                             });
                         } else {
-                            let mangled = format!("{type_name}_{}", m.name);
-                            let params = m.params.iter().map(|p| p.ty.resolve_self(&type_name)).collect();
+                            let params = m
+                                .params
+                                .iter()
+                                .map(|p| p.ty.resolve_self(&type_name))
+                                .collect();
                             self.fns.insert(mangled, (params, ret_ty));
                         }
                     }
                 }
-                Item::TypeAlias { name, ty } => {
-                    self.type_aliases
-                        .insert(format!("{prefix}{name}"), ty.clone());
+                Item::TypeAlias { name, ty, is_pub } => {
+                    let full = format!("{prefix}{name}");
+                    if in_mod {
+                        self.item_module.insert(full.clone(), prefix.to_string());
+                        if *is_pub {
+                            self.pub_items.insert(full.clone());
+                        }
+                    }
+                    self.type_aliases.insert(full, ty.clone());
                 }
                 Item::Mod {
                     name,
                     items: mod_items,
+                    is_pub,
                 } => {
-                    self.collect_items(mod_items, &format!("{prefix}{name}_"));
+                    let mod_prefix = format!("{prefix}{name}_");
+                    if in_mod {
+                        // Track the mod itself as an item for visibility of the mod name.
+                        let full = format!("{prefix}{name}");
+                        self.item_module.insert(full.clone(), prefix.to_string());
+                        if *is_pub {
+                            self.pub_items.insert(full);
+                        }
+                    }
+                    self.collect_items(mod_items, &mod_prefix);
                 }
                 Item::Skip => {}
             }
@@ -165,6 +241,7 @@ impl TyEnv {
 // Per-function variable scope
 // ===========================================================================
 
+/// Information stored for each local variable during type checking.
 #[derive(Clone)]
 struct VarInfo {
     ty: Ty,
@@ -172,6 +249,8 @@ struct VarInfo {
     moved: bool,
 }
 
+/// Lexically-scoped variable map: a stack of frames, one per block.
+/// Looking up a name searches from the innermost frame outward.
 #[derive(Clone)]
 struct Scope {
     frames: Vec<HashMap<String, VarInfo>>,
@@ -191,6 +270,7 @@ impl Scope {
         self.frames.pop();
     }
 
+    /// Define a new variable in the innermost frame.
     fn insert(&mut self, name: String, ty: Ty, mutable: bool) {
         self.frames.last_mut().unwrap().insert(
             name,
@@ -202,6 +282,7 @@ impl Scope {
         );
     }
 
+    /// Look up a variable by name, searching from the innermost frame outward.
     fn lookup(&self, name: &str) -> Option<&VarInfo> {
         for frame in self.frames.iter().rev() {
             if let Some(v) = frame.get(name) {
@@ -216,10 +297,16 @@ impl Scope {
 // Phase 1 — Type checker
 // ===========================================================================
 
+/// Walks the AST and emits type errors. Visibility violations are also reported here.
+/// Errors are accumulated in `errors`; `cur_loc` tracks the current source location
+/// for error messages. `cur_mod` is the module prefix of the item being checked
+/// (e.g. `"math_"` for items in `mod math { }`, or `""` at top level).
 struct TypeChecker {
     env: TyEnv,
     errors: Vec<Error>,
     cur_loc: Loc,
+    /// Module prefix of the function/item currently being checked (e.g. "math_" or "").
+    cur_mod: String,
 }
 
 impl TypeChecker {
@@ -228,11 +315,45 @@ impl TypeChecker {
             env,
             errors: Vec::new(),
             cur_loc: Loc::default(),
+            cur_mod: String::new(),
         }
     }
 
     fn err(&mut self, msg: impl Into<String>) {
         self.errors.push(Error::new(self.cur_loc, msg));
+    }
+
+    /// Check whether `name` (a fully-qualified item) is accessible from `cur_mod`.
+    /// Items NOT inside any module are always accessible.
+    /// Items inside a module are accessible only if:
+    ///   (a) the caller is in the same module or a descendant, OR
+    ///   (b) the item is marked pub.
+    fn check_item_visibility(&mut self, name: &str) {
+        if let Some(item_mod) = self.env.item_module.get(name).cloned() {
+            let accessible =
+                self.cur_mod.starts_with(item_mod.as_str()) || self.env.pub_items.contains(name);
+            if !accessible {
+                self.err(format!("`{name}` is private"));
+            }
+        }
+    }
+
+    /// Check that `field` of struct `struct_name` is accessible from `cur_mod`.
+    fn check_field_visibility(&mut self, struct_name: &str, field: &str) {
+        // Only enforce if the struct is inside a module.
+        if let Some(struct_mod) = self.env.item_module.get(struct_name).cloned() {
+            if !self.cur_mod.starts_with(struct_mod.as_str()) {
+                // We're outside the struct's module: field must be pub.
+                let is_pub = self
+                    .env
+                    .pub_fields
+                    .get(struct_name)
+                    .is_some_and(|s| s.contains(field));
+                if !is_pub {
+                    self.err(format!("field `{field}` of `{struct_name}` is private"));
+                }
+            }
+        }
     }
 
     /// Resolve type alias chain (cycle-safe).
@@ -249,13 +370,16 @@ impl TypeChecker {
     // Item traversal
     // -----------------------------------------------------------------------
 
+    /// Entry point: validate item declarations then type-check all function bodies.
     fn check_file(&mut self, file: &File) {
         self.validate_items(&file.items, "");
         self.check_items(&file.items, "");
     }
 
-    /// Validate that all named types in declarations exist.
+    /// Walk all item declarations and verify that every named type reference
+    /// resolves to a known struct, enum, or alias, and that impl targets exist.
     fn validate_items(&mut self, items: &[Item], prefix: &str) {
+        let saved_cur_mod = std::mem::replace(&mut self.cur_mod, prefix.to_string());
         for item in items {
             match item {
                 Item::Struct(s) => {
@@ -335,15 +459,18 @@ impl TypeChecker {
                 Item::Mod {
                     name,
                     items: mod_items,
+                    ..
                 } => {
                     self.validate_items(mod_items, &format!("{prefix}{name}_"));
+                    self.cur_mod = prefix.to_string();
                 }
                 Item::Skip => {}
             }
         }
+        self.cur_mod = saved_cur_mod;
     }
 
-    /// Check that a type's Named variants refer to declared types.
+    /// Check that a type's Named variants refer to declared types, and are accessible.
     fn validate_ty(&mut self, ty: &Ty) {
         match ty {
             Ty::Named(name) => {
@@ -352,11 +479,15 @@ impl TypeChecker {
                     && !self.env.type_aliases.contains_key(name)
                 {
                     self.err(format!("unknown type `{name}`"));
+                } else {
+                    self.check_item_visibility(name);
                 }
             }
             Ty::DynTrait(name) => {
                 if !self.env.traits.contains_key(name) {
                     self.err(format!("unknown trait `{name}`"));
+                } else {
+                    self.check_item_visibility(name);
                 }
             }
             Ty::Array(inner, _) | Ty::Slice(inner) => self.validate_ty(inner),
@@ -377,19 +508,29 @@ impl TypeChecker {
         }
     }
 
+    /// Recursively type-check all function bodies in `items`.
+    /// `prefix` is the current module path (e.g. `"math_"`), stored in `cur_mod`
+    /// so that visibility checks know what module is doing the calling.
     fn check_items(&mut self, items: &[Item], prefix: &str) {
         for item in items {
             match item {
-                Item::Fn(f) => self.check_fn(f, None, prefix),
+                Item::Fn(f) => {
+                    let saved = std::mem::replace(&mut self.cur_mod, prefix.to_string());
+                    self.check_fn(f, None, prefix);
+                    self.cur_mod = saved;
+                }
                 Item::Impl(imp) => {
                     let type_name = format!("{prefix}{}", imp.type_name);
+                    let saved = std::mem::replace(&mut self.cur_mod, prefix.to_string());
                     for m in &imp.methods {
                         self.check_fn(m, Some(&type_name.clone()), "");
                     }
+                    self.cur_mod = saved;
                 }
                 Item::Mod {
                     name,
                     items: mod_items,
+                    ..
                 } => {
                     self.check_items(mod_items, &format!("{prefix}{name}_"));
                 }
@@ -402,6 +543,10 @@ impl TypeChecker {
     // Function and block checking
     // -----------------------------------------------------------------------
 
+    /// Type-check a single function or method body.
+    /// `impl_type` is the mangled name of the implementing type for methods (used to
+    /// resolve `Self` and insert the `self` receiver into scope).
+    /// `prefix` is the module prefix used for name resolution within the body.
     fn check_fn(&mut self, f: &FnDecl, impl_type: Option<&str>, prefix: &str) {
         let mut scope = Scope::new();
 
@@ -442,12 +587,16 @@ impl TypeChecker {
         }
     }
 
+    /// Type-check a block, pushing and popping a scope frame around it.
     fn check_block(&mut self, block: &Block, scope: &mut Scope, return_ty: &Ty) {
         scope.push();
         self.check_block_stmts(&block.stmts, scope, return_ty);
         scope.pop();
     }
 
+    /// Type-check a list of statements.
+    /// The final bare `Expr` statement is treated as an implicit return and is
+    /// checked against `return_ty` directly.
     fn check_block_stmts(&mut self, stmts: &[Stmt], scope: &mut Scope, return_ty: &Ty) {
         for (i, stmt) in stmts.iter().enumerate() {
             let is_last = i + 1 == stmts.len();
@@ -631,6 +780,8 @@ impl TypeChecker {
         }
     }
 
+    /// Type-check a single match arm: bind pattern variables into a new scope frame
+    /// and check the arm body's statements against `return_ty`.
     fn check_arm(&mut self, arm: &MatchArm, scrutinee_ty: &Ty, scope: &mut Scope, return_ty: &Ty) {
         scope.push();
 
@@ -716,6 +867,10 @@ impl TypeChecker {
     // Expression type inference
     // -----------------------------------------------------------------------
 
+    /// Infer the type of `expr` and return it. Also enforces visibility on every
+    /// named item referenced (struct, function, field). Errors are accumulated via
+    /// `self.err()`; on error, a best-effort fallback type (`Ty::Unit`) is returned
+    /// so checking can continue and collect multiple errors in one pass.
     fn infer_expr(&mut self, expr: &Expr, scope: &Scope) -> Ty {
         self.cur_loc = expr.loc;
         match &expr.kind {
@@ -774,8 +929,12 @@ impl TypeChecker {
             ExprKind::Index { expr, index } => {
                 // Range index `arr[lo..hi]` produces a slice.
                 if let ExprKind::Range { start, end } = &index.kind {
-                    if let Some(e) = start { self.infer_expr(e, scope); }
-                    if let Some(e) = end   { self.infer_expr(e, scope); }
+                    if let Some(e) = start {
+                        self.infer_expr(e, scope);
+                    }
+                    if let Some(e) = end {
+                        self.infer_expr(e, scope);
+                    }
                     let arr = self.infer_expr(expr, scope);
                     return match arr {
                         Ty::Array(inner, _) | Ty::Slice(inner) => Ty::Slice(inner),
@@ -803,16 +962,23 @@ impl TypeChecker {
             }
 
             ExprKind::Range { start, end } => {
-                if let Some(e) = start { self.infer_expr(e, scope); }
-                if let Some(e) = end   { self.infer_expr(e, scope); }
+                if let Some(e) = start {
+                    self.infer_expr(e, scope);
+                }
+                if let Some(e) = end {
+                    self.infer_expr(e, scope);
+                }
                 Ty::I64 // ranges are integer-valued by default
             }
 
             ExprKind::StructLit { name, fields } => {
+                self.check_item_visibility(name);
                 if let Some(s) = self.env.structs.get(name).cloned() {
                     let provided: HashSet<&str> = fields.iter().map(|(n, _)| n.as_str()).collect();
                     for (fname, fexpr) in fields {
                         let got = self.infer_expr(fexpr, scope);
+                        // Check field visibility on construction.
+                        self.check_field_visibility(name, fname);
                         if let Some(fd) = s.fields.iter().find(|f| f.name == *fname) {
                             if !self.compat(&got, &fd.ty) {
                                 self.err(format!(
@@ -892,9 +1058,11 @@ impl TypeChecker {
                     Ty::Named(type_name.clone())
                 } else if let Some(s) = self.env.structs.get(&mangled).cloned() {
                     // Module-qualified struct literal: mod::Struct { ... }
+                    self.check_item_visibility(&mangled);
                     let provided: HashSet<&str> = fields.iter().map(|(n, _)| n.as_str()).collect();
                     for (fname, fexpr) in fields {
                         let got = self.infer_expr(fexpr, scope);
+                        self.check_field_visibility(&mangled, fname);
                         if let Some(fd) = s.fields.iter().find(|f| f.name == *fname) {
                             if !self.compat(&got, &fd.ty) {
                                 self.err(format!(
@@ -938,12 +1106,28 @@ impl TypeChecker {
                         }
                     }
                 } else {
+                    // Check field visibility.
+                    let sname = match &ty {
+                        Ty::Named(n) => Some(n.clone()),
+                        Ty::Ref(inner) => {
+                            if let Ty::Named(n) = inner.as_ref() {
+                                Some(n.clone())
+                            } else {
+                                None
+                            }
+                        }
+                        _ => None,
+                    };
+                    if let Some(sname) = sname {
+                        self.check_field_visibility(&sname, field);
+                    }
                     self.lookup_field_ty(&ty, field)
                 }
             }
 
             ExprKind::Call { name, args } => {
                 if let Some((param_tys, ret_ty)) = self.env.fns.get(name).cloned() {
+                    self.check_item_visibility(name);
                     self.check_call_args(name, args, &param_tys, scope);
                     ret_ty
                 } else if let Some(vi) = scope.lookup(name) {
@@ -978,6 +1162,7 @@ impl TypeChecker {
             } => {
                 let mangled = format!("{type_name}_{method}");
                 if let Some((param_tys, ret_ty)) = self.env.fns.get(&mangled).cloned() {
+                    self.check_item_visibility(&mangled);
                     self.check_call_args(&mangled, args, &param_tys, scope);
                     ret_ty
                 } else if self.env.enums.get(type_name.as_str()).is_some_and(|e| {
@@ -1021,6 +1206,7 @@ impl TypeChecker {
                 if let Some(type_name) = base_type_name(&recv_r) {
                     let mangled = format!("{type_name}_{method}");
                     if let Some((param_tys, ret_ty)) = self.env.fns.get(&mangled).cloned() {
+                        self.check_item_visibility(&mangled);
                         self.check_call_args(&mangled, args, &param_tys, scope);
                         ret_ty
                     } else {
@@ -1120,6 +1306,8 @@ impl TypeChecker {
         }
     }
 
+    /// Verify argument count and types for a function call.
+    /// Arguments are inferred even on arity mismatch so subsequent errors are still caught.
     fn check_call_args(&mut self, name: &str, args: &[Expr], param_tys: &[Ty], scope: &Scope) {
         if args.len() != param_tys.len() {
             self.err(format!(
@@ -1145,6 +1333,8 @@ impl TypeChecker {
         }
     }
 
+    /// Return the type of `field` on `ty`, or emit an error and return `Ty::Unit`.
+    /// Resolves type aliases before looking up the struct declaration.
     fn lookup_field_ty(&mut self, ty: &Ty, field: &str) -> Ty {
         let ty_r = self.resolve(ty);
         if let Some(name) = base_type_name(&ty_r)
@@ -1168,6 +1358,8 @@ impl TypeChecker {
         Ty::Unit
     }
 
+    /// Infer the type of an lvalue expression (for compound assignment type checking).
+    /// Returns `None` for expressions that are not valid lvalues.
     fn infer_lvalue(&mut self, expr: &Expr, scope: &Scope) -> Option<Ty> {
         match &expr.kind {
             ExprKind::Var(name) => scope.lookup(name).map(|vi| vi.ty.clone()),
@@ -1202,6 +1394,9 @@ impl TypeChecker {
         }
     }
 
+    /// Check operand types for a binary operator and return the result type.
+    /// Resolves aliases on both sides before checking. Returns the LHS type for
+    /// arithmetic/bitwise ops and `Ty::Bool` for comparisons and logical ops.
     fn check_binop(&mut self, op: BinOp, lty: &Ty, rty: &Ty) -> Ty {
         let lty_r = self.resolve(lty);
         let rty_r = self.resolve(rty);
@@ -1292,15 +1487,16 @@ fn block_definitely_returns(block: &Block) -> bool {
 //   moved   — whether a non-Copy value has been moved out
 //
 // Rules enforced:
-//   - Assign to immutable variable  →  error
-//   - &mut x where x is not `let mut`  →  error
-//   - Use of a moved Named-type variable  →  error
-//   - Passing a Named-type variable by value to a function  →  marks it moved
+//   - Assign to immutable variable  ->  error
+//   - &mut x where x is not `let mut`  ->  error
+//   - Use of a moved Named-type variable  ->  error
+//   - Passing a Named-type variable by value to a function  ->  marks it moved
 //
 // NOT yet enforced:
 //   - Shared-vs-mutable borrow conflicts across statements (future phase).
 //   - Move of partially borrowed data.
 
+/// Per-variable information used by the borrow checker.
 #[derive(Clone)]
 struct BVar {
     ty: Ty,
@@ -1351,6 +1547,9 @@ impl BScope {
     }
 }
 
+/// Minimal borrow checker. Runs after the type checker (only when there are no
+/// type errors) and enforces move semantics, mutability, and intra-statement
+/// borrow conflicts. See module-level doc for the full list of rules.
 struct BorrowChecker {
     env: TyEnv,
     errors: Vec<Error>,
@@ -1387,6 +1586,7 @@ impl BorrowChecker {
                 Item::Mod {
                     name,
                     items: mod_items,
+                    ..
                 } => {
                     self.check_items(mod_items, &format!("{prefix}{name}_"));
                 }
@@ -1432,6 +1632,8 @@ impl BorrowChecker {
         scope.pop();
     }
 
+    /// Walk statements, running `collect_borrows` before each statement to detect
+    /// intra-statement borrow conflicts (e.g. `foo(&x, &mut x)`).
     fn check_stmts(&mut self, stmts: &[Stmt], scope: &mut BScope) {
         for stmt in stmts {
             // Detect intra-statement borrow conflicts before full check.
@@ -1548,7 +1750,11 @@ impl BorrowChecker {
                 self.check_expr(iter, scope, false);
                 scope.insert(
                     var.clone(),
-                    BVar { ty: Ty::Unit, mutable: false, moved: false },
+                    BVar {
+                        ty: Ty::Unit,
+                        mutable: false,
+                        moved: false,
+                    },
                 );
                 self.check_block(body, scope);
             }
@@ -1724,8 +1930,12 @@ impl BorrowChecker {
                 self.check_expr(index, scope, false);
             }
             ExprKind::Range { start, end } => {
-                if let Some(e) = start { self.check_expr(e, scope, false); }
-                if let Some(e) = end   { self.check_expr(e, scope, false); }
+                if let Some(e) = start {
+                    self.check_expr(e, scope, false);
+                }
+                if let Some(e) = end {
+                    self.check_expr(e, scope, false);
+                }
             }
             ExprKind::Cast { expr, .. } => self.check_expr(expr, scope, false),
             ExprKind::StructLit { fields, .. } => {
@@ -1827,8 +2037,12 @@ impl BorrowChecker {
                 self.collect_borrows(index, shared, muts);
             }
             ExprKind::Range { start, end } => {
-                if let Some(e) = start { self.collect_borrows(e, shared, muts); }
-                if let Some(e) = end   { self.collect_borrows(e, shared, muts); }
+                if let Some(e) = start {
+                    self.collect_borrows(e, shared, muts);
+                }
+                if let Some(e) = end {
+                    self.collect_borrows(e, shared, muts);
+                }
             }
             _ => {}
         }
@@ -1839,6 +2053,7 @@ impl BorrowChecker {
 // Helper predicates and formatters
 // ===========================================================================
 
+/// True if `ty` is an integer type (signed or unsigned, any width).
 fn is_integer(ty: &Ty) -> bool {
     matches!(
         ty,
@@ -1855,14 +2070,17 @@ fn is_integer(ty: &Ty) -> bool {
     )
 }
 
+/// True if `ty` is a floating-point type.
 fn is_float(ty: &Ty) -> bool {
     matches!(ty, Ty::F32 | Ty::F64)
 }
 
+/// True if `ty` is any numeric type (integer or float).
 fn is_numeric(ty: &Ty) -> bool {
     is_integer(ty) || is_float(ty)
 }
 
+/// True if `ty` is a reference or raw pointer (used to decide pass-by-ref in borrow check).
 fn is_ref_ty(ty: &Ty) -> bool {
     matches!(
         ty,
@@ -1871,13 +2089,17 @@ fn is_ref_ty(ty: &Ty) -> bool {
 }
 
 /// Named types (structs and enums) are non-Copy in v1.
-/// All primitive types, references, raw pointers, arrays, tuples are Copy.
+/// All primitive types, references, raw pointers, arrays, and tuples are Copy.
+/// Currently returns false for everything because the C backend copies structs
+/// by value, so treating them as Copy is safe for now.
 fn is_non_copy(_ty: &Ty) -> bool {
     // In v1 everything is treated as Copy: the C backend copies structs by value anyway.
     false
 }
 
 /// Type compatibility: `got` is acceptable where `expected` is required.
+/// Handles widening coercions (integer/float literals, Never, &mut -> &, etc.)
+/// and structural compat for arrays, tuples, and function pointers.
 fn ty_compat(got: &Ty, expected: &Ty) -> bool {
     if got == expected {
         return true;
@@ -1936,7 +2158,8 @@ fn ty_compat(got: &Ty, expected: &Ty) -> bool {
     false
 }
 
-/// Extract the base struct/enum name from a type (for field and method lookup).
+/// Extract the base struct/enum name from a type, peeling through references.
+/// Used for field and method resolution (e.g. `&Point` -> `"Point"`).
 fn base_type_name(ty: &Ty) -> Option<String> {
     match ty {
         Ty::Named(n) => Some(n.clone()),
