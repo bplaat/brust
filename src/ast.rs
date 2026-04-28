@@ -11,6 +11,7 @@ pub enum Item {
     Fn(FnDecl),
     Struct(StructDecl),
     Impl(ImplBlock),
+    Trait(TraitDecl),
     Enum(EnumDecl),
     TypeAlias { name: String, ty: Ty },
     Mod { name: String, items: Vec<Item> },
@@ -52,7 +53,25 @@ pub enum VariantFields {
 
 pub struct ImplBlock {
     pub type_name: String,
+    /// `Some("Foo")` for `impl Foo for Bar`, `None` for plain `impl Bar`.
+    pub trait_name: Option<String>,
     pub methods: Vec<FnDecl>,
+}
+
+/// Trait declaration: `trait Foo { fn method(&self, ...) -> Ty; }`.
+#[derive(Clone)]
+pub struct TraitDecl {
+    pub name: String,
+    pub methods: Vec<TraitMethodSig>,
+}
+
+/// A method signature inside a trait declaration (no body).
+#[derive(Clone)]
+pub struct TraitMethodSig {
+    pub name: String,
+    pub receiver: Receiver,
+    pub params: Vec<Param>,
+    pub return_ty: Ty,
 }
 
 pub struct FnDecl {
@@ -65,12 +84,14 @@ pub struct FnDecl {
 }
 
 /// How `self` is received in a method.
+#[derive(Clone)]
 pub enum Receiver {
     Value,  // self
     Ref,    // &self
     RefMut, // &mut self
 }
 
+#[derive(Clone)]
 pub struct Param {
     pub name: String,
     pub ty: Ty,
@@ -107,6 +128,7 @@ pub enum Ty {
     FnPtr { params: Vec<Ty>, ret: Box<Ty> }, // fn(T0, T1) -> Ret
     // User-defined and pointer types
     Named(String),     // user-defined struct/enum
+    DynTrait(String),  // dyn TraitName — fat pointer {data, vtable}
     Ref(Box<Ty>),      // &T
     RefMut(Box<Ty>),   // &mut T
     RawConst(Box<Ty>), // *const T

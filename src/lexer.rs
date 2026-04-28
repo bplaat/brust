@@ -28,6 +28,8 @@ pub enum TokenKind {
     Type,
     Mod,
     Pub,
+    Trait,
+    Dyn,
     // Identifiers and literals
     Ident(String),
     IntLit(i64),
@@ -501,6 +503,8 @@ impl<'a> Lexer<'a> {
             "type" => TokenKind::Type,
             "mod" => TokenKind::Mod,
             "pub" => TokenKind::Pub,
+            "trait" => TokenKind::Trait,
+            "dyn" => TokenKind::Dyn,
             _ => TokenKind::Ident(name),
         }
     }
