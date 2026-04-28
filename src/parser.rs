@@ -6,7 +6,7 @@ use crate::ast::{
 use crate::error::Error;
 use crate::lexer::{Token, TokenKind};
 use crate::loc::Loc;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 pub struct Parser {
     tokens: Vec<Token>,
@@ -15,6 +15,8 @@ pub struct Parser {
     current_mod: Option<String>,
     /// Names declared at the top level of the current mod block (types + fns).
     mod_local_names: HashSet<String>,
+    /// Use-alias table: short name -> brust internal (underscore-joined) name.
+    use_aliases: HashMap<String, String>,
 }
 
 impl Parser {
@@ -24,6 +26,7 @@ impl Parser {
             pos: 0,
             current_mod: None,
             mod_local_names: HashSet::new(),
+            use_aliases: HashMap::new(),
         }
     }
 
@@ -79,7 +82,92 @@ impl Parser {
         name
     }
 
-    pub fn parse(mut self) -> Result<File, Error> {
+    /// Resolve a name: check use-aliases first, then apply module qualification.
+    fn resolve_name(&self, name: String) -> String {
+        if let Some(aliased) = self.use_aliases.get(&name) {
+            return aliased.clone();
+        }
+        self.qualify(name)
+    }
+
+    /// Parse a path segment: an identifier or `self` keyword.
+    fn parse_use_segment(&mut self) -> Result<String, Error> {
+        let tok = self.peek().clone();
+        match &tok.kind {
+            TokenKind::Ident(name) => {
+                let n = name.clone();
+                self.advance();
+                Ok(n)
+            }
+            TokenKind::SelfKw => {
+                self.advance();
+                Ok("self".to_string())
+            }
+            _ => Err(Error::new(
+                tok.loc,
+                format!("expected path segment, got {:?}", tok.kind),
+            )),
+        }
+    }
+
+    /// Parse a `use` path and populate `self.use_aliases`.
+    /// Handles: `a::b::C`, `a::{B, C}`, `a::*`, `a::b as D`.
+    fn parse_use_path(&mut self, prefix: &[String]) -> Result<(), Error> {
+        let seg = self.parse_use_segment()?;
+        // Strip crate-root and super markers (treat as root-relative).
+        if seg == "crate" || seg == "super" || seg == "self" {
+            if self.peek().kind == TokenKind::ColonColon {
+                self.advance();
+                return self.parse_use_path(prefix);
+            }
+            return Ok(());
+        }
+        let mut path = prefix.to_vec();
+        path.push(seg);
+
+        if self.peek().kind == TokenKind::ColonColon {
+            self.advance();
+            if self.peek().kind == TokenKind::LBrace {
+                // Group: use a::{B, C, ...}
+                self.advance();
+                loop {
+                    if self.peek().kind == TokenKind::RBrace {
+                        break;
+                    }
+                    if self.peek().kind == TokenKind::Star {
+                        // Glob: skip (no aliases registered)
+                        self.advance();
+                    } else {
+                        self.parse_use_path(&path)?;
+                    }
+                    if self.peek().kind == TokenKind::Comma {
+                        self.advance();
+                    } else {
+                        break;
+                    }
+                }
+                self.expect(&TokenKind::RBrace)?;
+            } else if self.peek().kind == TokenKind::Star {
+                // Glob import: skip
+                self.advance();
+            } else {
+                self.parse_use_path(&path)?;
+            }
+        } else {
+            // Leaf segment: register alias.
+            let alias = if self.peek().kind == TokenKind::As {
+                self.advance();
+                self.expect_ident()?
+            } else {
+                path.last().unwrap().clone()
+            };
+            let target = path.join("_");
+            self.use_aliases.insert(alias, target);
+        }
+        Ok(())
+    }
+
+    pub fn parse_file(&mut self) -> Result<File, Error> {
         let mut items = Vec::new();
         while !self.at_eof() {
             items.push(self.parse_item()?);
@@ -153,6 +241,54 @@ impl Parser {
                 let ty = self.parse_ty()?;
                 self.expect(&TokenKind::Semicolon)?;
                 Ok(Item::TypeAlias { name, ty })
+            }
+            TokenKind::Use => {
+                self.advance();
+                self.parse_use_path(&[])?;
+                self.expect(&TokenKind::Semicolon)?;
+                Ok(Item::Skip)
+            }
+            TokenKind::Extern => {
+                // extern crate foo; or extern "C" { ... } -- skip both forms.
+                self.advance();
+                // Skip to `;` or consume a block `{ ... }`.
+                loop {
+                    match self.peek().kind.clone() {
+                        TokenKind::Semicolon => {
+                            self.advance();
+                            break;
+                        }
+                        TokenKind::LBrace => {
+                            self.advance();
+                            let mut depth = 1usize;
+                            loop {
+                                match self.peek().kind.clone() {
+                                    TokenKind::LBrace => {
+                                        depth += 1;
+                                        self.advance();
+                                    }
+                                    TokenKind::RBrace => {
+                                        depth -= 1;
+                                        self.advance();
+                                        if depth == 0 {
+                                            break;
+                                        }
+                                    }
+                                    TokenKind::Eof => break,
+                                    _ => {
+                                        self.advance();
+                                    }
+                                }
+                            }
+                            break;
+                        }
+                        TokenKind::Eof => break,
+                        _ => {
+                            self.advance();
+                        }
+                    }
+                }
+                Ok(Item::Skip)
             }
             TokenKind::Mod => {
                 self.advance();
@@ -484,7 +620,7 @@ impl Parser {
             TokenKind::Dyn => {
                 self.advance();
                 let trait_name = self.expect_ident()?;
-                Ok(Ty::DynTrait(self.qualify(trait_name)))
+                Ok(Ty::DynTrait(self.resolve_name(trait_name)))
             }
             TokenKind::Ident(name) => {
                 let ty = match name.as_str() {
@@ -503,16 +639,28 @@ impl Parser {
                     "bool" => Ty::Bool,
                     "char" => Ty::Char,
                     "str" => Ty::Str,
+                    "Self" => {
+                        self.advance();
+                        return Ok(Ty::SelfTy);
+                    }
                     name => {
                         let base = name.to_string();
                         self.advance();
                         if self.peek().kind == TokenKind::ColonColon {
                             self.advance();
                             let type_name = self.expect_ident()?;
-                            return Ok(Ty::Named(format!("{base}_{type_name}")));
+                            // Handle additional segments (e.g. std::fmt::Display).
+                            let mut qualified = format!("{base}_{type_name}");
+                            while self.peek().kind == TokenKind::ColonColon {
+                                self.advance();
+                                let next = self.expect_ident()?;
+                                qualified = format!("{qualified}_{next}");
+                            }
+                            // Apply alias lookup on the fully-qualified name's last segment.
+                            return Ok(Ty::Named(qualified));
                         }
-                        // Inside a mod block, auto-qualify locally-declared type names.
-                        return Ok(Ty::Named(self.qualify(base)));
+                        // Check use-alias table, then apply module qualification.
+                        return Ok(Ty::Named(self.resolve_name(base)));
                     }
                 };
                 self.advance();
@@ -877,11 +1025,11 @@ impl Parser {
                 let (type_name, variant) = if self.peek().kind == TokenKind::ColonColon {
                     self.advance();
                     let part3 = self.expect_ident()?;
-                    // Three-part: mod::Type::Variant — qualify mod if local
-                    (format!("{}_{part2}", self.qualify(type_name)), part3)
+                    // Three-part: mod::Type::Variant -- resolve mod if local/aliased
+                    (format!("{}_{part2}", self.resolve_name(type_name)), part3)
                 } else {
-                    // Two-part: Type::Variant — qualify Type if local
-                    (self.qualify(type_name), part2)
+                    // Two-part: Type::Variant -- resolve Type if local/aliased
+                    (self.resolve_name(type_name), part2)
                 };
                 let bindings = if self.peek().kind == TokenKind::LParen {
                     self.advance();
@@ -1455,8 +1603,8 @@ impl Parser {
                         self.advance();
                         let part3 = self.expect_ident()?;
                         // Three-part path: mod::Type::method or Type::Variant::field
-                        // Qualify the leading name if it is a local type name.
-                        let qualified = format!("{}_{part2}", self.qualify(name));
+                        // Resolve via alias table + module qualification.
+                        let qualified = format!("{}_{part2}", self.resolve_name(name));
                         if self.peek().kind == TokenKind::LParen {
                             let args = self.parse_call_args()?;
                             return Ok(Expr {
@@ -1503,8 +1651,8 @@ impl Parser {
                     }
 
                     // Two-part path: Type::method or Enum::Variant or mod::fn
-                    // Qualify the leading name if it refers to a local type.
-                    let type_name = self.qualify(name);
+                    // Resolve via alias table + module qualification.
+                    let type_name = self.resolve_name(name);
                     if self.peek().kind == TokenKind::LParen {
                         let args = self.parse_call_args()?;
                         Ok(Expr {
@@ -1551,8 +1699,8 @@ impl Parser {
                 } else if self.peek().kind == TokenKind::LBrace
                     && name.chars().next().is_some_and(|c| c.is_uppercase())
                 {
-                    // Struct literal: auto-qualify if it's a local type.
-                    let name = self.qualify(name);
+                    // Struct literal: resolve via alias table + module qualification.
+                    let name = self.resolve_name(name);
                     self.advance();
                     let mut fields = Vec::new();
                     while self.peek().kind != TokenKind::RBrace && !self.at_eof() {
@@ -1572,8 +1720,8 @@ impl Parser {
                         loc,
                     })
                 } else if self.peek().kind == TokenKind::LParen {
-                    // Function call: auto-qualify if it's a local function name.
-                    let name = self.qualify(name);
+                    // Function call: resolve via alias table + module qualification.
+                    let name = self.resolve_name(name);
                     let args = self.parse_call_args()?;
                     Ok(Expr {
                         kind: ExprKind::Call { name, args },
