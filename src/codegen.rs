@@ -719,16 +719,30 @@ impl Codegen {
             }
 
             StmtKind::For { var, iter, body } => {
-                // Emit as: for (size_t _i = 0; _i < sizeof(arr)/sizeof(arr[0]); _i++)
-                // The iterator expression must be an array; we use a C sizeof trick.
-                let iter_s = self.emit_expr(iter, ctx);
                 let p1 = "    ".repeat(indent + 1);
-                self.out.push_str(&format!(
-                    "{p}for (size_t _brust_i = 0; _brust_i < sizeof({iter_s})/sizeof({iter_s}[0]); _brust_i++) {{\n"
-                ));
-                self.out.push_str(&format!(
-                    "{p1}__auto_type {var} = {iter_s}[_brust_i];\n"
-                ));
+                // `for i in lo..hi` -- emit as a numeric C for-loop.
+                if let ExprKind::Range { start, end } = &iter.kind {
+                    let lo = start
+                        .as_deref()
+                        .map(|e| self.emit_expr(e, ctx))
+                        .unwrap_or_else(|| "0".to_string());
+                    let hi = end
+                        .as_deref()
+                        .map(|e| self.emit_expr(e, ctx))
+                        .unwrap_or_else(|| "/* unbounded */0".to_string());
+                    self.out.push_str(&format!(
+                        "{p}for (int64_t {var} = {lo}; {var} < {hi}; {var}++) {{\n"
+                    ));
+                } else {
+                    // Array/slice iterator: use sizeof trick.
+                    let iter_s = self.emit_expr(iter, ctx);
+                    self.out.push_str(&format!(
+                        "{p}for (size_t _brust_i = 0; _brust_i < sizeof({iter_s})/sizeof({iter_s}[0]); _brust_i++) {{\n"
+                    ));
+                    self.out.push_str(&format!(
+                        "{p1}__auto_type {var} = {iter_s}[_brust_i];\n"
+                    ));
+                }
                 for s in &body.stmts {
                     self.emit_stmt(s, ctx, indent + 1);
                 }
@@ -1023,12 +1037,23 @@ impl Codegen {
             }
 
             ExprKind::Index { expr, index } => {
-                format!(
-                    "{}[{}]",
-                    self.emit_expr(expr, ctx),
-                    self.emit_expr(index, ctx)
-                )
+                let expr_c = self.emit_expr(expr, ctx);
+                // `arr[lo..hi]` -- emit as pointer offset `(arr + lo)`.
+                // `arr[lo..]`   -- emit as `(arr + lo)`.
+                // `arr[..hi]`   -- emit as `arr` (pointer from start).
+                if let ExprKind::Range { start, end: _ } = &index.kind {
+                    let start_c = start
+                        .as_deref()
+                        .map(|e| self.emit_expr(e, ctx))
+                        .unwrap_or_else(|| "0".to_string());
+                    format!("({expr_c} + {start_c})")
+                } else {
+                    format!("{expr_c}[{}]", self.emit_expr(index, ctx))
+                }
             }
+
+            // `lo..hi` as a standalone expression -- unusual outside index/for but valid.
+            ExprKind::Range { .. } => "/* range */0".to_string(),
 
             ExprKind::Tuple(elems) if elems.is_empty() => "/* () */0".to_string(),
             ExprKind::Tuple(_) => self.emit_expr_hint(expr, ctx, None),
@@ -1642,6 +1667,14 @@ fn scan_expr(expr: &Expr, hint: Option<&Ty>, found: &mut Vec<Vec<Ty>>) {
         ExprKind::Cast { expr, ty } => {
             scan_expr(expr, None, found);
             scan_ty(ty, found);
+        }
+        ExprKind::Index { expr, index } => {
+            scan_expr(expr, None, found);
+            scan_expr(index, None, found);
+        }
+        ExprKind::Range { start, end } => {
+            if let Some(e) = start { scan_expr(e, None, found); }
+            if let Some(e) = end   { scan_expr(e, None, found); }
         }
         ExprKind::Unsafe(block) => scan_block(block, found),
         _ => {}

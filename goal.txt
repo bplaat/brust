@@ -38,7 +38,6 @@
 🟡 Medium — Can work around in a rewrite
 
 - Char methods: .is_ascii_digit(), .is_ascii_alphabetic(), .is_ascii_hexdigit()
-- Slice ranges: src[pos..pos+2]
 - u32::from_str_radix() for hex parsing
 - unwrap_or_else → can use match
 - #[derive(Clone, PartialEq, Debug)] — currently recognized but not enforced

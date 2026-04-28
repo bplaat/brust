@@ -760,6 +760,19 @@ impl TypeChecker {
             }
 
             ExprKind::Index { expr, index } => {
+                // Range index `arr[lo..hi]` produces a slice.
+                if let ExprKind::Range { start, end } = &index.kind {
+                    if let Some(e) = start { self.infer_expr(e, scope); }
+                    if let Some(e) = end   { self.infer_expr(e, scope); }
+                    let arr = self.infer_expr(expr, scope);
+                    return match arr {
+                        Ty::Array(inner, _) | Ty::Slice(inner) => Ty::Slice(inner),
+                        _ => {
+                            self.err(format!("cannot slice type `{}`", ty_display(&arr)));
+                            Ty::Unit
+                        }
+                    };
+                }
                 let idx = self.infer_expr(index, scope);
                 if !is_integer(&idx) {
                     self.err(format!(
@@ -775,6 +788,12 @@ impl TypeChecker {
                         Ty::Unit
                     }
                 }
+            }
+
+            ExprKind::Range { start, end } => {
+                if let Some(e) = start { self.infer_expr(e, scope); }
+                if let Some(e) = end   { self.infer_expr(e, scope); }
+                Ty::I64 // ranges are integer-valued by default
             }
 
             ExprKind::StructLit { name, fields } => {
@@ -1692,6 +1711,10 @@ impl BorrowChecker {
                 self.check_expr(expr, scope, true);
                 self.check_expr(index, scope, false);
             }
+            ExprKind::Range { start, end } => {
+                if let Some(e) = start { self.check_expr(e, scope, false); }
+                if let Some(e) = end   { self.check_expr(e, scope, false); }
+            }
             ExprKind::Cast { expr, .. } => self.check_expr(expr, scope, false),
             ExprKind::StructLit { fields, .. } => {
                 for (_, e) in fields {
@@ -1790,6 +1813,10 @@ impl BorrowChecker {
             ExprKind::Index { expr, index } => {
                 self.collect_borrows(expr, shared, muts);
                 self.collect_borrows(index, shared, muts);
+            }
+            ExprKind::Range { start, end } => {
+                if let Some(e) = start { self.collect_borrows(e, shared, muts); }
+                if let Some(e) = end   { self.collect_borrows(e, shared, muts); }
             }
             _ => {}
         }
