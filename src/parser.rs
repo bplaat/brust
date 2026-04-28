@@ -1,7 +1,7 @@
 use crate::ast::{
-    BinOp, Block, EnumDecl, EnumVariant, Expr, ExprKind, FieldDecl, File, FnDecl, ImplBlock, Item,
-    MatchArm, Param, Pat, PatBindings, Receiver, Stmt, StmtKind, StructDecl, TraitDecl,
-    TraitMethodSig, Ty, UnOp, VariantFields,
+    BinOp, Block, EnumDecl, EnumVariant, Expr, ExprKind, ExternFnDecl, FieldDecl, File, FnDecl,
+    ImplBlock, Item, MatchArm, Param, Pat, PatBindings, Receiver, Stmt, StmtKind, StructDecl,
+    TraitDecl, TraitMethodSig, Ty, UnOp, VariantFields,
 };
 use crate::error::Error;
 use crate::lexer::{Lexer, Token, TokenKind};
@@ -370,6 +370,20 @@ impl Parser {
             TokenKind::Impl => Ok(Item::Impl(self.parse_impl()?)),
             TokenKind::Trait => Ok(Item::Trait(self.parse_trait(is_pub)?)),
             TokenKind::Enum => Ok(Item::Enum(self.parse_enum(is_pub)?)),
+            // `unsafe fn` -- unsafe modifier on fn decl is accepted but ignored
+            // `unsafe extern "C" { ... }` -- extern block with unsafe prefix
+            TokenKind::Unsafe => {
+                self.advance();
+                let next = self.peek().clone();
+                match next.kind {
+                    TokenKind::Fn => Ok(Item::Fn(self.parse_fn(is_pub)?)),
+                    TokenKind::Extern => {
+                        self.advance();
+                        self.parse_extern_block(next.loc, is_pub, true)
+                    }
+                    _ => Err(Error::new(next.loc, format!("expected `fn` or `extern` after `unsafe`, got {:?}", next.kind))),
+                }
+            }
             TokenKind::Type => {
                 self.advance();
                 let name = self.expect_ident()?;
@@ -385,46 +399,8 @@ impl Parser {
                 Ok(Item::Skip)
             }
             TokenKind::Extern => {
-                // extern crate foo; / extern crate foo as bar; / extern "C" { ... }
                 self.advance();
-                // Skip to `;` or consume a block `{ ... }`.
-                loop {
-                    match self.peek().kind.clone() {
-                        TokenKind::Semicolon => {
-                            self.advance();
-                            break;
-                        }
-                        TokenKind::LBrace => {
-                            self.advance();
-                            let mut depth = 1usize;
-                            loop {
-                                match self.peek().kind.clone() {
-                                    TokenKind::LBrace => {
-                                        depth += 1;
-                                        self.advance();
-                                    }
-                                    TokenKind::RBrace => {
-                                        depth -= 1;
-                                        self.advance();
-                                        if depth == 0 {
-                                            break;
-                                        }
-                                    }
-                                    TokenKind::Eof => break,
-                                    _ => {
-                                        self.advance();
-                                    }
-                                }
-                            }
-                            break;
-                        }
-                        TokenKind::Eof => break,
-                        _ => {
-                            self.advance();
-                        }
-                    }
-                }
-                Ok(Item::Skip)
+                self.parse_extern_block(tok.loc, is_pub, false)
             }
             TokenKind::Mod => {
                 self.advance();
@@ -464,10 +440,127 @@ impl Parser {
                 })
             }
             _ => Err(Error::new(
-                tok.loc,
+                tok.loc.clone(),
                 format!("expected item, got {:?}", tok.kind),
             )),
         }
+    }
+
+    /// Parse `unsafe extern "C" { fn ...; }` / `extern crate ...;`.
+    /// Called after consuming `extern` (or `unsafe extern`).
+    /// `is_unsafe` is true when `unsafe` preceded the `extern` keyword.
+    /// Bare `extern "C" { }` without `unsafe` is rejected (edition 2024 rule).
+    fn parse_extern_block(&mut self, loc: Loc, _is_pub: bool, is_unsafe: bool) -> Result<Item, Error> {
+        // Handle: extern crate foo; / extern crate foo as bar;
+        if matches!(self.peek().kind, TokenKind::Ident(ref s) if s == "crate") {
+            // Skip to semicolon
+            while !matches!(self.peek().kind, TokenKind::Semicolon | TokenKind::Eof) {
+                self.advance();
+            }
+            if self.peek().kind == TokenKind::Semicolon {
+                self.advance();
+            }
+            return Ok(Item::Skip);
+        }
+
+        // Must be `"C"` (ABI string)
+        match &self.peek().kind {
+            TokenKind::StringLit(abi) if abi == "C" => {
+                self.advance();
+            }
+            TokenKind::StringLit(abi) => {
+                let abi = abi.clone();
+                return Err(Error::new(loc, format!("unsupported ABI `\"{abi}\"`: only \"C\" is supported")));
+            }
+            // Not a string: skip the rest of the unknown extern form
+            _ => {
+                while !matches!(self.peek().kind, TokenKind::Semicolon | TokenKind::LBrace | TokenKind::Eof) {
+                    self.advance();
+                }
+                if self.peek().kind == TokenKind::Semicolon {
+                    self.advance();
+                    return Ok(Item::Skip);
+                }
+                // Consume brace block
+                if self.peek().kind == TokenKind::LBrace {
+                    self.advance();
+                    let mut depth = 1usize;
+                    loop {
+                        match self.peek().kind.clone() {
+                            TokenKind::LBrace => { depth += 1; self.advance(); }
+                            TokenKind::RBrace => { depth -= 1; self.advance(); if depth == 0 { break; } }
+                            TokenKind::Eof => break,
+                            _ => { self.advance(); }
+                        }
+                    }
+                }
+                return Ok(Item::Skip);
+            }
+        }
+
+        // Extern "C" blocks must be at top level (C symbols must not be mangled).
+        if !self.mod_stack.is_empty() {
+            return Err(Error::new(loc, "`extern \"C\"` blocks must be at the top level, not inside a module".to_string()));
+        }
+
+        // Edition 2024: extern "C" blocks must be declared `unsafe extern "C"`.
+        if !is_unsafe {
+            return Err(Error::new(loc, "`extern \"C\"` block must be declared `unsafe extern \"C\"` to acknowledge that calling C functions is unsafe".to_string()));
+        }
+
+        self.expect(&TokenKind::LBrace)?;
+        let mut fns = Vec::new();
+        while self.peek().kind != TokenKind::RBrace && !self.at_eof() {
+            let fn_loc = self.loc();
+            // Optional `pub` or `unsafe` modifiers on individual fn decls are accepted but ignored
+            while matches!(self.peek().kind, TokenKind::Pub | TokenKind::Unsafe) {
+                self.advance();
+            }
+            self.expect(&TokenKind::Fn)?;
+            let name = self.expect_ident()?;
+            self.expect(&TokenKind::LParen)?;
+            let mut params = Vec::new();
+            let mut is_variadic = false;
+            while self.peek().kind != TokenKind::RParen && !self.at_eof() {
+                if !params.is_empty() {
+                    self.expect(&TokenKind::Comma)?;
+                    if self.peek().kind == TokenKind::RParen {
+                        break;
+                    }
+                }
+                // Variadic marker `...`
+                if self.peek().kind == TokenKind::DotDotDot {
+                    self.advance();
+                    is_variadic = true;
+                    // `...` must be last; break after consuming it
+                    break;
+                }
+                // Optional `_:` or `name:` pattern (brust uses simple ident params)
+                let pname = self.expect_ident()?;
+                // Optional `_` as param name followed by colon, or just a type
+                if self.peek().kind == TokenKind::Colon {
+                    self.advance();
+                    let ty = self.parse_ty()?;
+                    params.push(Param { name: pname, ty });
+                } else {
+                    // Unnamed param: what we read was actually the type name -- re-parse
+                    // Treat single ident without colon as a named type param with name "_"
+                    let ty = Ty::Named(self.qualify(pname));
+                    params.push(Param { name: "_".to_string(), ty });
+                }
+            }
+            self.expect(&TokenKind::RParen)?;
+            let return_ty = if self.peek().kind == TokenKind::Arrow {
+                self.advance();
+                self.parse_ty()?
+            } else {
+                Ty::Unit
+            };
+            self.expect(&TokenKind::Semicolon)?;
+            fns.push(ExternFnDecl { name, params, return_ty, is_variadic, loc: fn_loc });
+        }
+        self.expect(&TokenKind::RBrace)?;
+        Ok(Item::ExternBlock(fns))
     }
 
     fn parse_enum(&mut self, is_pub: bool) -> Result<EnumDecl, Error> {

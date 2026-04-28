@@ -65,6 +65,10 @@ pub struct TyEnv {
     pub pub_items: HashSet<String>,
     /// Struct qualified name -> set of pub field names.
     pub pub_fields: HashMap<String, HashSet<String>>,
+    /// Names of `extern "C"` functions -- calls to these require an `unsafe` block.
+    pub extern_fns: HashSet<String>,
+    /// Names of variadic extern functions -- allowed to have more args than declared params.
+    pub variadic_fns: HashSet<String>,
 }
 
 impl TyEnv {
@@ -79,6 +83,8 @@ impl TyEnv {
             item_module: HashMap::new(),
             pub_items: HashSet::new(),
             pub_fields: HashMap::new(),
+            extern_fns: HashSet::new(),
+            variadic_fns: HashSet::new(),
         };
         env.collect_items(&file.items, "");
         env
@@ -212,6 +218,18 @@ impl TyEnv {
                     }
                     self.collect_items(mod_items, &mod_prefix);
                 }
+                Item::ExternBlock(fns) => {
+                    // Extern "C" functions use their raw C name (never mangled with prefix).
+                    // They are always accessible and always require `unsafe` to call.
+                    for f in fns {
+                        let params = f.params.iter().map(|p| p.ty.clone()).collect();
+                        self.fns.insert(f.name.clone(), (params, f.return_ty.clone()));
+                        self.extern_fns.insert(f.name.clone());
+                        if f.is_variadic {
+                            self.variadic_fns.insert(f.name.clone());
+                        }
+                    }
+                }
                 Item::Skip => {}
             }
         }
@@ -307,6 +325,8 @@ struct TypeChecker {
     cur_loc: Loc,
     /// Module prefix of the function/item currently being checked (e.g. "math_" or "").
     cur_mod: String,
+    /// Whether the current expression context is inside an `unsafe` block.
+    in_unsafe: bool,
 }
 
 impl TypeChecker {
@@ -316,6 +336,7 @@ impl TypeChecker {
             errors: Vec::new(),
             cur_loc: Loc::default(),
             cur_mod: String::new(),
+            in_unsafe: false,
         }
     }
 
@@ -358,7 +379,7 @@ impl TypeChecker {
 
     /// Resolve type alias chain (cycle-safe).
     fn resolve(&self, ty: &Ty) -> Ty {
-        self.env.resolve_inner(ty, &mut HashSet::new())
+        self.env.resolve(ty)
     }
 
     /// Type compatibility with alias resolution on both sides.
@@ -464,6 +485,16 @@ impl TypeChecker {
                     self.validate_items(mod_items, &format!("{prefix}{name}_"));
                     self.cur_mod = prefix.to_string();
                 }
+                Item::ExternBlock(fns) => {
+                    // Validate param and return types of every extern fn declaration.
+                    for f in fns {
+                        self.cur_loc = f.loc;
+                        for p in &f.params {
+                            self.validate_ty(&p.ty);
+                        }
+                        self.validate_ty(&f.return_ty);
+                    }
+                }
                 Item::Skip => {}
             }
         }
@@ -549,6 +580,8 @@ impl TypeChecker {
     /// `prefix` is the module prefix used for name resolution within the body.
     fn check_fn(&mut self, f: &FnDecl, impl_type: Option<&str>, prefix: &str) {
         let mut scope = Scope::new();
+        // Each function starts outside any unsafe block.
+        self.in_unsafe = false;
 
         // Resolve SelfTy to the concrete implementing type.
         let return_ty = match impl_type {
@@ -1128,6 +1161,12 @@ impl TypeChecker {
             ExprKind::Call { name, args } => {
                 if let Some((param_tys, ret_ty)) = self.env.fns.get(name).cloned() {
                     self.check_item_visibility(name);
+                    // Extern "C" functions require an unsafe block at the call site.
+                    if self.env.extern_fns.contains(name) && !self.in_unsafe {
+                        self.err(format!(
+                            "call to unsafe extern fn `{name}` must be inside an `unsafe` block"
+                        ));
+                    }
                     self.check_call_args(name, args, &param_tys, scope);
                     ret_ty
                 } else if let Some(vi) = scope.lookup(name) {
@@ -1297,22 +1336,54 @@ impl TypeChecker {
 
             ExprKind::Unsafe(block) => {
                 // Type-check inside unsafe blocks using a copy of the current scope.
+                // Save and restore `in_unsafe` to handle nested unsafe blocks correctly.
+                let saved_unsafe = std::mem::replace(&mut self.in_unsafe, true);
                 let mut inner_scope = scope.clone();
-                for stmt in &block.stmts {
-                    self.check_stmt(stmt, &mut inner_scope, &Ty::Unit);
-                }
-                Ty::Unit
+                let result_ty = if let Some((last, rest)) = block.stmts.split_last() {
+                    for stmt in rest {
+                        self.check_stmt(stmt, &mut inner_scope, &Ty::Unit);
+                    }
+                    // Tail expressions appear as either bare Expr or implicit Return.
+                    let tail_expr = match &last.kind {
+                        StmtKind::Expr(expr) => Some(expr),
+                        StmtKind::Return(Some(expr)) => Some(expr),
+                        _ => None,
+                    };
+                    if let Some(expr) = tail_expr {
+                        self.cur_loc = last.loc;
+                        self.infer_expr(expr, &inner_scope)
+                    } else {
+                        self.check_stmt(last, &mut inner_scope, &Ty::Unit);
+                        Ty::Unit
+                    }
+                } else {
+                    Ty::Unit
+                };
+                self.in_unsafe = saved_unsafe;
+                result_ty
             }
         }
     }
 
     /// Verify argument count and types for a function call.
+    /// For variadic extern fns, at least `param_tys.len()` args must be provided;
+    /// extra arguments beyond that are accepted without type checking.
     /// Arguments are inferred even on arity mismatch so subsequent errors are still caught.
     fn check_call_args(&mut self, name: &str, args: &[Expr], param_tys: &[Ty], scope: &Scope) {
-        if args.len() != param_tys.len() {
+        let is_variadic = self.env.variadic_fns.contains(name);
+        let arity_ok = if is_variadic {
+            args.len() >= param_tys.len()
+        } else {
+            args.len() == param_tys.len()
+        };
+        if !arity_ok {
+            let expected = if is_variadic {
+                format!("at least {}", param_tys.len())
+            } else {
+                param_tys.len().to_string()
+            };
             self.err(format!(
-                "`{name}` expects {} argument(s), found {}",
-                param_tys.len(),
+                "`{name}` expects {expected} argument(s), found {}",
                 args.len()
             ));
             for a in args {
@@ -1320,6 +1391,7 @@ impl TypeChecker {
             }
             return;
         }
+        // Type-check the fixed parameters; variadic extra args are inferred without checking.
         for (i, (arg, param_ty)) in args.iter().zip(param_tys.iter()).enumerate() {
             let got = self.infer_expr(arg, scope);
             if !self.compat(&got, param_ty) {
@@ -1330,6 +1402,10 @@ impl TypeChecker {
                     ty_display(&got)
                 ));
             }
+        }
+        // Infer types of extra variadic args (for side-effects, e.g. nested calls).
+        for arg in args.iter().skip(param_tys.len()) {
+            self.infer_expr(arg, scope);
         }
     }
 

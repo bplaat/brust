@@ -23,6 +23,8 @@ pub enum Item {
         items: Vec<Item>,
         is_pub: bool,
     },
+    /// `extern "C" { fn name(params) -> RetTy; ... }` -- FFI function declarations.
+    ExternBlock(Vec<ExternFnDecl>),
     /// Discarded item: `use ...;`, `extern crate ...;`, etc.
     Skip,
 }
@@ -62,6 +64,18 @@ pub enum VariantFields {
     Unit,                  // Variant
     Tuple(Vec<Ty>),        // Variant(T0, T1)
     Named(Vec<FieldDecl>), // Variant { x: T, y: T }
+}
+
+/// A single function declaration inside an `extern "C" { }` block.
+/// The `name` is the exact C symbol (never mangled).
+/// `is_variadic` means the function accepts additional arguments beyond `params`.
+#[derive(Clone)]
+pub struct ExternFnDecl {
+    pub name: String,
+    pub params: Vec<Param>,
+    pub return_ty: Ty,
+    pub is_variadic: bool,
+    pub loc: Loc,
 }
 
 pub struct ImplBlock {
