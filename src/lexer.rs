@@ -84,17 +84,17 @@ pub struct Token {
     pub loc: Loc,
 }
 
-pub struct Lexer<'a> {
-    src: &'a [u8],
+pub struct Lexer {
+    src: Vec<u8>,
     pos: usize,
     line: u32,
     col: u32,
 }
 
-impl<'a> Lexer<'a> {
-    pub fn new(src: &'a str) -> Self {
+impl Lexer {
+    pub fn new(src: &str) -> Self {
         Self {
-            src: src.as_bytes(),
+            src: src.as_bytes().to_vec(),
             pos: 0,
             line: 1,
             col: 1,

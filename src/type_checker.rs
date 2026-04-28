@@ -46,6 +46,7 @@ use crate::loc::Loc;
 // Global type environment
 // ===========================================================================
 
+#[derive(Clone)]
 pub struct TyEnv {
     pub structs: HashMap<String, StructDecl>,
     pub enums: HashMap<String, EnumDecl>,
@@ -213,14 +214,14 @@ impl Scope {
 // Phase 1 — Type checker
 // ===========================================================================
 
-struct TypeChecker<'a> {
-    env: &'a TyEnv,
+struct TypeChecker {
+    env: TyEnv,
     errors: Vec<Error>,
     cur_loc: Loc,
 }
 
-impl<'a> TypeChecker<'a> {
-    fn new(env: &'a TyEnv) -> Self {
+impl TypeChecker {
+    fn new(env: TyEnv) -> Self {
         Self {
             env,
             errors: Vec::new(),
@@ -649,7 +650,7 @@ impl<'a> TypeChecker<'a> {
                         ty_display(scrutinee_ty)
                     ));
                 }
-                if let Some(edecl) = self.env.enums.get(type_name) {
+                if let Some(edecl) = self.env.enums.get(type_name).cloned() {
                     if let Some(ev) = edecl.variants.iter().find(|v| v.name == *variant) {
                         match (bindings, &ev.fields) {
                             (PatBindings::None, _) => {} // unit or ignored
@@ -1319,14 +1320,14 @@ impl BScope {
     }
 }
 
-struct BorrowChecker<'a> {
-    env: &'a TyEnv,
+struct BorrowChecker {
+    env: TyEnv,
     errors: Vec<Error>,
     cur_loc: Loc,
 }
 
-impl<'a> BorrowChecker<'a> {
-    fn new(env: &'a TyEnv) -> Self {
+impl BorrowChecker {
+    fn new(env: TyEnv) -> Self {
         Self {
             env,
             errors: Vec::new(),
@@ -1950,14 +1951,14 @@ pub fn check(file: &File) -> Vec<Error> {
 
     // Phase 1: type checking
     {
-        let mut tc = TypeChecker::new(&env);
+        let mut tc = TypeChecker::new(env.clone());
         tc.check_file(file);
         errors.extend(tc.errors);
     }
 
     // Phase 2: borrow checking (only if type checking was clean, to avoid cascading noise)
     if errors.is_empty() {
-        let mut bc = BorrowChecker::new(&env);
+        let mut bc = BorrowChecker::new(env);
         bc.check_file(file);
         errors.extend(bc.errors);
     }
