@@ -6,15 +6,77 @@ use crate::ast::{
 use crate::error::Error;
 use crate::lexer::{Token, TokenKind};
 use crate::loc::Loc;
+use std::collections::HashSet;
 
 pub struct Parser {
     tokens: Vec<Token>,
     pos: usize,
+    /// Name of the mod block currently being parsed, if any.
+    current_mod: Option<String>,
+    /// Names declared at the top level of the current mod block (types + fns).
+    mod_local_names: HashSet<String>,
 }
 
 impl Parser {
     pub fn new(tokens: Vec<Token>) -> Self {
-        Self { tokens, pos: 0 }
+        Self {
+            tokens,
+            pos: 0,
+            current_mod: None,
+            mod_local_names: HashSet::new(),
+        }
+    }
+
+    /// Scan from `start` up to the matching `}` at depth 0 and collect the
+    /// names of all top-level `fn`, `struct`, `enum`, and `type` declarations.
+    fn collect_mod_local_names(&self, start: usize) -> HashSet<String> {
+        let mut names = HashSet::new();
+        let mut depth: usize = 0;
+        let mut i = start;
+        while i < self.tokens.len() {
+            match &self.tokens[i].kind {
+                TokenKind::LBrace => {
+                    depth += 1;
+                    i += 1;
+                }
+                TokenKind::RBrace => {
+                    if depth == 0 {
+                        break;
+                    }
+                    depth -= 1;
+                    i += 1;
+                }
+                TokenKind::Fn | TokenKind::Struct | TokenKind::Enum | TokenKind::Type
+                    if depth == 0 =>
+                {
+                    i += 1;
+                    // Skip optional `pub`
+                    if matches!(self.tokens.get(i).map(|t| &t.kind), Some(TokenKind::Pub)) {
+                        i += 1;
+                    }
+                    if let Some(TokenKind::Ident(name)) = self.tokens.get(i).map(|t| &t.kind) {
+                        names.insert(name.clone());
+                    }
+                    i += 1;
+                }
+                _ => {
+                    i += 1;
+                }
+            }
+        }
+        names
+    }
+
+    /// If `name` is a locally-declared name in the current module, return the
+    /// fully-qualified internal name (`{mod}_{name}`). Otherwise return `name`
+    /// unchanged.
+    fn qualify(&self, name: String) -> String {
+        if let Some(ref m) = self.current_mod {
+            if self.mod_local_names.contains(&name) {
+                return format!("{m}_{name}");
+            }
+        }
+        name
     }
 
     pub fn parse(mut self) -> Result<File, Error> {
@@ -95,11 +157,19 @@ impl Parser {
                 self.advance();
                 let name = self.expect_ident()?;
                 self.expect(&TokenKind::LBrace)?;
+                // Pre-scan the token stream for names declared inside this mod.
+                let local_names = self.collect_mod_local_names(self.pos);
+                // Save outer context and activate module scope.
+                let saved_mod = self.current_mod.replace(name.clone());
+                let saved_names = std::mem::replace(&mut self.mod_local_names, local_names);
                 let mut items = Vec::new();
                 while self.peek().kind != TokenKind::RBrace && !self.at_eof() {
                     items.push(self.parse_item()?);
                 }
                 self.expect(&TokenKind::RBrace)?;
+                // Restore outer context.
+                self.current_mod = saved_mod;
+                self.mod_local_names = saved_names;
                 Ok(Item::Mod { name, items })
             }
             _ => Err(Error::new(
@@ -398,7 +468,8 @@ impl Parser {
                             let type_name = self.expect_ident()?;
                             return Ok(Ty::Named(format!("{base}_{type_name}")));
                         }
-                        return Ok(Ty::Named(base));
+                        // Inside a mod block, auto-qualify locally-declared type names.
+                        return Ok(Ty::Named(self.qualify(base)));
                     }
                 };
                 self.advance();
@@ -730,9 +801,11 @@ impl Parser {
                 let (type_name, variant) = if self.peek().kind == TokenKind::ColonColon {
                     self.advance();
                     let part3 = self.expect_ident()?;
-                    (format!("{type_name}_{part2}"), part3)
+                    // Three-part: mod::Type::Variant — qualify mod if local
+                    (format!("{}_{part2}", self.qualify(type_name)), part3)
                 } else {
-                    (type_name, part2)
+                    // Two-part: Type::Variant — qualify Type if local
+                    (self.qualify(type_name), part2)
                 };
                 let bindings = if self.peek().kind == TokenKind::LParen {
                     self.advance();
@@ -1266,7 +1339,9 @@ impl Parser {
                     if self.peek().kind == TokenKind::ColonColon {
                         self.advance();
                         let part3 = self.expect_ident()?;
-                        let qualified = format!("{name}_{part2}");
+                        // Three-part path: mod::Type::method or Type::Variant::field
+                        // Qualify the leading name if it is a local type name.
+                        let qualified = format!("{}_{part2}", self.qualify(name));
                         if self.peek().kind == TokenKind::LParen {
                             let args = self.parse_call_args()?;
                             return Ok(Expr {
@@ -1312,11 +1387,14 @@ impl Parser {
                         }
                     }
 
+                    // Two-part path: Type::method or Enum::Variant or mod::fn
+                    // Qualify the leading name if it refers to a local type.
+                    let type_name = self.qualify(name);
                     if self.peek().kind == TokenKind::LParen {
                         let args = self.parse_call_args()?;
                         Ok(Expr {
                             kind: ExprKind::AssocCall {
-                                type_name: name,
+                                type_name,
                                 method: part2,
                                 args,
                             },
@@ -1339,7 +1417,7 @@ impl Parser {
                         self.expect(&TokenKind::RBrace)?;
                         Ok(Expr {
                             kind: ExprKind::EnumStructLit {
-                                type_name: name,
+                                type_name,
                                 variant: part2,
                                 fields,
                             },
@@ -1348,7 +1426,7 @@ impl Parser {
                     } else {
                         Ok(Expr {
                             kind: ExprKind::AssocCall {
-                                type_name: name,
+                                type_name,
                                 method: part2,
                                 args: vec![],
                             },
@@ -1358,6 +1436,8 @@ impl Parser {
                 } else if self.peek().kind == TokenKind::LBrace
                     && name.chars().next().is_some_and(|c| c.is_uppercase())
                 {
+                    // Struct literal: auto-qualify if it's a local type.
+                    let name = self.qualify(name);
                     self.advance();
                     let mut fields = Vec::new();
                     while self.peek().kind != TokenKind::RBrace && !self.at_eof() {
@@ -1377,6 +1457,8 @@ impl Parser {
                         loc,
                     })
                 } else if self.peek().kind == TokenKind::LParen {
+                    // Function call: auto-qualify if it's a local function name.
+                    let name = self.qualify(name);
                     let args = self.parse_call_args()?;
                     Ok(Expr {
                         kind: ExprKind::Call { name, args },

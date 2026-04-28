@@ -19,6 +19,10 @@ struct Ctx {
     var_types: HashMap<String, Ty>,
     /// Return type of the current function, used to hint tuple literal emission.
     return_ty: Option<Ty>,
+    /// Function/method return types shared from Codegen, for printf spec on call expressions.
+    fn_ret_tys: HashMap<String, Ty>,
+    /// Type aliases shared from Codegen, for resolving Named types in printf spec.
+    type_aliases: HashMap<String, Ty>,
 }
 
 impl Ctx {
@@ -29,6 +33,8 @@ impl Ctx {
             type_env: HashMap::new(),
             var_types: HashMap::new(),
             return_ty: None,
+            fn_ret_tys: HashMap::new(),
+            type_aliases: HashMap::new(),
         }
     }
 
@@ -46,6 +52,8 @@ impl Ctx {
             type_env,
             var_types: HashMap::new(),
             return_ty: None,
+            fn_ret_tys: HashMap::new(),
+            type_aliases: HashMap::new(),
         }
     }
 }
@@ -57,8 +65,12 @@ impl Ctx {
 struct Codegen {
     /// Enum declarations indexed by name, for tagged union resolution in match.
     enums: HashMap<String, EnumDecl>,
-    /// Function/method param types (mangled name → param type list) for tuple arg hints.
+    /// Function/method param types (mangled name -> param type list) for tuple arg hints.
     fn_params: HashMap<String, Vec<Ty>>,
+    /// Function/method return types (mangled name -> return Ty) for printf spec inference.
+    fn_ret_tys: HashMap<String, Ty>,
+    /// Type aliases (alias name -> underlying Ty) for printf spec resolution.
+    type_aliases: HashMap<String, Ty>,
     /// Functions that return `!` — calls to these inside a return emit as statements.
     never_fns: std::collections::HashSet<String>,
     out: String,
@@ -67,11 +79,23 @@ struct Codegen {
 pub fn generate(file: &File) -> String {
     let mut enums: HashMap<String, EnumDecl> = HashMap::new();
     let mut fn_params: HashMap<String, Vec<Ty>> = HashMap::new();
+    let mut fn_ret_tys: HashMap<String, Ty> = HashMap::new();
+    let mut type_aliases: HashMap<String, Ty> = HashMap::new();
     let mut never_fns = std::collections::HashSet::new();
-    collect_items(&file.items, "", &mut enums, &mut fn_params, &mut never_fns);
+    collect_type_aliases(&file.items, &mut type_aliases);
+    collect_items(
+        &file.items,
+        "",
+        &mut enums,
+        &mut fn_params,
+        &mut fn_ret_tys,
+        &mut never_fns,
+    );
     let mut cg = Codegen {
         enums,
         fn_params,
+        fn_ret_tys,
+        type_aliases,
         never_fns,
         out: String::new(),
     };
@@ -79,11 +103,20 @@ pub fn generate(file: &File) -> String {
     cg.out
 }
 
+fn collect_type_aliases(items: &[Item], aliases: &mut HashMap<String, Ty>) {
+    for item in items {
+        if let Item::TypeAlias { name, ty } = item {
+            aliases.insert(name.clone(), ty.clone());
+        }
+    }
+}
+
 fn collect_items(
     items: &[Item],
     prefix: &str,
     enums: &mut HashMap<String, EnumDecl>,
     fn_params: &mut HashMap<String, Vec<Ty>>,
+    fn_ret_tys: &mut HashMap<String, Ty>,
     never_fns: &mut std::collections::HashSet<String>,
 ) {
     for item in items {
@@ -94,6 +127,7 @@ fn collect_items(
                     name.clone(),
                     f.params.iter().map(|p| p.ty.clone()).collect(),
                 );
+                fn_ret_tys.insert(name.clone(), f.return_ty.clone());
                 if f.return_ty == Ty::Never {
                     never_fns.insert(name);
                 }
@@ -104,7 +138,11 @@ fn collect_items(
                     if m.return_ty == Ty::Never {
                         never_fns.insert(mangled.clone());
                     }
-                    fn_params.insert(mangled, m.params.iter().map(|p| p.ty.clone()).collect());
+                    fn_params.insert(
+                        mangled.clone(),
+                        m.params.iter().map(|p| p.ty.clone()).collect(),
+                    );
+                    fn_ret_tys.insert(mangled, m.return_ty.clone());
                 }
             }
             Item::Enum(e) => {
@@ -122,6 +160,7 @@ fn collect_items(
                     &format!("{prefix}{name}_"),
                     enums,
                     fn_params,
+                    fn_ret_tys,
                     never_fns,
                 );
             }
@@ -368,6 +407,8 @@ impl Codegen {
         };
         ctx.var_types = params_var_types;
         ctx.return_ty = Some(f.return_ty.clone());
+        ctx.fn_ret_tys = self.fn_ret_tys.clone();
+        ctx.type_aliases = self.type_aliases.clone();
 
         for stmt in &f.body.stmts {
             self.emit_stmt(stmt, &mut ctx, 1);
@@ -443,6 +484,17 @@ impl Codegen {
                         self.out.push_str(&format!("{p}return;\n"));
                     } else {
                         self.out.push_str(&format!("{p}return 0;\n"));
+                    }
+                }
+                Some(e)
+                    if matches!(&e.kind, ExprKind::Unsafe(_))
+                        && ctx.return_ty == Some(Ty::Unit) =>
+                {
+                    // `unsafe { stmts }` as the tail of a unit function: inline the statements.
+                    if let ExprKind::Unsafe(block) = &e.kind {
+                        for s in &block.stmts {
+                            self.emit_stmt(s, ctx, indent);
+                        }
                     }
                 }
                 Some(e) => {
@@ -874,11 +926,8 @@ impl Codegen {
                         .map(|(i, a)| self.emit_expr_hint(a, ctx, param_tys.get(i)))
                         .collect();
                     if args.is_empty() {
-                        if is_tagged_enum {
-                            format!("{type_name}_{method}()")
-                        } else {
-                            format!("{type_name}_{method}")
-                        }
+                        // Tagged enum unit variants and struct static methods both need `()`.
+                        format!("{type_name}_{method}()")
                     } else {
                         format!("{type_name}_{method}({})", args_s.join(", "))
                     }
@@ -1047,21 +1096,69 @@ impl Codegen {
     }
 }
 
-/// Choose printf format specifier and cast for an expression.
+/// Choose printf format specifier for an expression, returning `%f`, `%u`, `%s`, or `%lld`.
+/// Uses variable types, cast targets, and function return types to infer the right spec.
 fn printf_spec(expr: &Expr, ctx: &Ctx) -> String {
     match &expr.kind {
         ExprKind::Float(_) => "%f".to_string(),
         ExprKind::Char(_) => "%u".to_string(),
         ExprKind::Str(_) => "%s".to_string(),
-        ExprKind::Cast { ty: Ty::F32, .. } | ExprKind::Cast { ty: Ty::F64, .. } => "%f".to_string(),
-        ExprKind::Cast { ty: Ty::Char, .. } => "%u".to_string(),
-        ExprKind::Cast { ty: Ty::Str, .. } => "%s".to_string(),
-        ExprKind::Var(name) => match ctx.var_types.get(name) {
-            Some(Ty::F32) | Some(Ty::F64) => "%f".to_string(),
-            Some(Ty::Char) => "%u".to_string(),
-            Some(Ty::Str) => "%s".to_string(),
+
+        ExprKind::Cast { ty, .. } => match ty {
+            Ty::F32 | Ty::F64 => "%f".to_string(),
+            Ty::Char => "%u".to_string(),
+            Ty::Str => "%s".to_string(),
             _ => "%lld".to_string(),
         },
+
+        ExprKind::Var(name) => spec_for_ty(ctx.var_types.get(name), ctx),
+
+        // Arithmetic inherits spec from the left operand.
+        ExprKind::BinOp { lhs, .. } => printf_spec(lhs, ctx),
+        ExprKind::UnOp { operand, .. } => printf_spec(operand, ctx),
+
+        // Field access: infer from the field expression's base if not possible, fall through.
+        ExprKind::Field { expr, .. } => printf_spec(expr, ctx),
+
+        // Calls: look up the return type of the function/method.
+        ExprKind::Call { name, .. } => spec_for_ty(ctx.fn_ret_tys.get(name.as_str()), ctx),
+        ExprKind::AssocCall {
+            type_name, method, ..
+        } => {
+            let mangled = format!("{type_name}_{method}");
+            spec_for_ty(ctx.fn_ret_tys.get(mangled.as_str()), ctx)
+        }
+        ExprKind::MethodCall { expr, method, .. } => {
+            // Receiver type is in type_env; mangled name is TypeName_method.
+            if let ExprKind::Var(recv) = &expr.kind
+                && let Some(type_name) = ctx.type_env.get(recv)
+            {
+                let mangled = format!("{type_name}_{method}");
+                return spec_for_ty(ctx.fn_ret_tys.get(mangled.as_str()), ctx);
+            }
+            "%lld".to_string()
+        }
+
+        ExprKind::Deref(inner) => printf_spec(inner, ctx),
+
+        _ => "%lld".to_string(),
+    }
+}
+
+/// Map an optional `Ty` to a printf format specifier, resolving type aliases.
+fn spec_for_ty(ty: Option<&Ty>, ctx: &Ctx) -> String {
+    match ty {
+        Some(Ty::F32) | Some(Ty::F64) => "%f".to_string(),
+        Some(Ty::Char) => "%u".to_string(),
+        Some(Ty::Str) => "%s".to_string(),
+        // Resolve named type aliases one level (common case: type Meters = f64).
+        Some(Ty::Named(name)) => {
+            if let Some(underlying) = ctx.type_aliases.get(name) {
+                spec_for_ty(Some(underlying), ctx)
+            } else {
+                "%lld".to_string()
+            }
+        }
         _ => "%lld".to_string(),
     }
 }

@@ -23,8 +23,8 @@
 //!   - &mut of an immutable binding is rejected.
 //!   - Intra-statement borrow conflicts: taking &x and &mut x in the same
 //!     expression is detected via collect_borrows.
-//!   Cross-statement borrow-overlap tracking (shared vs mut across multiple
-//!   statements) is deferred to a future phase.
+//!   - Cross-statement borrow-overlap tracking (shared vs mut across multiple
+//!     statements) is deferred to a future phase.
 //!
 //! Limitations in v1:
 //!   - Integer literals are typed as I64 but accepted for any integer type.

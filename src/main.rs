@@ -11,7 +11,7 @@ use std::{env, fs, path::Path, process};
 fn main() {
     let args: Vec<String> = env::args().collect();
     if args.len() < 2 {
-        eprintln!("usage: brust <file.br>");
+        eprintln!("usage: brust <file.rs> [-o <output>]");
         process::exit(1);
     }
 
@@ -42,19 +42,33 @@ fn main() {
         process::exit(1);
     }
 
-    // Codegen
+    // Codegen -> C source
     let c_src = codegen::generate(&file);
 
-    // Write output: same name, .c extension
-    let out_path = if args.len() >= 4 && args[2] == "-o" {
+    // Determine final binary output path.
+    let bin_path = if args.len() >= 4 && args[2] == "-o" {
         Path::new(&args[3]).to_path_buf()
     } else {
-        Path::new(input_path).with_extension("c")
+        Path::new(input_path).with_extension("")
     };
-    fs::write(&out_path, &c_src).unwrap_or_else(|e| {
-        eprintln!("error: cannot write '{}': {}", out_path.display(), e);
+
+    // Write C to a temporary file next to the binary output.
+    let c_path = bin_path.with_extension("c");
+    fs::write(&c_path, &c_src).unwrap_or_else(|e| {
+        eprintln!("error: cannot write '{}': {}", c_path.display(), e);
         process::exit(1);
     });
 
-    println!("wrote {}", out_path.display());
+    // Compile C -> binary using $CC or cc.
+    let cc = env::var("CC").unwrap_or_else(|_| "cc".to_string());
+    let status = process::Command::new(&cc)
+        .args([c_path.to_str().unwrap(), "-o", bin_path.to_str().unwrap()])
+        .status()
+        .unwrap_or_else(|e| {
+            eprintln!("error: cannot run '{}': {}", cc, e);
+            process::exit(1);
+        });
+    if !status.success() {
+        process::exit(status.code().unwrap_or(1));
+    }
 }
