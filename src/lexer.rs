@@ -22,6 +22,13 @@ pub enum TokenKind {
     Star,
     Slash,
     Percent,
+    // Bitwise operators
+    Amp,       // &
+    Pipe,      // |
+    Caret,     // ^
+    Tilde,     // ~
+    Shl,       // <<
+    Shr,       // >>
     // Comparison operators
     EqEq,
     BangEq,
@@ -140,25 +147,25 @@ impl<'a> Lexer<'a> {
             }
             b'<' => {
                 self.advance();
-                if self.peek() == Some(b'=') { self.advance(); TokenKind::Le } else { TokenKind::Lt }
+                if self.peek() == Some(b'=') { self.advance(); TokenKind::Le }
+                else if self.peek() == Some(b'<') { self.advance(); TokenKind::Shl }
+                else { TokenKind::Lt }
             }
             b'>' => {
                 self.advance();
-                if self.peek() == Some(b'=') { self.advance(); TokenKind::Ge } else { TokenKind::Gt }
+                if self.peek() == Some(b'=') { self.advance(); TokenKind::Ge }
+                else if self.peek() == Some(b'>') { self.advance(); TokenKind::Shr }
+                else { TokenKind::Gt }
             }
             b'&' => {
                 self.advance();
                 if self.peek() == Some(b'&') { self.advance(); TokenKind::AmpAmp }
-                else {
-                    return Err(Error::new(line, col, "expected '&&', single '&' not yet supported"));
-                }
+                else { TokenKind::Amp }
             }
             b'|' => {
                 self.advance();
                 if self.peek() == Some(b'|') { self.advance(); TokenKind::PipePipe }
-                else {
-                    return Err(Error::new(line, col, "expected '||', single '|' not yet supported"));
-                }
+                else { TokenKind::Pipe }
             }
             b'+' => { self.advance(); TokenKind::Plus }
             b'-' => {
@@ -173,6 +180,8 @@ impl<'a> Lexer<'a> {
             b'*' => { self.advance(); TokenKind::Star }
             b'/' => { self.advance(); TokenKind::Slash }
             b'%' => { self.advance(); TokenKind::Percent }
+            b'^' => { self.advance(); TokenKind::Caret }
+            b'~' => { self.advance(); TokenKind::Tilde }
             b'"' => self.lex_string(line, col)?,
             c if c.is_ascii_digit() => self.lex_int(line, col)?,
             c if c.is_ascii_alphabetic() || c == b'_' => self.lex_ident_or_keyword(),
@@ -207,9 +216,36 @@ impl<'a> Lexer<'a> {
     }
 
     fn lex_int(&mut self, line: usize, col: usize) -> Result<TokenKind, Error> {
+        // Check for 0x (hex) or 0b (binary) prefix
+        if self.peek() == Some(b'0') {
+            let next = self.src.get(self.pos + 1).copied();
+            if next == Some(b'x') || next == Some(b'X') {
+                self.advance(); self.advance(); // consume '0x'
+                let mut s = String::new();
+                while self.peek().map_or(false, |c| c.is_ascii_hexdigit() || c == b'_') {
+                    let c = self.advance().unwrap();
+                    if c != b'_' { s.push(c as char); }
+                }
+                return i64::from_str_radix(&s, 16)
+                    .map(TokenKind::IntLit)
+                    .map_err(|_| Error::new(line, col, format!("hex literal '0x{s}' out of range")));
+            }
+            if next == Some(b'b') || next == Some(b'B') {
+                self.advance(); self.advance(); // consume '0b'
+                let mut s = String::new();
+                while self.peek().map_or(false, |c| c == b'0' || c == b'1' || c == b'_') {
+                    let c = self.advance().unwrap();
+                    if c != b'_' { s.push(c as char); }
+                }
+                return i64::from_str_radix(&s, 2)
+                    .map(TokenKind::IntLit)
+                    .map_err(|_| Error::new(line, col, format!("binary literal '0b{s}' out of range")));
+            }
+        }
         let mut s = String::new();
-        while self.peek().map_or(false, |c| c.is_ascii_digit()) {
-            s.push(self.advance().unwrap() as char);
+        while self.peek().map_or(false, |c| c.is_ascii_digit() || c == b'_') {
+            let c = self.advance().unwrap();
+            if c != b'_' { s.push(c as char); }
         }
         s.parse::<i64>()
             .map(TokenKind::IntLit)
