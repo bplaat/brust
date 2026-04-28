@@ -9,6 +9,7 @@ pub enum Item {
     Impl(ImplBlock),
     Enum(EnumDecl),
     TypeAlias { name: String, ty: Ty },
+    Mod { name: String, items: Vec<Item> },
 }
 
 pub struct StructDecl {
