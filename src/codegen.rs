@@ -276,6 +276,13 @@ fn collect_items(
 }
 
 impl Codegen {
+    /// Copy shared read-only state from Codegen into a fresh Ctx.
+    fn fill_ctx(&self, ctx: &mut Ctx) {
+        ctx.fn_ret_tys = self.fn_ret_tys.clone();
+        ctx.type_aliases = self.type_aliases.clone();
+        ctx.value_self_fns = self.value_self_fns.clone();
+    }
+
     fn run(&mut self, file: &File) {
         self.out
             .push_str("#include <stdbool.h>\n#include <stdint.h>\n#include <stdio.h>\n");
@@ -634,9 +641,7 @@ impl Codegen {
             Some(itype) => f.return_ty.resolve_self(itype),
             None => f.return_ty.clone(),
         });
-        ctx.fn_ret_tys = self.fn_ret_tys.clone();
-        ctx.type_aliases = self.type_aliases.clone();
-        ctx.value_self_fns = self.value_self_fns.clone();
+        self.fill_ctx(&mut ctx);
         if f.name == "main" {
             ctx.in_main = true;
         }
@@ -722,9 +727,7 @@ impl Codegen {
             let mut ctx = Ctx::for_method(type_name, &Receiver::Ref, params_env);
             ctx.var_types = params_var_types;
             ctx.return_ty = Some(ret_ty);
-            ctx.fn_ret_tys = self.fn_ret_tys.clone();
-            ctx.type_aliases = self.type_aliases.clone();
-            ctx.value_self_fns = self.value_self_fns.clone();
+            self.fill_ctx(&mut ctx);
             for stmt in &m.body.stmts {
                 self.emit_stmt(stmt, &mut ctx, 1);
             }
@@ -771,9 +774,7 @@ impl Codegen {
                 let mut ctx = Ctx::for_method(type_name, &sig.receiver, params_env);
                 ctx.var_types = params_var_types;
                 ctx.return_ty = Some(ret_ty);
-                ctx.fn_ret_tys = self.fn_ret_tys.clone();
-                ctx.type_aliases = self.type_aliases.clone();
-                ctx.value_self_fns = self.value_self_fns.clone();
+                self.fill_ctx(&mut ctx);
                 for stmt in &body.stmts {
                     self.emit_stmt(stmt, &mut ctx, 1);
                 }

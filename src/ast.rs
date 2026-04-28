@@ -1,3 +1,4 @@
+use std::fmt;
 use std::rc::Rc;
 
 use crate::loc::Loc;
@@ -219,6 +220,153 @@ impl Ty {
                 params.iter().any(|t| t.contains_self()) || ret.contains_self()
             }
             _ => false,
+        }
+    }
+
+    pub fn is_integer(&self) -> bool {
+        matches!(
+            self,
+            Ty::I8 | Ty::I16 | Ty::I32 | Ty::I64 | Ty::Isize
+                | Ty::U8 | Ty::U16 | Ty::U32 | Ty::U64 | Ty::Usize
+        )
+    }
+
+    pub fn is_float(&self) -> bool {
+        matches!(self, Ty::F32 | Ty::F64)
+    }
+
+    pub fn is_numeric(&self) -> bool {
+        self.is_integer() || self.is_float()
+    }
+
+    /// True if this type is a reference or raw pointer.
+    pub fn is_ref_like(&self) -> bool {
+        matches!(self, Ty::Ref(_) | Ty::RefMut(_) | Ty::RawConst(_) | Ty::RawMut(_))
+    }
+
+    /// Named types (structs/enums) are non-Copy in principle, but in v1 everything
+    /// is treated as Copy because the C backend copies structs by value anyway.
+    pub fn is_non_copy(&self) -> bool {
+        // Placeholder: always false in v1.
+        let _ = self;
+        false
+    }
+
+    /// Peel through references to find the underlying named type.
+    pub fn base_type_name(&self) -> Option<String> {
+        match self {
+            Ty::Named(n) => Some(n.clone()),
+            Ty::Ref(inner) | Ty::RefMut(inner) => inner.base_type_name(),
+            _ => None,
+        }
+    }
+
+    /// Type compatibility: `self` is acceptable where `other` is required.
+    /// Handles widening coercions (integer/float literals, Never, &mut -> &, etc.)
+    /// and structural compat for arrays, tuples, and function pointers.
+    pub fn is_compat_with(&self, other: &Ty) -> bool {
+        if self == other {
+            return true;
+        }
+        // SelfTy in annotations: compatible with any Named type (resolved in impl context).
+        if matches!(other, Ty::SelfTy) || matches!(self, Ty::SelfTy) {
+            return true;
+        }
+        // Integer literal (I64) is compatible with any integer type.
+        if self == &Ty::I64 && other.is_integer() {
+            return true;
+        }
+        // Float literal (F64) is compatible with any float type.
+        if self == &Ty::F64 && other.is_float() {
+            return true;
+        }
+        // Never diverges -- compatible with any type.
+        if self == &Ty::Never {
+            return true;
+        }
+        // &mut T coerces to &T.
+        if let (Ty::RefMut(a), Ty::Ref(b)) = (self, other) {
+            return a.is_compat_with(b);
+        }
+        // &mut T / &T coerce to raw pointer *mut T / *const T.
+        if let (Ty::RefMut(a), Ty::RawMut(b)) = (self, other) {
+            return a.is_compat_with(b);
+        }
+        if let (Ty::Ref(a), Ty::RawConst(b)) = (self, other) {
+            return a.is_compat_with(b);
+        }
+        // Recursive array compat.
+        if let (Ty::Array(ga, gn), Ty::Array(ea, en)) = (self, other) {
+            return gn == en && ga.is_compat_with(ea);
+        }
+        // Recursive tuple compat.
+        if let (Ty::Tuple(gs), Ty::Tuple(es)) = (self, other) {
+            return gs.len() == es.len()
+                && gs.iter().zip(es.iter()).all(|(g, e)| g.is_compat_with(e));
+        }
+        // Function pointer structural compat.
+        if let (
+            Ty::FnPtr { params: gp, ret: gr },
+            Ty::FnPtr { params: ep, ret: er },
+        ) = (self, other)
+        {
+            return gp.len() == ep.len()
+                && gp.iter().zip(ep.iter()).all(|(g, e)| g.is_compat_with(e))
+                && gr.is_compat_with(er);
+        }
+        false
+    }
+}
+
+impl fmt::Display for Ty {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Ty::I8 => write!(f, "i8"),
+            Ty::I16 => write!(f, "i16"),
+            Ty::I32 => write!(f, "i32"),
+            Ty::I64 => write!(f, "i64"),
+            Ty::Isize => write!(f, "isize"),
+            Ty::U8 => write!(f, "u8"),
+            Ty::U16 => write!(f, "u16"),
+            Ty::U32 => write!(f, "u32"),
+            Ty::U64 => write!(f, "u64"),
+            Ty::Usize => write!(f, "usize"),
+            Ty::F32 => write!(f, "f32"),
+            Ty::F64 => write!(f, "f64"),
+            Ty::Bool => write!(f, "bool"),
+            Ty::Char => write!(f, "char"),
+            Ty::Unit => write!(f, "()"),
+            Ty::Str => write!(f, "&str"),
+            Ty::Never => write!(f, "!"),
+            Ty::SelfTy => write!(f, "Self"),
+            Ty::Array(inner, n) => write!(f, "[{inner}; {n}]"),
+            Ty::Slice(inner) => write!(f, "&[{inner}]"),
+            Ty::Tuple(tys) => {
+                write!(f, "(")?;
+                for (i, ty) in tys.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{ty}")?;
+                }
+                write!(f, ")")
+            }
+            Ty::FnPtr { params, ret } => {
+                write!(f, "fn(")?;
+                for (i, ty) in params.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{ty}")?;
+                }
+                write!(f, ") -> {ret}")
+            }
+            Ty::Named(n) => write!(f, "{n}"),
+            Ty::DynTrait(t) => write!(f, "dyn {t}"),
+            Ty::Ref(inner) => write!(f, "&{inner}"),
+            Ty::RefMut(inner) => write!(f, "&mut {inner}"),
+            Ty::RawConst(inner) => write!(f, "*const {inner}"),
+            Ty::RawMut(inner) => write!(f, "*mut {inner}"),
         }
     }
 }

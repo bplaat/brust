@@ -294,6 +294,32 @@ impl TyEnv {
 }
 
 // ===========================================================================
+// Shared checker infrastructure
+// ===========================================================================
+
+/// State common to both TypeChecker and BorrowChecker: the type environment,
+/// accumulated errors, and the current source location for error messages.
+struct CheckerBase {
+    env: TyEnv,
+    errors: Vec<Error>,
+    cur_loc: Loc,
+}
+
+impl CheckerBase {
+    fn new(env: TyEnv) -> Self {
+        Self {
+            env,
+            errors: Vec::new(),
+            cur_loc: Loc::default(),
+        }
+    }
+
+    fn err(&mut self, msg: impl Into<String>) {
+        self.errors.push(Error::new(self.cur_loc, msg));
+    }
+}
+
+// ===========================================================================
 // Per-function variable scope
 // ===========================================================================
 
@@ -358,9 +384,7 @@ impl Scope {
 /// for error messages. `cur_mod` is the module prefix of the item being checked
 /// (e.g. `"math_"` for items in `mod math { }`, or `""` at top level).
 struct TypeChecker {
-    env: TyEnv,
-    errors: Vec<Error>,
-    cur_loc: Loc,
+    base: CheckerBase,
     /// Module prefix of the function/item currently being checked (e.g. "math_" or "").
     cur_mod: String,
     /// Whether the current expression context is inside an `unsafe` block.
@@ -370,16 +394,14 @@ struct TypeChecker {
 impl TypeChecker {
     fn new(env: TyEnv) -> Self {
         Self {
-            env,
-            errors: Vec::new(),
-            cur_loc: Loc::default(),
+            base: CheckerBase::new(env),
             cur_mod: String::new(),
             in_unsafe: false,
         }
     }
 
     fn err(&mut self, msg: impl Into<String>) {
-        self.errors.push(Error::new(self.cur_loc, msg));
+        self.base.err(msg);
     }
 
     /// Check whether `name` (a fully-qualified item) is accessible from `cur_mod`.
@@ -388,9 +410,9 @@ impl TypeChecker {
     ///   (a) the caller is in the same module or a descendant, OR
     ///   (b) the item is marked pub.
     fn check_item_visibility(&mut self, name: &str) {
-        if let Some(item_mod) = self.env.item_module.get(name).cloned() {
+        if let Some(item_mod) = self.base.env.item_module.get(name).cloned() {
             let accessible =
-                self.cur_mod.starts_with(item_mod.as_str()) || self.env.pub_items.contains(name);
+                self.cur_mod.starts_with(item_mod.as_str()) || self.base.env.pub_items.contains(name);
             if !accessible {
                 self.err(format!("`{name}` is private"));
             }
@@ -400,11 +422,11 @@ impl TypeChecker {
     /// Check that `field` of struct `struct_name` is accessible from `cur_mod`.
     fn check_field_visibility(&mut self, struct_name: &str, field: &str) {
         // Only enforce if the struct is inside a module.
-        if let Some(struct_mod) = self.env.item_module.get(struct_name).cloned() {
+        if let Some(struct_mod) = self.base.env.item_module.get(struct_name).cloned() {
             if !self.cur_mod.starts_with(struct_mod.as_str()) {
                 // We're outside the struct's module: field must be pub.
                 let is_pub = self
-                    .env
+                    .base.env
                     .pub_fields
                     .get(struct_name)
                     .is_some_and(|s| s.contains(field));
@@ -417,12 +439,12 @@ impl TypeChecker {
 
     /// Resolve type alias chain (cycle-safe).
     fn resolve(&self, ty: &Ty) -> Ty {
-        self.env.resolve(ty)
+        self.base.env.resolve(ty)
     }
 
     /// Type compatibility with alias resolution on both sides.
     fn compat(&self, got: &Ty, expected: &Ty) -> bool {
-        ty_compat(&self.resolve(got), &self.resolve(expected))
+        self.resolve(got).is_compat_with(&self.resolve(expected))
     }
 
     // -----------------------------------------------------------------------
@@ -442,13 +464,13 @@ impl TypeChecker {
         for item in items {
             match item {
                 Item::Struct(s) => {
-                    self.cur_loc = s.loc;
+                    self.base.cur_loc = s.loc;
                     for f in &s.fields {
                         self.validate_ty(&f.ty);
                     }
                 }
                 Item::Enum(e) => {
-                    self.cur_loc = e.loc;
+                    self.base.cur_loc = e.loc;
                     for v in &e.variants {
                         match &v.fields {
                             VariantFields::Tuple(tys) => {
@@ -469,7 +491,7 @@ impl TypeChecker {
                     self.validate_ty(ty);
                 }
                 Item::Fn(f) => {
-                    self.cur_loc = f.loc;
+                    self.base.cur_loc = f.loc;
                     for p in &f.params {
                         self.validate_ty(&p.ty);
                     }
@@ -478,14 +500,14 @@ impl TypeChecker {
                 Item::Impl(imp) => {
                     // Validate the impl target type exists.
                     let mangled = format!("{prefix}{}", imp.type_name);
-                    if !self.env.structs.contains_key(&mangled)
-                        && !self.env.enums.contains_key(&mangled)
+                    if !self.base.env.structs.contains_key(&mangled)
+                        && !self.base.env.enums.contains_key(&mangled)
                     {
                         self.err(format!("impl for unknown type `{}`", imp.type_name));
                     }
                     // Validate trait exists and all required methods are provided.
                     if let Some(trait_name) = &imp.trait_name {
-                        if let Some(tr) = self.env.traits.get(trait_name).cloned() {
+                        if let Some(tr) = self.base.env.traits.get(trait_name).cloned() {
                             for sig in &tr.methods {
                                 // Methods with a default body don't need to be overridden.
                                 if sig.body.is_none()
@@ -502,7 +524,7 @@ impl TypeChecker {
                         }
                     }
                     for m in &imp.methods {
-                        self.cur_loc = m.loc;
+                        self.base.cur_loc = m.loc;
                         for p in &m.params {
                             self.validate_ty(&p.ty);
                         }
@@ -529,7 +551,7 @@ impl TypeChecker {
                 Item::ExternBlock(fns) => {
                     // Validate param and return types of every extern fn declaration.
                     for f in fns {
-                        self.cur_loc = f.loc;
+                        self.base.cur_loc = f.loc;
                         for p in &f.params {
                             self.validate_ty(&p.ty);
                         }
@@ -549,9 +571,9 @@ impl TypeChecker {
     fn validate_ty(&mut self, ty: &Ty) {
         match ty {
             Ty::Named(name) => {
-                if !self.env.structs.contains_key(name)
-                    && !self.env.enums.contains_key(name)
-                    && !self.env.type_aliases.contains_key(name)
+                if !self.base.env.structs.contains_key(name)
+                    && !self.base.env.enums.contains_key(name)
+                    && !self.base.env.type_aliases.contains_key(name)
                 {
                     self.err(format!("unknown type `{name}`"));
                 } else {
@@ -559,7 +581,7 @@ impl TypeChecker {
                 }
             }
             Ty::DynTrait(name) => {
-                if !self.env.traits.contains_key(name) {
+                if !self.base.env.traits.contains_key(name) {
                     self.err(format!("unknown trait `{name}`"));
                 } else {
                     self.check_item_visibility(name);
@@ -655,11 +677,11 @@ impl TypeChecker {
 
         // All-paths-return check for non-void functions.
         if return_ty != Ty::Unit && return_ty != Ty::Never && !block_definitely_returns(&f.body) {
-            self.cur_loc = f.loc;
+            self.base.cur_loc = f.loc;
             self.err(format!(
                 "function `{}` may not return a value (expected `{}`)",
                 f.name,
-                ty_display(&return_ty)
+                return_ty
             ));
         }
     }
@@ -684,13 +706,13 @@ impl TypeChecker {
                 && return_ty != &Ty::Never
                 && let StmtKind::Expr(expr) = &mut stmt.kind
             {
-                self.cur_loc = stmt.loc;
+                self.base.cur_loc = stmt.loc;
                 let ty = self.infer_expr(expr, scope);
                 if !self.compat(&ty, return_ty) {
                     self.err(format!(
                         "implicit return: expected `{}`, found `{}`",
-                        ty_display(return_ty),
-                        ty_display(&ty)
+                        return_ty,
+                        ty
                     ));
                 }
                 continue;
@@ -704,7 +726,7 @@ impl TypeChecker {
     // -----------------------------------------------------------------------
 
     fn check_stmt(&mut self, stmt: &mut Stmt, scope: &mut Scope, return_ty: &Ty) {
-        self.cur_loc = stmt.loc;
+        self.base.cur_loc = stmt.loc;
         match &mut stmt.kind {
             StmtKind::Let {
                 name,
@@ -719,8 +741,8 @@ impl TypeChecker {
                     if !self.compat(&inferred, ann) {
                         self.err(format!(
                             "let `{name}`: expected `{}`, found `{}`",
-                            ty_display(ann),
-                            ty_display(&inferred)
+                            ann,
+                            inferred
                         ));
                     }
                     ann.clone()
@@ -745,8 +767,8 @@ impl TypeChecker {
                         if !self.compat(&rhs, &lhs) {
                             self.err(format!(
                                 "assign `{name}`: expected `{}`, found `{}`",
-                                ty_display(&lhs),
-                                ty_display(&rhs)
+                                lhs,
+                                rhs
                             ));
                         }
                     }
@@ -758,8 +780,8 @@ impl TypeChecker {
                 if !self.compat(&ty, return_ty) {
                     self.err(format!(
                         "return type mismatch: expected `{}`, found `{}`",
-                        ty_display(return_ty),
-                        ty_display(&ty)
+                        return_ty,
+                        ty
                     ));
                 }
             }
@@ -768,7 +790,7 @@ impl TypeChecker {
                 if !self.compat(&Ty::Unit, return_ty) && return_ty != &Ty::Never {
                     self.err(format!(
                         "empty return in function returning `{}`",
-                        ty_display(return_ty)
+                        return_ty
                     ));
                 }
             }
@@ -782,7 +804,7 @@ impl TypeChecker {
                 if !self.compat(&ct, &Ty::Bool) {
                     self.err(format!(
                         "if condition must be `bool`, found `{}`",
-                        ty_display(&ct)
+                        ct
                     ));
                 }
                 self.check_block(then_block, scope, return_ty);
@@ -796,7 +818,7 @@ impl TypeChecker {
                 if !self.compat(&ct, &Ty::Bool) {
                     self.err(format!(
                         "while condition must be `bool`, found `{}`",
-                        ty_display(&ct)
+                        ct
                     ));
                 }
                 self.check_block(body, scope, return_ty);
@@ -855,12 +877,12 @@ impl TypeChecker {
             StmtKind::CompoundAssign { lhs, rhs, .. } => {
                 let rhs_ty = self.infer_expr(rhs, scope);
                 if let Some(lhs_ty) = self.infer_lvalue(lhs, scope)
-                    && !ty_compat(&rhs_ty, &lhs_ty)
+                    && !rhs_ty.is_compat_with(&lhs_ty)
                 {
                     self.err(format!(
                         "compound assignment: expected `{}`, found `{}`",
-                        ty_display(&lhs_ty),
-                        ty_display(&rhs_ty)
+                        lhs_ty,
+                        rhs_ty
                     ));
                 }
             }
@@ -882,7 +904,7 @@ impl TypeChecker {
                     if !self.compat(&ct, &Ty::Bool) {
                         self.err(format!(
                             "if-let chain condition must be `bool`, found `{}`",
-                            ty_display(&ct)
+                            ct
                         ));
                     }
                 }
@@ -913,12 +935,12 @@ impl TypeChecker {
                     if let ExprKind::BinOp { lhs, rhs, .. } = &mut expr.kind {
                         let rhs_ty = self.infer_expr(rhs, scope);
                         if let Some(lhs_ty) = self.infer_lvalue(lhs, scope)
-                            && !ty_compat(&rhs_ty, &lhs_ty)
+                            && !rhs_ty.is_compat_with(&lhs_ty)
                         {
                             self.err(format!(
                                 "assignment: expected `{}`, found `{}`",
-                                ty_display(&lhs_ty),
-                                ty_display(&rhs_ty)
+                                lhs_ty,
+                                rhs_ty
                             ));
                         }
                     }
@@ -969,7 +991,7 @@ impl TypeChecker {
             if !self.compat(&gt, &Ty::Bool) {
                 self.err(format!(
                     "match guard must be `bool`, found `{}`",
-                    ty_display(&gt)
+                    gt
                 ));
             }
         }
@@ -989,25 +1011,25 @@ impl TypeChecker {
 
             Pat::Bool(_) => {
                 if scrutinee_ty != &Ty::Bool {
-                    self.err(format!("bool pattern on `{}`", ty_display(scrutinee_ty)));
+                    self.err(format!("bool pattern on `{}`", scrutinee_ty));
                 }
             }
 
             Pat::Int(_) => {
-                if !is_integer(scrutinee_ty) {
-                    self.err(format!("integer pattern on `{}`", ty_display(scrutinee_ty)));
+                if !scrutinee_ty.is_integer() {
+                    self.err(format!("integer pattern on `{}`", scrutinee_ty));
                 }
             }
 
             Pat::Char(_) => {
                 if scrutinee_ty != &Ty::Char {
-                    self.err(format!("char pattern on `{}`", ty_display(scrutinee_ty)));
+                    self.err(format!("char pattern on `{}`", scrutinee_ty));
                 }
             }
 
             Pat::CharRange { .. } => {
                 if scrutinee_ty != &Ty::Char {
-                    self.err(format!("char range pattern on `{}`", ty_display(scrutinee_ty)));
+                    self.err(format!("char range pattern on `{}`", scrutinee_ty));
                 }
             }
 
@@ -1017,10 +1039,10 @@ impl TypeChecker {
             }
 
             Pat::Range { .. } => {
-                if !is_integer(scrutinee_ty) {
+                if !scrutinee_ty.is_integer() {
                     self.err(format!(
                         "range pattern on non-integer `{}`",
-                        ty_display(scrutinee_ty)
+                        scrutinee_ty
                     ));
                 }
             }
@@ -1035,7 +1057,7 @@ impl TypeChecker {
             }
 
             Pat::TupleStruct { type_name, fields } => {
-                if let Some(sdecl) = self.env.structs.get(type_name).cloned() {
+                if let Some(sdecl) = self.base.env.structs.get(type_name).cloned() {
                     for (i, pat) in fields.iter().enumerate() {
                         let field_ty = sdecl
                             .fields
@@ -1065,10 +1087,10 @@ impl TypeChecker {
                 if !ok {
                     self.err(format!(
                         "pattern `{type_name}::{variant}` used on `{}`",
-                        ty_display(scrutinee_ty)
+                        scrutinee_ty
                     ));
                 }
-                if let Some(edecl) = self.env.enums.get(type_name).cloned() {
+                if let Some(edecl) = self.base.env.enums.get(type_name).cloned() {
                     if let Some(ev) = edecl.variants.iter().find(|v| v.name == *variant) {
                         match (bindings, &ev.fields) {
                             (PatBindings::None, _) => {} // unit or ignored
@@ -1111,7 +1133,7 @@ impl TypeChecker {
                         self.err(format!("no variant `{variant}` in enum `{type_name}`"));
                     }
                 } else if type_name == variant
-                    && let Some(sdecl) = self.env.structs.get(type_name).cloned()
+                    && let Some(sdecl) = self.base.env.structs.get(type_name).cloned()
                 {
                     // Struct pattern: `Point { x, y, .. }` -- type_name and variant are the same.
                     if let PatBindings::Named(fields, _has_rest) = bindings {
@@ -1155,7 +1177,7 @@ impl TypeChecker {
                     if !self.compat(&ct, &Ty::Bool) {
                         self.err(format!(
                             "if condition must be `bool`, found `{}`",
-                            ty_display(&ct)
+                            ct
                         ));
                     }
                     let then_ty = self.infer_block_value_ty(then_block, &block_scope);
@@ -1163,11 +1185,11 @@ impl TypeChecker {
                         .as_mut()
                         .map(|b| self.infer_block_value_ty(b, &block_scope))
                         .unwrap_or(Ty::Unit);
-                    if !ty_compat(&then_ty, &else_ty) && !ty_compat(&else_ty, &then_ty) {
+                    if !then_ty.is_compat_with(&else_ty) && !else_ty.is_compat_with(&then_ty) {
                         self.err(format!(
                             "if/else branch type mismatch: `{}` vs `{}`",
-                            ty_display(&then_ty),
-                            ty_display(&else_ty)
+                            then_ty,
+                            else_ty
                         ));
                     }
                     then_ty
@@ -1183,11 +1205,11 @@ impl TypeChecker {
                     for arm in arms.iter_mut() {
                         let arm_ty = self.infer_arm_value_ty(arm, &sc_ty, &block_scope);
                         if let Some(ref rt) = result_ty {
-                            if !ty_compat(&arm_ty, rt) && !ty_compat(rt, &arm_ty) {
+                            if !arm_ty.is_compat_with(rt) && !rt.is_compat_with(&arm_ty) {
                                 self.err(format!(
                                     "match arms have incompatible types: `{}` vs `{}`",
-                                    ty_display(rt),
-                                    ty_display(&arm_ty)
+                                    rt,
+                                    arm_ty
                                 ));
                             }
                         } else {
@@ -1247,7 +1269,7 @@ impl TypeChecker {
             bindings,
         } = &arm.pat
         {
-            if let Some(edecl) = self.env.enums.get(type_name).cloned() {
+            if let Some(edecl) = self.base.env.enums.get(type_name).cloned() {
                 if let Some(ev) = edecl.variants.iter().find(|v| v.name == *variant) {
                     match (bindings, &ev.fields) {
                         (PatBindings::Tuple(pats), VariantFields::Tuple(tys)) => {
@@ -1287,7 +1309,7 @@ impl TypeChecker {
     /// `self.err()`; on error, a best-effort fallback type (`Ty::Unit`) is returned
     /// so checking can continue and collect multiple errors in one pass.
     fn infer_expr(&mut self, expr: &mut Expr, scope: &Scope) -> Ty {
-        self.cur_loc = expr.loc;
+        self.base.cur_loc = expr.loc;
         match &mut expr.kind {
             // Literals: suffixed integers infer as their explicit type; unsuffixed
             // integer/float literals use canonical types widened by ty_compat.
@@ -1309,18 +1331,18 @@ impl TypeChecker {
                     }
                     None => {
                         // Allow using a function name as a first-class value.
-                        if let Some((param_tys, ret_ty)) = self.env.fns.get(name) {
+                        if let Some((param_tys, ret_ty)) = self.base.env.fns.get(name) {
                             return Ty::FnPtr {
                                 params: param_tys.clone(),
                                 ret: Box::new(ret_ty.clone()),
                             };
                         }
                         // Allow referencing global const/static.
-                        if let Some(ty) = self.env.consts.get(name) {
+                        if let Some(ty) = self.base.env.consts.get(name) {
                             return ty.clone();
                         }
                         // Unit struct used as a value: `Marker` or `Marker {}`
-                        if let Some(s) = self.env.structs.get(name) {
+                        if let Some(s) = self.base.env.structs.get(name) {
                             if s.fields.is_empty() && !s.is_tuple {
                                 return Ty::Named(name.clone());
                             }
@@ -1345,11 +1367,11 @@ impl TypeChecker {
                 let first = self.infer_expr(&mut elems[0], scope);
                 for e in &mut elems[1..] {
                     let t = self.infer_expr(e, scope);
-                    if !ty_compat(&t, &first) {
+                    if !t.is_compat_with(&first) {
                         self.err(format!(
                             "array element type mismatch: expected `{}`, found `{}`",
-                            ty_display(&first),
-                            ty_display(&t)
+                            first,
+                            t
                         ));
                     }
                 }
@@ -1369,23 +1391,23 @@ impl TypeChecker {
                     return match arr {
                         Ty::Array(inner, _) | Ty::Slice(inner) => Ty::Slice(inner),
                         _ => {
-                            self.err(format!("cannot slice type `{}`", ty_display(&arr)));
+                            self.err(format!("cannot slice type `{}`", arr));
                             Ty::Unit
                         }
                     };
                 }
                 let idx = self.infer_expr(index, scope);
-                if !is_integer(&idx) {
+                if !idx.is_integer() {
                     self.err(format!(
                         "array index must be an integer, found `{}`",
-                        ty_display(&idx)
+                        idx
                     ));
                 }
                 let arr = self.infer_expr(expr, scope);
                 match arr {
                     Ty::Array(inner, _) | Ty::Slice(inner) => *inner,
                     _ => {
-                        self.err(format!("cannot index type `{}`", ty_display(&arr)));
+                        self.err(format!("cannot index type `{}`", arr));
                         Ty::Unit
                     }
                 }
@@ -1403,7 +1425,7 @@ impl TypeChecker {
 
             ExprKind::StructLit { name, fields, rest } => {
                 self.check_item_visibility(name);
-                if let Some(s) = self.env.structs.get(name.as_str()).cloned() {
+                if let Some(s) = self.base.env.structs.get(name.as_str()).cloned() {
                     let provided: HashSet<String> = fields.iter().map(|(n, _)| n.clone()).collect();
                     for (fname, fexpr) in fields.iter_mut() {
                         let got = self.infer_expr(fexpr, scope);
@@ -1413,8 +1435,8 @@ impl TypeChecker {
                             if !self.compat(&got, &fd.ty) {
                                 self.err(format!(
                                     "field `{fname}` of `{name}`: expected `{}`, found `{}`",
-                                    ty_display(&fd.ty),
-                                    ty_display(&got)
+                                    fd.ty,
+                                    got
                                 ));
                             }
                         } else {
@@ -1426,7 +1448,7 @@ impl TypeChecker {
                         if !self.compat(&base_ty, &Ty::Named(name.clone())) {
                             self.err(format!(
                                 "struct update base has type `{}`, expected `{name}`",
-                                ty_display(&base_ty)
+                                base_ty
                             ));
                         }
                     } else {
@@ -1452,7 +1474,7 @@ impl TypeChecker {
                 fields,
             } => {
                 let mangled = format!("{type_name}_{variant}");
-                if let Some(edecl) = self.env.enums.get(type_name.as_str()).cloned() {
+                if let Some(edecl) = self.base.env.enums.get(type_name.as_str()).cloned() {
                     // Typed enum variant: Type::Variant { ... }
                     if let Some(ev) = edecl.variants.iter().find(|v| v.name == *variant) {
                         if let VariantFields::Named(decl_fields) = &ev.fields {
@@ -1465,8 +1487,8 @@ impl TypeChecker {
                                         self.err(format!(
                                             "field `{fname}` of `{type_name}::{variant}`: \
                                              expected `{}`, found `{}`",
-                                            ty_display(&df.ty),
-                                            ty_display(&got)
+                                            df.ty,
+                                            got
                                         ));
                                     }
                                 } else {
@@ -1496,7 +1518,7 @@ impl TypeChecker {
                         self.err(format!("no variant `{variant}` in enum `{type_name}`"));
                     }
                     Ty::Named(type_name.clone())
-                } else if let Some(s) = self.env.structs.get(&mangled).cloned() {
+                } else if let Some(s) = self.base.env.structs.get(&mangled).cloned() {
                     // Module-qualified struct literal: mod::Struct { ... }
                     self.check_item_visibility(&mangled);
                     let provided: HashSet<String> = fields.iter().map(|(n, _)| n.clone()).collect();
@@ -1507,8 +1529,8 @@ impl TypeChecker {
                             if !self.compat(&got, &fd.ty) {
                                 self.err(format!(
                                     "field `{fname}` of `{mangled}`: expected `{}`, found `{}`",
-                                    ty_display(&fd.ty),
-                                    ty_display(&got)
+                                    fd.ty,
+                                    got
                                 ));
                             }
                         } else {
@@ -1540,9 +1562,9 @@ impl TypeChecker {
                             self.err(format!("tuple index {idx} out of range"));
                             Ty::Unit
                         }),
-                        Ty::Named(n) if self.env.tuple_structs.contains(n) => {
+                        Ty::Named(n) if self.base.env.tuple_structs.contains(n) => {
                             // Tuple struct field access: Point.0 -> type of field _0
-                            if let Some(s) = self.env.structs.get(n) {
+                            if let Some(s) = self.base.env.structs.get(n) {
                                 let internal_name = format!("_{idx}");
                                 s.fields
                                     .iter()
@@ -1557,7 +1579,7 @@ impl TypeChecker {
                             }
                         }
                         _ => {
-                            self.err(format!("tuple index on non-tuple `{}`", ty_display(&ty)));
+                            self.err(format!("tuple index on non-tuple `{}`", ty));
                             Ty::Unit
                         }
                     }
@@ -1582,10 +1604,10 @@ impl TypeChecker {
             }
 
             ExprKind::Call { name, args } => {
-                if let Some((param_tys, ret_ty)) = self.env.fns.get(name).cloned() {
+                if let Some((param_tys, ret_ty)) = self.base.env.fns.get(name).cloned() {
                     self.check_item_visibility(name);
                     // Extern "C" functions require an unsafe block at the call site.
-                    if self.env.extern_fns.contains(name) && !self.in_unsafe {
+                    if self.base.env.extern_fns.contains(name) && !self.in_unsafe {
                         self.err(format!(
                             "call to unsafe extern fn `{name}` must be inside an `unsafe` block"
                         ));
@@ -1604,7 +1626,7 @@ impl TypeChecker {
                         }
                         self.err(format!(
                             "`{name}` is not callable (type: `{}`)",
-                            ty_display(&vi.ty)
+                            vi.ty
                         ));
                         Ty::Unit
                     }
@@ -1623,11 +1645,11 @@ impl TypeChecker {
                 args,
             } => {
                 let mangled = format!("{type_name}_{method}");
-                if let Some((param_tys, ret_ty)) = self.env.fns.get(&mangled).cloned() {
+                if let Some((param_tys, ret_ty)) = self.base.env.fns.get(&mangled).cloned() {
                     self.check_item_visibility(&mangled);
                     self.check_call_args(&mangled, args, &param_tys, scope);
                     ret_ty
-                } else if self.env.enums.get(type_name.as_str()).is_some_and(|e| {
+                } else if self.base.env.enums.get(type_name.as_str()).is_some_and(|e| {
                     e.variants
                         .iter()
                         .any(|v| v.name == *method && matches!(v.fields, VariantFields::Unit))
@@ -1651,7 +1673,7 @@ impl TypeChecker {
                 // Dyn trait dispatch: look up method in the trait definition.
                 if let Ty::DynTrait(trait_name) = &recv_r {
                     let trait_name = trait_name.clone();
-                    if let Some(tr) = self.env.traits.get(&trait_name).cloned()
+                    if let Some(tr) = self.base.env.traits.get(&trait_name).cloned()
                         && let Some(sig) = tr.methods.iter().find(|m| m.name == *method)
                     {
                         for a in args.iter_mut() {
@@ -1665,9 +1687,9 @@ impl TypeChecker {
                     self.err(format!("no method `{method}` on `dyn {trait_name}`"));
                     return Ty::Unit;
                 }
-                if let Some(type_name) = base_type_name(&recv_r) {
+                if let Some(type_name) = recv_r.base_type_name() {
                     let mangled = format!("{type_name}_{method}");
-                    if let Some((param_tys, ret_ty)) = self.env.fns.get(&mangled).cloned() {
+                    if let Some((param_tys, ret_ty)) = self.base.env.fns.get(&mangled).cloned() {
                         self.check_item_visibility(&mangled);
                         self.check_call_args(&mangled, args, &param_tys, scope);
                         ret_ty
@@ -1675,7 +1697,7 @@ impl TypeChecker {
                         for a in args.iter_mut() {
                             self.infer_expr(a, scope);
                         }
-                        self.err(format!("no method `{method}` on `{}`", ty_display(&recv)));
+                        self.err(format!("no method `{method}` on `{}`", recv));
                         Ty::Unit
                     }
                 } else {
@@ -1684,7 +1706,7 @@ impl TypeChecker {
                     }
                     self.err(format!(
                         "method call `.{method}()` on primitive type `{}`",
-                        ty_display(&recv)
+                        recv
                     ));
                     Ty::Unit
                 }
@@ -1694,8 +1716,8 @@ impl TypeChecker {
                 let ty = self.infer_expr(operand, scope);
                 match op {
                     UnOp::Neg => {
-                        if !is_numeric(&ty) {
-                            self.err(format!("negation on non-numeric `{}`", ty_display(&ty)));
+                        if !ty.is_numeric() {
+                            self.err(format!("negation on non-numeric `{}`", ty));
                         }
                         ty
                     }
@@ -1703,19 +1725,19 @@ impl TypeChecker {
                         // In Rust, `!` on bool is logical NOT, on integers is bitwise NOT.
                         if ty == Ty::Bool {
                             Ty::Bool
-                        } else if is_integer(&ty) {
+                        } else if ty.is_integer() {
                             ty
                         } else {
                             self.err(format!(
                                 "NOT operator on non-bool/integer `{}`",
-                                ty_display(&ty)
+                                ty
                             ));
                             Ty::Bool
                         }
                     }
                     UnOp::BitNot => {
-                        if !is_integer(&ty) {
-                            self.err(format!("bitwise NOT on non-integer `{}`", ty_display(&ty)));
+                        if !ty.is_integer() {
+                            self.err(format!("bitwise NOT on non-integer `{}`", ty));
                         }
                         ty
                     }
@@ -1748,7 +1770,7 @@ impl TypeChecker {
                 match ty {
                     Ty::Ref(t) | Ty::RefMut(t) | Ty::RawConst(t) | Ty::RawMut(t) => *t,
                     _ => {
-                        self.err(format!("cannot dereference `{}`", ty_display(&ty)));
+                        self.err(format!("cannot dereference `{}`", ty));
                         Ty::Unit
                     }
                 }
@@ -1773,7 +1795,7 @@ impl TypeChecker {
                         _ => None,
                     };
                     if let Some(expr) = tail_expr {
-                        self.cur_loc = last.loc;
+                        self.base.cur_loc = last.loc;
                         self.infer_expr(expr, &inner_scope)
                     } else {
                         self.check_stmt(last, &mut inner_scope, &Ty::Unit);
@@ -1797,7 +1819,7 @@ impl TypeChecker {
                 if !self.compat(&ct, &Ty::Bool) {
                     self.err(format!(
                         "if condition must be `bool`, found `{}`",
-                        ty_display(&ct)
+                        ct
                     ));
                 }
                 let then_ty = self.infer_block_value_ty(then_block, scope);
@@ -1805,11 +1827,11 @@ impl TypeChecker {
                     .as_mut()
                     .map(|b| self.infer_block_value_ty(b, scope))
                     .unwrap_or(Ty::Unit);
-                if !ty_compat(&then_ty, &else_ty) && !ty_compat(&else_ty, &then_ty) {
+                if !then_ty.is_compat_with(&else_ty) && !else_ty.is_compat_with(&then_ty) {
                     self.err(format!(
                         "if/else branch type mismatch: `{}` vs `{}`",
-                        ty_display(&then_ty),
-                        ty_display(&else_ty)
+                        then_ty,
+                        else_ty
                     ));
                 }
                 then_ty
@@ -1826,11 +1848,11 @@ impl TypeChecker {
                 for arm in arms.iter_mut() {
                     let arm_ty = self.infer_arm_value_ty(arm, &sc_ty, scope);
                     if let Some(ref rt) = result_ty {
-                        if !ty_compat(&arm_ty, rt) && !ty_compat(rt, &arm_ty) {
+                        if !arm_ty.is_compat_with(rt) && !rt.is_compat_with(&arm_ty) {
                             self.err(format!(
                                 "match arms have incompatible types: `{}` vs `{}`",
-                                ty_display(rt),
-                                ty_display(&arm_ty)
+                                rt,
+                                arm_ty
                             ));
                         }
                     } else {
@@ -1893,11 +1915,11 @@ impl TypeChecker {
                     .as_mut()
                     .map(|b| self.infer_block_value_ty(b, scope))
                     .unwrap_or(Ty::Unit);
-                if !ty_compat(&then_ty, &else_ty) && !ty_compat(&else_ty, &then_ty) {
+                if !then_ty.is_compat_with(&else_ty) && !else_ty.is_compat_with(&then_ty) {
                     self.err(format!(
                         "if-let branch type mismatch: `{}` vs `{}`",
-                        ty_display(&then_ty),
-                        ty_display(&else_ty)
+                        then_ty,
+                        else_ty
                     ));
                 }
                 then_ty
@@ -1918,7 +1940,7 @@ impl TypeChecker {
     /// extra arguments beyond that are accepted without type checking.
     /// Arguments are inferred even on arity mismatch so subsequent errors are still caught.
     fn check_call_args(&mut self, name: &str, args: &mut [Expr], param_tys: &[Ty], scope: &Scope) {
-        let is_variadic = self.env.variadic_fns.contains(name);
+        let is_variadic = self.base.env.variadic_fns.contains(name);
         let arity_ok = if is_variadic {
             args.len() >= param_tys.len()
         } else {
@@ -1946,8 +1968,8 @@ impl TypeChecker {
                 self.err(format!(
                     "argument {} of `{name}`: expected `{}`, found `{}`",
                     i + 1,
-                    ty_display(param_ty),
-                    ty_display(&got)
+                    param_ty,
+                    got
                 ));
             }
         }
@@ -1961,8 +1983,8 @@ impl TypeChecker {
     /// Resolves type aliases before looking up the struct declaration.
     fn lookup_field_ty(&mut self, ty: &Ty, field: &str) -> Ty {
         let ty_r = self.resolve(ty);
-        if let Some(name) = base_type_name(&ty_r)
-            && let Some(s) = self.env.structs.get(&name)
+        if let Some(name) = ty_r.base_type_name()
+            && let Some(s) = self.base.env.structs.get(&name)
         {
             return s
                 .fields
@@ -1974,9 +1996,9 @@ impl TypeChecker {
                     Ty::Unit
                 });
         }
-        if base_type_name(&ty_r).is_none() {
+        if ty_r.base_type_name().is_none() {
             // Primitive type -- field access is always invalid.
-            self.err(format!("no field `{field}` on `{}`", ty_display(&ty_r)));
+            self.err(format!("no field `{field}` on `{}`", ty_r));
         }
         // Named type that is an enum -- field access happens through match bindings.
         Ty::Unit
@@ -2026,34 +2048,34 @@ impl TypeChecker {
         let rty_r = self.resolve(rty);
         match op {
             BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Rem => {
-                if !is_numeric(&lty_r) {
-                    self.err(format!("arithmetic on non-numeric `{}`", ty_display(lty)));
-                } else if !ty_compat(&rty_r, &lty_r) && !ty_compat(&lty_r, &rty_r) {
+                if !lty_r.is_numeric() {
+                    self.err(format!("arithmetic on non-numeric `{}`", lty));
+                } else if !rty_r.is_compat_with(&lty_r) && !lty_r.is_compat_with(&rty_r) {
                     self.err(format!(
                         "arithmetic type mismatch: `{}` vs `{}`",
-                        ty_display(lty),
-                        ty_display(rty)
+                        lty,
+                        rty
                     ));
                 }
                 lty.clone()
             }
             BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor | BinOp::Shl | BinOp::Shr => {
-                if !is_integer(&lty_r) {
-                    self.err(format!("bitwise op on non-integer `{}`", ty_display(lty)));
-                } else if !is_integer(&rty_r) {
+                if !lty_r.is_integer() {
+                    self.err(format!("bitwise op on non-integer `{}`", lty));
+                } else if !rty_r.is_integer() {
                     self.err(format!(
                         "bitwise op RHS must be integer, found `{}`",
-                        ty_display(rty)
+                        rty
                     ));
                 }
                 lty.clone()
             }
             BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Gt | BinOp::Le | BinOp::Ge => {
-                if !ty_compat(&lty_r, &rty_r) && !ty_compat(&rty_r, &lty_r) {
+                if !lty_r.is_compat_with(&rty_r) && !rty_r.is_compat_with(&lty_r) {
                     self.err(format!(
                         "comparison type mismatch: `{}` vs `{}`",
-                        ty_display(lty),
-                        ty_display(rty)
+                        lty,
+                        rty
                     ));
                 }
                 Ty::Bool
@@ -2062,13 +2084,13 @@ impl TypeChecker {
                 if !self.compat(lty, &Ty::Bool) {
                     self.err(format!(
                         "logical op requires `bool`, found `{}`",
-                        ty_display(lty)
+                        lty
                     ));
                 }
                 if !self.compat(rty, &Ty::Bool) {
                     self.err(format!(
                         "logical op requires `bool`, found `{}`",
-                        ty_display(rty)
+                        rty
                     ));
                 }
                 Ty::Bool
@@ -2178,22 +2200,18 @@ impl BScope {
 /// type errors) and enforces move semantics, mutability, and intra-statement
 /// borrow conflicts. See module-level doc for the full list of rules.
 struct BorrowChecker {
-    env: TyEnv,
-    errors: Vec<Error>,
-    cur_loc: Loc,
+    base: CheckerBase,
 }
 
 impl BorrowChecker {
     fn new(env: TyEnv) -> Self {
         Self {
-            env,
-            errors: Vec::new(),
-            cur_loc: Loc::default(),
+            base: CheckerBase::new(env),
         }
     }
 
     fn err(&mut self, msg: impl Into<String>) {
-        self.errors.push(Error::new(self.cur_loc, msg));
+        self.base.err(msg);
     }
 
     fn check_file(&mut self, file: &File) {
@@ -2280,7 +2298,7 @@ impl BorrowChecker {
     }
 
     fn check_stmt(&mut self, stmt: &Stmt, scope: &mut BScope) {
-        self.cur_loc = stmt.loc;
+        self.base.cur_loc = stmt.loc;
         match &stmt.kind {
             StmtKind::Let {
                 name,
@@ -2294,7 +2312,7 @@ impl BorrowChecker {
                 {
                     if sv.moved {
                         self.err(format!("use of moved value `{src}`"));
-                    } else if is_non_copy(&sv.ty) {
+                    } else if sv.ty.is_non_copy() {
                         let src_ty = sv.ty.clone();
                         scope.get_mut(src).unwrap().moved = true;
                         let final_ty = ty.clone().unwrap_or(src_ty);
@@ -2558,7 +2576,7 @@ impl BorrowChecker {
 
     /// Check that an lvalue is mutable before assignment.
     fn check_lvalue_mut(&mut self, expr: &Expr, scope: &BScope) {
-        self.cur_loc = expr.loc;
+        self.base.cur_loc = expr.loc;
         match &expr.kind {
             ExprKind::Var(name) => {
                 if let Some(bv) = scope.get(name)
@@ -2585,7 +2603,7 @@ impl BorrowChecker {
     /// Walk an expression for borrow checking.
     /// `by_ref`: true means this use is in a reference/borrow context — don't move.
     fn check_expr(&mut self, expr: &Expr, scope: &mut BScope, by_ref: bool) {
-        self.cur_loc = expr.loc;
+        self.base.cur_loc = expr.loc;
         match &expr.kind {
             ExprKind::Var(name) => {
                 if let Some(bv) = scope.get_mut(name) {
@@ -2593,7 +2611,7 @@ impl BorrowChecker {
                         self.err(format!("use of moved value `{name}`"));
                         return;
                     }
-                    if !by_ref && is_non_copy(&bv.ty) {
+                    if !by_ref && bv.ty.is_non_copy() {
                         bv.moved = true;
                     }
                 }
@@ -2601,10 +2619,10 @@ impl BorrowChecker {
 
             ExprKind::Call { name, args } => {
                 let param_tys = self
-                    .env
+                    .base.env
                     .fns
                     .get(name)
-                    .map(|(p, _)| p.clone())
+                    .map(|(p, _): &(Vec<_>, _)| p.clone())
                     .unwrap_or_default();
                 self.check_args(args, &param_tys, scope);
             }
@@ -2616,10 +2634,10 @@ impl BorrowChecker {
             } => {
                 let mangled = format!("{type_name}_{method}");
                 let param_tys = self
-                    .env
+                    .base.env
                     .fns
                     .get(&mangled)
-                    .map(|(p, _)| p.clone())
+                    .map(|(p, _): &(Vec<_>, _)| p.clone())
                     .unwrap_or_default();
                 self.check_args(args, &param_tys, scope);
             }
@@ -2720,7 +2738,7 @@ impl BorrowChecker {
 
     fn check_args(&mut self, args: &[Expr], param_tys: &[Ty], scope: &mut BScope) {
         for (i, arg) in args.iter().enumerate() {
-            let by_ref = param_tys.get(i).is_some_and(is_ref_ty);
+            let by_ref = param_tys.get(i).is_some_and(Ty::is_ref_like);
             self.check_expr(arg, scope, by_ref);
         }
     }
@@ -2733,7 +2751,7 @@ impl BorrowChecker {
         shared: &mut HashSet<String>,
         muts: &mut HashSet<String>,
     ) {
-        self.cur_loc = expr.loc;
+        self.base.cur_loc = expr.loc;
         match &expr.kind {
             ExprKind::AddrOf {
                 mutable: false,
@@ -2807,164 +2825,6 @@ impl BorrowChecker {
 }
 
 // ===========================================================================
-// Helper predicates and formatters
-// ===========================================================================
-
-/// True if `ty` is an integer type (signed or unsigned, any width).
-fn is_integer(ty: &Ty) -> bool {
-    matches!(
-        ty,
-        Ty::I8
-            | Ty::I16
-            | Ty::I32
-            | Ty::I64
-            | Ty::Isize
-            | Ty::U8
-            | Ty::U16
-            | Ty::U32
-            | Ty::U64
-            | Ty::Usize
-    )
-}
-
-/// True if `ty` is a floating-point type.
-fn is_float(ty: &Ty) -> bool {
-    matches!(ty, Ty::F32 | Ty::F64)
-}
-
-/// True if `ty` is any numeric type (integer or float).
-fn is_numeric(ty: &Ty) -> bool {
-    is_integer(ty) || is_float(ty)
-}
-
-/// True if `ty` is a reference or raw pointer (used to decide pass-by-ref in borrow check).
-fn is_ref_ty(ty: &Ty) -> bool {
-    matches!(
-        ty,
-        Ty::Ref(_) | Ty::RefMut(_) | Ty::RawConst(_) | Ty::RawMut(_)
-    )
-}
-
-/// Named types (structs and enums) are non-Copy in v1.
-/// All primitive types, references, raw pointers, arrays, and tuples are Copy.
-/// Currently returns false for everything because the C backend copies structs
-/// by value, so treating them as Copy is safe for now.
-fn is_non_copy(_ty: &Ty) -> bool {
-    // In v1 everything is treated as Copy: the C backend copies structs by value anyway.
-    false
-}
-
-/// Type compatibility: `got` is acceptable where `expected` is required.
-/// Handles widening coercions (integer/float literals, Never, &mut -> &, etc.)
-/// and structural compat for arrays, tuples, and function pointers.
-fn ty_compat(got: &Ty, expected: &Ty) -> bool {
-    if got == expected {
-        return true;
-    }
-    // SelfTy in annotations: compatible with any Named type (resolved in impl context).
-    if matches!(expected, Ty::SelfTy) || matches!(got, Ty::SelfTy) {
-        return true;
-    }
-    // Integer literal (I64) is compatible with any integer type.
-    if got == &Ty::I64 && is_integer(expected) {
-        return true;
-    }
-    // Float literal (F64) is compatible with any float type.
-    if got == &Ty::F64 && is_float(expected) {
-        return true;
-    }
-    // Never diverges — compatible with any type.
-    if got == &Ty::Never {
-        return true;
-    }
-    // &mut T coerces to &T.
-    if let (Ty::RefMut(a), Ty::Ref(b)) = (got, expected) {
-        return ty_compat(a, b);
-    }
-    // &mut T / &T coerce to raw pointer *mut T / *const T (C doesn't distinguish).
-    if let (Ty::RefMut(a), Ty::RawMut(b)) = (got, expected) {
-        return ty_compat(a, b);
-    }
-    if let (Ty::Ref(a), Ty::RawConst(b)) = (got, expected) {
-        return ty_compat(a, b);
-    }
-    // Recursive array compat: [I64; N] compat [i32; N].
-    if let (Ty::Array(ga, gn), Ty::Array(ea, en)) = (got, expected) {
-        return gn == en && ty_compat(ga, ea);
-    }
-    // Recursive tuple compat: (I64, I64) compat (i32, i64).
-    if let (Ty::Tuple(gs), Ty::Tuple(es)) = (got, expected) {
-        return gs.len() == es.len() && gs.iter().zip(es.iter()).all(|(g, e)| ty_compat(g, e));
-    }
-    // Function pointer structural compat.
-    if let (
-        Ty::FnPtr {
-            params: gp,
-            ret: gr,
-        },
-        Ty::FnPtr {
-            params: ep,
-            ret: er,
-        },
-    ) = (got, expected)
-    {
-        return gp.len() == ep.len()
-            && gp.iter().zip(ep.iter()).all(|(g, e)| ty_compat(g, e))
-            && ty_compat(gr, er);
-    }
-    false
-}
-
-/// Extract the base struct/enum name from a type, peeling through references.
-/// Used for field and method resolution (e.g. `&Point` -> `"Point"`).
-fn base_type_name(ty: &Ty) -> Option<String> {
-    match ty {
-        Ty::Named(n) => Some(n.clone()),
-        Ty::Ref(inner) | Ty::RefMut(inner) => base_type_name(inner),
-        _ => None,
-    }
-}
-
-/// Human-readable type representation for error messages.
-pub fn ty_display(ty: &Ty) -> String {
-    match ty {
-        Ty::I8 => "i8".into(),
-        Ty::I16 => "i16".into(),
-        Ty::I32 => "i32".into(),
-        Ty::I64 => "i64".into(),
-        Ty::Isize => "isize".into(),
-        Ty::U8 => "u8".into(),
-        Ty::U16 => "u16".into(),
-        Ty::U32 => "u32".into(),
-        Ty::U64 => "u64".into(),
-        Ty::Usize => "usize".into(),
-        Ty::F32 => "f32".into(),
-        Ty::F64 => "f64".into(),
-        Ty::Bool => "bool".into(),
-        Ty::Char => "char".into(),
-        Ty::Unit => "()".into(),
-        Ty::Str => "&str".into(),
-        Ty::Never => "!".into(),
-        Ty::Array(inner, n) => format!("[{}; {n}]", ty_display(inner)),
-        Ty::Slice(inner) => format!("&[{}]", ty_display(inner)),
-        Ty::Tuple(tys) => format!(
-            "({})",
-            tys.iter().map(ty_display).collect::<Vec<_>>().join(", ")
-        ),
-        Ty::FnPtr { params, ret } => {
-            let ps = params.iter().map(ty_display).collect::<Vec<_>>().join(", ");
-            format!("fn({ps}) -> {}", ty_display(ret))
-        }
-        Ty::Named(n) => n.clone(),
-        Ty::DynTrait(t) => format!("dyn {t}"),
-        Ty::SelfTy => "Self".into(),
-        Ty::Ref(inner) => format!("&{}", ty_display(inner)),
-        Ty::RefMut(inner) => format!("&mut {}", ty_display(inner)),
-        Ty::RawConst(inner) => format!("*const {}", ty_display(inner)),
-        Ty::RawMut(inner) => format!("*mut {}", ty_display(inner)),
-    }
-}
-
 // ===========================================================================
 // Public entry point
 // ===========================================================================
@@ -2977,14 +2837,14 @@ pub fn check(file: &mut File) -> Vec<Error> {
     {
         let mut tc = TypeChecker::new(env.clone());
         tc.check_file(file);
-        errors.extend(tc.errors);
+        errors.extend(tc.base.errors);
     }
 
     // Phase 2: borrow checking (only if type checking was clean, to avoid cascading noise)
     if errors.is_empty() {
         let mut bc = BorrowChecker::new(env);
         bc.check_file(file);
-        errors.extend(bc.errors);
+        errors.extend(bc.base.errors);
     }
 
     errors
