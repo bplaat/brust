@@ -140,6 +140,8 @@ impl Parser {
         match &tok.kind {
             TokenKind::Let    => self.parse_let(),
             TokenKind::Return => self.parse_return(),
+            TokenKind::If     => self.parse_if(),
+            TokenKind::While  => self.parse_while(),
             // Identifier: println!, assignment `x = ...`, or call expression `f(...)`
             TokenKind::Ident(name) if name == "println" => self.parse_println(),
             TokenKind::Ident(_) => self.parse_ident_stmt(),
@@ -196,6 +198,32 @@ impl Parser {
         }
     }
 
+    fn parse_if(&mut self) -> Result<Stmt, Error> {
+        self.expect(&TokenKind::If)?;
+        let cond = self.parse_expr()?;
+        let then_block = self.parse_block()?;
+        let else_block = if self.peek().kind == TokenKind::Else {
+            self.advance();
+            if self.peek().kind == TokenKind::If {
+                // `else if ...` -> wrap in a block containing another if
+                let inner = self.parse_if()?;
+                Some(Block { stmts: vec![inner] })
+            } else {
+                Some(self.parse_block()?)
+            }
+        } else {
+            None
+        };
+        Ok(Stmt::If { cond, then_block, else_block })
+    }
+
+    fn parse_while(&mut self) -> Result<Stmt, Error> {
+        self.expect(&TokenKind::While)?;
+        let cond = self.parse_expr()?;
+        let body = self.parse_block()?;
+        Ok(Stmt::While { cond, body })
+    }
+
     fn parse_println(&mut self) -> Result<Stmt, Error> {
         self.expect_ident()?; // println
         self.expect(&TokenKind::Bang)?;
@@ -222,9 +250,63 @@ impl Parser {
     }
 
     // --- expressions (recursive descent with precedence) ---
+    // Precedence (lowest to highest):
+    //   || -> && -> == != -> < > <= >= -> + - -> * / % -> unary -> primary
 
     fn parse_expr(&mut self) -> Result<Expr, Error> {
-        self.parse_additive()
+        self.parse_or()
+    }
+
+    fn parse_or(&mut self) -> Result<Expr, Error> {
+        let mut lhs = self.parse_and()?;
+        while self.peek().kind == TokenKind::PipePipe {
+            self.advance();
+            let rhs = self.parse_and()?;
+            lhs = Expr::BinOp { op: BinOp::Or, lhs: Box::new(lhs), rhs: Box::new(rhs) };
+        }
+        Ok(lhs)
+    }
+
+    fn parse_and(&mut self) -> Result<Expr, Error> {
+        let mut lhs = self.parse_equality()?;
+        while self.peek().kind == TokenKind::AmpAmp {
+            self.advance();
+            let rhs = self.parse_equality()?;
+            lhs = Expr::BinOp { op: BinOp::And, lhs: Box::new(lhs), rhs: Box::new(rhs) };
+        }
+        Ok(lhs)
+    }
+
+    fn parse_equality(&mut self) -> Result<Expr, Error> {
+        let mut lhs = self.parse_relational()?;
+        loop {
+            let op = match self.peek().kind {
+                TokenKind::EqEq   => BinOp::Eq,
+                TokenKind::BangEq => BinOp::Ne,
+                _ => break,
+            };
+            self.advance();
+            let rhs = self.parse_relational()?;
+            lhs = Expr::BinOp { op, lhs: Box::new(lhs), rhs: Box::new(rhs) };
+        }
+        Ok(lhs)
+    }
+
+    fn parse_relational(&mut self) -> Result<Expr, Error> {
+        let mut lhs = self.parse_additive()?;
+        loop {
+            let op = match self.peek().kind {
+                TokenKind::Lt => BinOp::Lt,
+                TokenKind::Gt => BinOp::Gt,
+                TokenKind::Le => BinOp::Le,
+                TokenKind::Ge => BinOp::Ge,
+                _ => break,
+            };
+            self.advance();
+            let rhs = self.parse_additive()?;
+            lhs = Expr::BinOp { op, lhs: Box::new(lhs), rhs: Box::new(rhs) };
+        }
+        Ok(lhs)
     }
 
     fn parse_additive(&mut self) -> Result<Expr, Error> {
@@ -293,10 +375,11 @@ impl Parser {
                 self.advance();
                 Ok(Expr::Int(n))
             }
+            TokenKind::True  => { self.advance(); Ok(Expr::Bool(true)) }
+            TokenKind::False => { self.advance(); Ok(Expr::Bool(false)) }
             TokenKind::Ident(name) => {
                 let name = name.clone();
                 self.advance();
-                // Call expression: `name(args...)`
                 if self.peek().kind == TokenKind::LParen {
                     let args = self.parse_call_args()?;
                     Ok(Expr::Call { name, args })

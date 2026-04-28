@@ -7,6 +7,11 @@ pub enum TokenKind {
     Let,
     Mut,
     Return,
+    If,
+    Else,
+    While,
+    True,
+    False,
     // Identifiers and literals
     Ident(String),
     IntLit(i64),
@@ -17,6 +22,16 @@ pub enum TokenKind {
     Star,
     Slash,
     Percent,
+    // Comparison operators
+    EqEq,
+    BangEq,
+    Lt,
+    Gt,
+    Le,
+    Ge,
+    // Logical operators
+    AmpAmp,
+    PipePipe,
     // Punctuation
     LParen,
     RParen,
@@ -115,8 +130,36 @@ impl<'a> Lexer<'a> {
             b';' => { self.advance(); TokenKind::Semicolon }
             b',' => { self.advance(); TokenKind::Comma }
             b':' => { self.advance(); TokenKind::Colon }
-            b'=' => { self.advance(); TokenKind::Eq }
-            b'!' => { self.advance(); TokenKind::Bang }
+            b'=' => {
+                self.advance();
+                if self.peek() == Some(b'=') { self.advance(); TokenKind::EqEq } else { TokenKind::Eq }
+            }
+            b'!' => {
+                self.advance();
+                if self.peek() == Some(b'=') { self.advance(); TokenKind::BangEq } else { TokenKind::Bang }
+            }
+            b'<' => {
+                self.advance();
+                if self.peek() == Some(b'=') { self.advance(); TokenKind::Le } else { TokenKind::Lt }
+            }
+            b'>' => {
+                self.advance();
+                if self.peek() == Some(b'=') { self.advance(); TokenKind::Ge } else { TokenKind::Gt }
+            }
+            b'&' => {
+                self.advance();
+                if self.peek() == Some(b'&') { self.advance(); TokenKind::AmpAmp }
+                else {
+                    return Err(Error::new(line, col, "expected '&&', single '&' not yet supported"));
+                }
+            }
+            b'|' => {
+                self.advance();
+                if self.peek() == Some(b'|') { self.advance(); TokenKind::PipePipe }
+                else {
+                    return Err(Error::new(line, col, "expected '||', single '|' not yet supported"));
+                }
+            }
             b'+' => { self.advance(); TokenKind::Plus }
             b'-' => {
                 self.advance();
@@ -183,6 +226,11 @@ impl<'a> Lexer<'a> {
             "let"    => TokenKind::Let,
             "mut"    => TokenKind::Mut,
             "return" => TokenKind::Return,
+            "if"     => TokenKind::If,
+            "else"   => TokenKind::Else,
+            "while"  => TokenKind::While,
+            "true"   => TokenKind::True,
+            "false"  => TokenKind::False,
             _ => TokenKind::Ident(name),
         }
     }

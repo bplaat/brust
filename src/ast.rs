@@ -40,12 +40,17 @@ pub enum Stmt {
     Assign { name: String, expr: Expr },
     /// `return [expr];`
     Return(Option<Expr>),
+    /// `if expr { ... } [else { ... }]`
+    If { cond: Expr, then_block: Block, else_block: Option<Block> },
+    /// `while expr { ... }`
+    While { cond: Expr, body: Block },
     /// Expression used as a statement, e.g. a function call.
     Expr(Expr),
 }
 
 pub enum Expr {
     Int(i64),
+    Bool(bool),
     Var(String),
     Call { name: String, args: Vec<Expr> },
     BinOp { op: BinOp, lhs: Box<Expr>, rhs: Box<Expr> },
@@ -53,9 +58,10 @@ pub enum Expr {
 
 #[derive(Clone, Copy)]
 pub enum BinOp {
-    Add,
-    Sub,
-    Mul,
-    Div,
-    Rem,
+    // Arithmetic
+    Add, Sub, Mul, Div, Rem,
+    // Comparison
+    Eq, Ne, Lt, Gt, Le, Ge,
+    // Logical
+    And, Or,
 }
