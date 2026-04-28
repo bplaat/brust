@@ -291,6 +291,25 @@ impl Parser {
                     Err(Error::new(n_tok.line, n_tok.col, "expected integer size in array type".to_string()))
                 }
             }
+            TokenKind::Fn => {
+                // Function pointer: fn(T0, T1, ...) -> Ret
+                self.advance();
+                self.expect(&TokenKind::LParen)?;
+                let mut params = Vec::new();
+                while self.peek().kind != TokenKind::RParen && !self.at_eof() {
+                    if !params.is_empty() { self.expect(&TokenKind::Comma)?; }
+                    if self.peek().kind == TokenKind::RParen { break; }
+                    params.push(self.parse_ty()?);
+                }
+                self.expect(&TokenKind::RParen)?;
+                let ret = if self.peek().kind == TokenKind::Arrow {
+                    self.advance();
+                    self.parse_ty()?
+                } else {
+                    Ty::Unit
+                };
+                Ok(Ty::FnPtr { params, ret: Box::new(ret) })
+            }
             TokenKind::Star => {
                 self.advance();
                 let tok2 = self.peek().clone();
