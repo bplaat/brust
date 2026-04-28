@@ -11,9 +11,8 @@ use std::collections::HashMap;
 
 #[derive(Clone)]
 struct Ctx {
-    #[allow(dead_code)]
-    impl_type: Option<String>,
-    ref_self: bool,
+    /// True when `self` is passed by reference (i.e. `&self` or `&mut self` receiver).
+    self_by_ref: bool,
     /// Maps variable names to their struct/enum type name, for method call resolution.
     type_env: HashMap<String, String>,
     /// Maps variable names to their type, for printf format specifier selection.
@@ -37,8 +36,7 @@ struct Ctx {
 impl Ctx {
     fn new() -> Self {
         Self {
-            impl_type: None,
-            ref_self: false,
+            self_by_ref: false,
             type_env: HashMap::new(),
             var_types: HashMap::new(),
             return_ty: None,
@@ -56,12 +54,11 @@ impl Ctx {
         receiver: &Receiver,
         params_type_env: HashMap<String, String>,
     ) -> Self {
-        let ref_self = matches!(receiver, Receiver::Ref | Receiver::RefMut);
+        let self_by_ref = matches!(receiver, Receiver::Ref | Receiver::RefMut);
         let mut type_env = params_type_env;
         type_env.insert("self".to_string(), impl_type.to_string());
         Self {
-            impl_type: Some(impl_type.to_string()),
-            ref_self,
+            self_by_ref,
             type_env,
             var_types: HashMap::new(),
             return_ty: None,
@@ -322,9 +319,16 @@ impl Codegen {
                     let mut ctx = Ctx::new();
                     let val = self.emit_expr(expr, &mut ctx);
                     self.const_types.insert(prefixed.clone(), ty.clone());
-                    self.out.push_str(&format!("static const {decl} = {val};\n"));
+                    self.out
+                        .push_str(&format!("static const {decl} = {val};\n"));
                 }
-                Item::Static { name, ty, expr, mutable, .. } => {
+                Item::Static {
+                    name,
+                    ty,
+                    expr,
+                    mutable,
+                    ..
+                } => {
                     self.out.push('\n');
                     let prefixed = format!("{prefix}{name}");
                     let decl = ty_str_decl(ty, &prefixed);
@@ -655,11 +659,6 @@ impl Codegen {
         self.out.push_str("}\n\n");
     }
 
-    #[allow(dead_code)]
-    fn emit_impl(&mut self, _imp: &ImplBlock) {
-        // Kept for potential future use — module items use emit_fn directly
-    }
-
     /// Emit trampoline functions and a static vtable instance for `impl TraitName for TypeName`.
     fn emit_trait_impl(&mut self, imp: &ImplBlock, type_name: &str, trait_name: &str) {
         for m in &imp.methods {
@@ -972,7 +971,16 @@ impl Codegen {
                 expr_ty,
                 and_cond,
             } => {
-                self.emit_if_let(pat, expr, expr_ty.as_ref(), and_cond.as_ref(), then_block, else_block, ctx, indent);
+                self.emit_if_let(
+                    pat,
+                    expr,
+                    expr_ty.as_ref(),
+                    and_cond.as_ref(),
+                    then_block,
+                    else_block,
+                    ctx,
+                    indent,
+                );
             }
 
             StmtKind::WhileLet {
@@ -990,7 +998,12 @@ impl Codegen {
                 scrutinee_ty,
             } => self.emit_match(expr, arms, ctx, indent, scrutinee_ty.as_ref()),
 
-            StmtKind::LetPat { pat, ty, expr, else_block } => {
+            StmtKind::LetPat {
+                pat,
+                ty,
+                expr,
+                else_block,
+            } => {
                 if let Some(else_block) = else_block {
                     self.emit_let_else(pat, ty.as_ref(), expr, else_block, ctx, indent);
                 } else {
@@ -1153,7 +1166,12 @@ impl Codegen {
                     self.out.push_str(&format!("{p}if ({pat_cond}) {{\n"));
                     let mut arm_ctx = ctx.clone();
                     self.emit_if_let_enum_bindings(
-                        type_name, variant, bindings, &match_var, &ip, &mut arm_ctx,
+                        type_name,
+                        variant,
+                        bindings,
+                        &match_var,
+                        &ip,
+                        &mut arm_ctx,
                     );
                     let cond_s = self.emit_expr(and_cond.unwrap(), &mut arm_ctx);
                     self.out.push_str(&format!("{ip}if ({cond_s}) {{\n"));
@@ -1174,7 +1192,12 @@ impl Codegen {
                     self.out.push_str(&format!("{p}if ({pat_cond}) {{\n"));
                     let mut arm_ctx = ctx.clone();
                     self.emit_if_let_enum_bindings(
-                        type_name, variant, bindings, &match_var, &ip, &mut arm_ctx,
+                        type_name,
+                        variant,
+                        bindings,
+                        &match_var,
+                        &ip,
+                        &mut arm_ctx,
                     );
                     let cond_s = self.emit_expr(cond, &mut arm_ctx);
                     self.out.push_str(&format!("{ip}if ({cond_s}) {{\n"));
@@ -1187,7 +1210,12 @@ impl Codegen {
                     self.out.push_str(&format!("{p}if ({pat_cond}) {{\n"));
                     let mut arm_ctx = ctx.clone();
                     self.emit_if_let_enum_bindings(
-                        type_name, variant, bindings, &match_var, &ip, &mut arm_ctx,
+                        type_name,
+                        variant,
+                        bindings,
+                        &match_var,
+                        &ip,
+                        &mut arm_ctx,
                     );
                     for s in &then_block.stmts {
                         self.emit_stmt(s, &mut arm_ctx, indent + 1);
@@ -1218,7 +1246,9 @@ impl Codegen {
                             }
                         }
                         Pat::Int(n) => format!("({cond_expr}) == {n}"),
-                        Pat::Range { lo, hi } => format!("({cond_expr}) >= {lo} && ({cond_expr}) <= {hi}"),
+                        Pat::Range { lo, hi } => {
+                            format!("({cond_expr}) >= {lo} && ({cond_expr}) <= {hi}")
+                        }
                         Pat::EnumVariant {
                             type_name, variant, ..
                         } => {
@@ -1243,8 +1273,7 @@ impl Codegen {
                 } else {
                     self.out.push_str(&format!("{p}{{\n"));
                 }
-                self.out
-                    .push_str(&format!("{ip}{decl} = {expr_s};\n"));
+                self.out.push_str(&format!("{ip}{decl} = {expr_s};\n"));
                 for s in &then_block.stmts {
                     self.emit_stmt(s, ctx, indent + 1);
                 }
@@ -1297,8 +1326,7 @@ impl Codegen {
                     PatBindings::Named(fields_bind, _) => {
                         if let VariantFields::Named(decl_fields) = &ev.fields {
                             for (field_name, binding) in fields_bind {
-                                if let Some(df) =
-                                    decl_fields.iter().find(|f| f.name == *field_name)
+                                if let Some(df) = decl_fields.iter().find(|f| f.name == *field_name)
                                 {
                                     let fty = ty_str(&df.ty);
                                     self.out.push_str(&format!(
@@ -1333,14 +1361,17 @@ impl Codegen {
         match pat {
             Pat::Tuple(pats) => {
                 // `let (a, b) = tup;`
-                self.out.push_str(&format!("{p}__auto_type {tmp} = {expr_s};\n"));
+                self.out
+                    .push_str(&format!("{p}__auto_type {tmp} = {expr_s};\n"));
                 let tys: Vec<Ty> = match ty {
                     Some(Ty::Tuple(t)) => t.clone(),
                     _ => pats.iter().map(|_| Ty::I64).collect(),
                 };
                 for (i, sub_pat) in pats.iter().enumerate() {
                     if let Pat::Binding(name) = sub_pat {
-                        if name == "_" { continue; }
+                        if name == "_" {
+                            continue;
+                        }
                         let field_ty = tys.get(i).cloned().unwrap_or(Ty::I64);
                         let decl = ty_str_decl(&field_ty, name);
                         self.out.push_str(&format!("{p}{decl} = {tmp}._{i};\n"));
@@ -1350,11 +1381,15 @@ impl Codegen {
             Pat::TupleStruct { type_name, fields } => {
                 // `let Point(x, y) = p;`
                 let ts = ty_str(&Ty::Named(type_name.clone()));
-                self.out.push_str(&format!("{p}const {ts} {tmp} = {expr_s};\n"));
+                self.out
+                    .push_str(&format!("{p}const {ts} {tmp} = {expr_s};\n"));
                 for (i, sub_pat) in fields.iter().enumerate() {
                     if let Pat::Binding(name) = sub_pat {
-                        if name == "_" { continue; }
-                        self.out.push_str(&format!("{p}__auto_type {name} = {tmp}._{i};\n"));
+                        if name == "_" {
+                            continue;
+                        }
+                        self.out
+                            .push_str(&format!("{p}__auto_type {name} = {tmp}._{i};\n"));
                     }
                 }
             }
@@ -1364,7 +1399,8 @@ impl Codegen {
             }
             _ => {
                 // Generic fallback: store in temp
-                self.out.push_str(&format!("{p}__auto_type {tmp} = {expr_s};\n"));
+                self.out
+                    .push_str(&format!("{p}__auto_type {tmp} = {expr_s};\n"));
             }
         }
     }
@@ -1382,11 +1418,16 @@ impl Codegen {
         let ip = pad(indent + 1);
         let expr_s = self.emit_expr(expr, ctx);
         match pat {
-            Pat::EnumVariant { type_name, variant, bindings } => {
+            Pat::EnumVariant {
+                type_name,
+                variant,
+                bindings,
+            } => {
                 let match_var = match &expr.kind {
                     ExprKind::Var(n) => n.clone(),
                     _ => {
-                        self.out.push_str(&format!("{p}const {type_name} _le_tmp = {expr_s};\n"));
+                        self.out
+                            .push_str(&format!("{p}const {type_name} _le_tmp = {expr_s};\n"));
                         "_le_tmp".to_string()
                     }
                 };
@@ -1401,32 +1442,44 @@ impl Codegen {
                 // Bind variables after the guard.
                 let mut arm_ctx = ctx.clone();
                 self.emit_if_let_enum_bindings(
-                    type_name, variant, bindings, &match_var, &ip, &mut arm_ctx,
+                    type_name,
+                    variant,
+                    bindings,
+                    &match_var,
+                    &ip,
+                    &mut arm_ctx,
                 );
             }
             Pat::TupleStruct { type_name, fields } => {
                 let ts = ty_str(&Ty::Named(type_name.clone()));
-                self.out.push_str(&format!("{p}const {ts} _le_tmp = {expr_s};\n"));
+                self.out
+                    .push_str(&format!("{p}const {ts} _le_tmp = {expr_s};\n"));
                 // Tuple structs always match -- just bind fields.
                 for (i, sub_pat) in fields.iter().enumerate() {
                     if let Pat::Binding(name) = sub_pat {
-                        if name == "_" { continue; }
-                        self.out.push_str(&format!("{p}__auto_type {name} = _le_tmp._{i};\n"));
+                        if name == "_" {
+                            continue;
+                        }
+                        self.out
+                            .push_str(&format!("{p}__auto_type {name} = _le_tmp._{i};\n"));
                     }
                 }
             }
             Pat::Binding(name) => {
                 // `let x = expr else { ... };` -- always matches, bind.
-                self.out.push_str(&format!("{p}__auto_type {name} = {expr_s};\n"));
+                self.out
+                    .push_str(&format!("{p}__auto_type {name} = {expr_s};\n"));
             }
             _ => {
                 // Generic: store temp, run else if condition fails.
-                self.out.push_str(&format!("{p}__auto_type _le_tmp = {expr_s};\n"));
+                self.out
+                    .push_str(&format!("{p}__auto_type _le_tmp = {expr_s};\n"));
             }
         }
     }
 
-    fn emit_while_let(        &mut self,
+    fn emit_while_let(
+        &mut self,
         pat: &Pat,
         expr: &Expr,
         expr_ty: Option<&Ty>,
@@ -1484,19 +1537,14 @@ impl Codegen {
                 // For Var scrutinees: check tag directly each iteration, bind from var.
                 // For other exprs: use a compound-assignment temp to avoid re-evaluating.
                 let (cond, use_temp) = match &expr.kind {
-                    ExprKind::Var(n) => (
-                        format!("{n}.tag == {type_name}_{variant}_tag"),
-                        false,
-                    ),
+                    ExprKind::Var(n) => (format!("{n}.tag == {type_name}_{variant}_tag"), false),
                     _ => {
                         let expr_s = self.emit_expr(expr, ctx);
                         // Declare temp before loop; update it in the while condition.
                         let ty_s = ty_str(&Ty::Named(type_name.clone()));
-                        self.out
-                            .push_str(&format!("{p}{ty_s} _wlet_tmp;\n"));
-                        let cond = format!(
-                            "(_wlet_tmp = {expr_s}).tag == {type_name}_{variant}_tag"
-                        );
+                        self.out.push_str(&format!("{p}{ty_s} _wlet_tmp;\n"));
+                        let cond =
+                            format!("(_wlet_tmp = {expr_s}).tag == {type_name}_{variant}_tag");
                         (cond, true)
                     }
                 };
@@ -1621,8 +1669,7 @@ impl Codegen {
             Pat::Binding(name) => {
                 // Bind the whole matched value to `name`.
                 let decl = typed_or_auto_decl(scrutinee_ty, name);
-                self.out
-                    .push_str(&format!("{bp}{decl} = {match_var};\n"));
+                self.out.push_str(&format!("{bp}{decl} = {match_var};\n"));
                 return;
             }
             Pat::EnumVariant {
@@ -1634,7 +1681,11 @@ impl Codegen {
         };
         if !is_tagged {
             // Check if this is a struct pattern (type_name == variant, and it's a known struct).
-            if let Pat::EnumVariant { type_name, variant, bindings } = pat
+            if let Pat::EnumVariant {
+                type_name,
+                variant,
+                bindings,
+            } = pat
                 && type_name == variant
                 && let Some(sdecl) = self.structs.get(type_name.as_str()).cloned()
             {
@@ -1731,8 +1782,7 @@ impl Codegen {
         let ms = format!("_ms{ms_id}");
         let expr_s = self.emit_expr(expr, ctx);
         let ms_decl = typed_or_auto_decl(scrutinee_ty, &ms);
-        self.out
-            .push_str(&format!("{p}{ms_decl} = {expr_s};\n"));
+        self.out.push_str(&format!("{p}{ms_decl} = {expr_s};\n"));
 
         for (i, arm) in arms.iter().enumerate() {
             let mut arm_ctx = ctx.clone();
@@ -1748,8 +1798,7 @@ impl Codegen {
                     let cond = format!("({{ {cond_decl} = {ms}; {gs}; }})");
                     self.out.push_str(&format!("{p}{keyword} ({cond}) {{\n"));
                     let body_decl = typed_or_auto_decl(scrutinee_ty, name);
-                    self.out
-                        .push_str(&format!("{ip}{body_decl} = {ms};\n"));
+                    self.out.push_str(&format!("{ip}{body_decl} = {ms};\n"));
                     for s in &arm.body.stmts {
                         self.emit_stmt(s, &mut arm_ctx, indent + 1);
                     }
@@ -1758,7 +1807,10 @@ impl Codegen {
                 // Wildcard/binding without guard: always matches
                 (Pat::Wildcard, None) | (Pat::Binding(_), None) => {
                     let decl = if let Pat::Binding(name) = &arm.pat {
-                        Some(format!("{ip}{} = {ms};\n", typed_or_auto_decl(scrutinee_ty, name)))
+                        Some(format!(
+                            "{ip}{} = {ms};\n",
+                            typed_or_auto_decl(scrutinee_ty, name)
+                        ))
                     } else {
                         None
                     };
@@ -1783,12 +1835,16 @@ impl Codegen {
                         self.out.push_str(&format!("{p}{keyword} (1) {{\n"));
                         for (fi, sub_pat) in fields.iter().enumerate() {
                             if let Pat::Binding(name) = sub_pat {
-                                if name == "_" { continue; }
-                                let fty = sdecl.as_ref()
+                                if name == "_" {
+                                    continue;
+                                }
+                                let fty = sdecl
+                                    .as_ref()
                                     .and_then(|s| s.fields.get(fi))
                                     .map(|f| ty_str(&f.ty))
                                     .unwrap_or_else(|| "int64_t".to_string());
-                                self.out.push_str(&format!("{ip}{fty} {name} = {ms}._{fi};\n"));
+                                self.out
+                                    .push_str(&format!("{ip}{fty} {name} = {ms}._{fi};\n"));
                             }
                         }
                         if let Some(g) = guard {
@@ -1815,7 +1871,8 @@ impl Codegen {
                             type_name, variant, ..
                         } => {
                             // Struct pattern: type_name == variant means it's a plain struct (always matches).
-                            if type_name == variant && self.structs.contains_key(type_name.as_str()) {
+                            if type_name == variant && self.structs.contains_key(type_name.as_str())
+                            {
                                 "1".to_string()
                             } else {
                                 format!("{ms}.tag == {type_name}_{variant}_tag")
@@ -1853,13 +1910,23 @@ impl Codegen {
                     let (is_tagged, enum_decl) = if let Pat::EnumVariant { type_name, .. } = pat {
                         let edecl = self.enums.get(type_name.as_str()).cloned();
                         let is_t = edecl.as_ref().is_some_and(|e| {
-                            e.variants.iter().any(|v| !matches!(v.fields, VariantFields::Unit))
+                            e.variants
+                                .iter()
+                                .any(|v| !matches!(v.fields, VariantFields::Unit))
                         });
                         (is_t, edecl)
                     } else {
                         (false, None)
                     };
-                    self.emit_match_arm_bindings(pat, &ms, is_tagged, &enum_decl, &ip, &mut arm_ctx, scrutinee_ty);
+                    self.emit_match_arm_bindings(
+                        pat,
+                        &ms,
+                        is_tagged,
+                        &enum_decl,
+                        &ip,
+                        &mut arm_ctx,
+                        scrutinee_ty,
+                    );
                     for s in &arm.body.stmts {
                         self.emit_stmt(s, &mut arm_ctx, indent + 1);
                     }
@@ -1869,7 +1936,14 @@ impl Codegen {
         }
     }
 
-    fn emit_match(&mut self, expr: &Expr, arms: &[MatchArm], ctx: &mut Ctx, indent: usize, scrutinee_ty: Option<&Ty>) {
+    fn emit_match(
+        &mut self,
+        expr: &Expr,
+        arms: &[MatchArm],
+        ctx: &mut Ctx,
+        indent: usize,
+        scrutinee_ty: Option<&Ty>,
+    ) {
         // When any arm uses a binding or range pattern, C switch can't express it -- use if-else chain.
         let needs_if_chain = arms.iter().any(|a| matches!(&a.pat, Pat::Binding(_) | Pat::Range { .. } | Pat::TupleStruct { .. } | Pat::Tuple(_)))
             || arms.iter().any(|a| matches!(&a.pat, Pat::EnumVariant { type_name, variant, .. } if type_name == variant && self.structs.contains_key(type_name.as_str())));
@@ -2143,10 +2217,7 @@ impl Codegen {
             let ms_id = self.tmp_counter;
             self.tmp_counter += 1;
             let ms = format!("_ms{ms_id}");
-            (
-                ms.clone(),
-                format!("const {type_str} {ms} = {expr_s}; "),
-            )
+            (ms.clone(), format!("const {type_str} {ms} = {expr_s}; "))
         } else {
             (self.emit_expr(expr, ctx), String::new())
         };
@@ -2461,7 +2532,7 @@ impl Codegen {
 
             ExprKind::Field { expr, field } => {
                 let is_self_ptr =
-                    matches!(&expr.kind, ExprKind::Var(n) if n == "self") && ctx.ref_self;
+                    matches!(&expr.kind, ExprKind::Var(n) if n == "self") && ctx.self_by_ref;
                 let obj = self.emit_expr(expr, ctx);
                 // Numeric field name → tuple index `._N`; otherwise `.field` or `->field`
                 if field.chars().all(|c| c.is_ascii_digit()) {
@@ -2562,7 +2633,7 @@ impl Codegen {
                             // Inherent method.
                             let self_arg = if ctx.value_self_fns.contains(mangled.as_str())
                                 || (matches!(&expr.kind, ExprKind::Var(n) if n == "self")
-                                    && ctx.ref_self)
+                                    && ctx.self_by_ref)
                             {
                                 // Value receiver OR already-pointer self: pass directly.
                                 expr_c
@@ -2582,7 +2653,7 @@ impl Codegen {
                         {
                             // Trait impl method on concrete type — call trampoline with void* cast.
                             let self_ptr = if matches!(&expr.kind, ExprKind::Var(n) if n == "self")
-                                && ctx.ref_self
+                                && ctx.self_by_ref
                             {
                                 format!("(void*){expr_c}")
                             } else {
@@ -2738,7 +2809,11 @@ impl Codegen {
                     None
                 }
             }
-            ExprKind::MethodCall { expr: inner, method, .. } => {
+            ExprKind::MethodCall {
+                expr: inner,
+                method,
+                ..
+            } => {
                 if let Some(recv_type) = self.infer_type_name(inner, ctx) {
                     let mangled = format!("{recv_type}_{method}");
                     if let Some(Ty::Named(t)) = ctx.fn_ret_tys.get(mangled.as_str()) {
@@ -2961,8 +3036,14 @@ fn scan_items(items: &[Item], found: &mut Vec<Vec<Ty>>) {
                 }
             }
             Item::TypeAlias { ty, .. } => scan_ty(ty, found),
-            Item::Mod { items: mod_items, .. } => scan_items(mod_items, found),
-            Item::Trait(_) | Item::Skip | Item::ExternBlock(_) | Item::Const { .. } | Item::Static { .. } => {}
+            Item::Mod {
+                items: mod_items, ..
+            } => scan_items(mod_items, found),
+            Item::Trait(_)
+            | Item::Skip
+            | Item::ExternBlock(_)
+            | Item::Const { .. }
+            | Item::Static { .. } => {}
         }
     }
 }
@@ -3000,7 +3081,12 @@ fn scan_block(block: &crate::ast::Block, found: &mut Vec<Vec<Ty>>) {
                 }
                 scan_expr(expr, ty.as_ref(), found);
             }
-            StmtKind::LetPat { ty, expr, else_block, .. } => {
+            StmtKind::LetPat {
+                ty,
+                expr,
+                else_block,
+                ..
+            } => {
                 if let Some(t) = ty {
                     scan_ty(t, found);
                 }
@@ -3148,7 +3234,7 @@ fn typed_or_auto_decl(ty: Option<&Ty>, name: &str) -> String {
 
 /// Return the appropriate C zero-initializer literal for a type.
 /// Aggregate types need `{0}`; scalars and pointers use `0`.
-fn zero_init(ty: &Ty) -> &'static str {
+fn zero_init(ty: &Ty) -> &str {
     match ty {
         Ty::Named(_) | Ty::Tuple(_) | Ty::Array(_, _) => "{0}",
         _ => "0",

@@ -492,14 +492,19 @@ impl Lexer {
     fn consume_int_suffix(&mut self) {
         // Longest suffixes first to avoid consuming a prefix of a longer one.
         const SUFFIXES: &[&[u8]] = &[
-            b"u128", b"i128", b"usize", b"isize",
-            b"u64", b"i64", b"u32", b"i32", b"u16", b"i16", b"u8", b"i8",
+            b"u128", b"i128", b"usize", b"isize", b"u64", b"i64", b"u32", b"i32", b"u16", b"i16",
+            b"u8", b"i8",
         ];
         for suffix in SUFFIXES {
             let end = self.pos + suffix.len();
             if self.src.get(self.pos..end) == Some(*suffix) {
                 // Only consume if not followed by another alphanumeric char.
-                if !self.src.get(end).copied().is_some_and(|c| c.is_ascii_alphanumeric() || c == b'_') {
+                if !self
+                    .src
+                    .get(end)
+                    .copied()
+                    .is_some_and(|c| c.is_ascii_alphanumeric() || c == b'_')
+                {
                     for _ in 0..suffix.len() {
                         self.advance();
                     }
@@ -558,8 +563,8 @@ impl Lexer {
                 s.push(c as char);
             }
         }
-        let is_float = self.peek() == Some(b'.')
-            && self.src.get(self.pos + 1).copied() != Some(b'.')
+        let is_float = (self.peek() == Some(b'.')
+            && self.src.get(self.pos + 1).copied() != Some(b'.'))
             || matches!(self.peek(), Some(b'e') | Some(b'E'));
         if is_float {
             if self.peek() == Some(b'.') {

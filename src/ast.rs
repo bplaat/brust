@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 use crate::loc::Loc;
 
 /// A complete source file / compilation unit.
@@ -113,6 +111,7 @@ pub struct TraitDecl {
 #[derive(Clone)]
 pub struct TraitMethodSig {
     pub name: String,
+    #[allow(dead_code)]
     pub receiver: Receiver,
     pub params: Vec<Param>,
     pub return_ty: Ty,
@@ -322,7 +321,10 @@ pub enum Pat {
     Bool(bool),
     Int(i64),
     /// `lo..=hi` inclusive range pattern.
-    Range { lo: i64, hi: i64 },
+    Range {
+        lo: i64,
+        hi: i64,
+    },
     /// Binding pattern: `x` -- binds the matched value to a variable name.
     Binding(String),
     /// `Pat1 | Pat2 | ...` -- or-pattern (each alternative must be the same kind)
@@ -330,7 +332,10 @@ pub enum Pat {
     /// `(pat0, pat1, ...)` -- tuple destructure pattern
     Tuple(Vec<Pat>),
     /// `TypeName(pat0, pat1, ...)` -- tuple-struct pattern
-    TupleStruct { type_name: String, fields: Vec<Pat> },
+    TupleStruct {
+        type_name: String,
+        fields: Vec<Pat>,
+    },
     EnumVariant {
         type_name: String,
         variant: String,

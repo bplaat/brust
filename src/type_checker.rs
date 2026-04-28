@@ -124,7 +124,8 @@ impl TyEnv {
                     if s.is_tuple {
                         self.tuple_structs.insert(full.clone());
                         let params: Vec<Ty> = s.fields.iter().map(|f| f.ty.clone()).collect();
-                        self.fns.insert(full.clone(), (params, Ty::Named(full.clone())));
+                        self.fns
+                            .insert(full.clone(), (params, Ty::Named(full.clone())));
                     }
                     self.structs.insert(full, s.clone());
                 }
@@ -243,7 +244,9 @@ impl TyEnv {
                         }
                     }
                 }
-                Item::Const { name, ty, is_pub, .. } => {
+                Item::Const {
+                    name, ty, is_pub, ..
+                } => {
                     let full = format!("{prefix}{name}");
                     if in_mod {
                         self.item_module.insert(full.clone(), prefix.to_string());
@@ -253,7 +256,9 @@ impl TyEnv {
                     }
                     self.consts.insert(full, ty.clone());
                 }
-                Item::Static { name, ty, is_pub, .. } => {
+                Item::Static {
+                    name, ty, is_pub, ..
+                } => {
                     let full = format!("{prefix}{name}");
                     if in_mod {
                         self.item_module.insert(full.clone(), prefix.to_string());
@@ -798,7 +803,13 @@ impl TypeChecker {
                 self.check_block(body, scope, return_ty);
             }
 
-            StmtKind::For { var, iter, body, elem_ty, iter_ty } => {
+            StmtKind::For {
+                var,
+                iter,
+                body,
+                elem_ty,
+                iter_ty,
+            } => {
                 let it = self.infer_expr(iter, scope);
                 *iter_ty = Some(it.clone());
                 let inferred_elem_ty = match &it {
@@ -820,7 +831,11 @@ impl TypeChecker {
 
             StmtKind::Continue => {}
 
-            StmtKind::Match { expr, arms, scrutinee_ty } => {
+            StmtKind::Match {
+                expr,
+                arms,
+                scrutinee_ty,
+            } => {
                 let scrutinee = self.infer_expr(expr, scope);
                 *scrutinee_ty = Some(scrutinee.clone());
                 for arm in arms.iter_mut() {
@@ -909,7 +924,12 @@ impl TypeChecker {
                 }
             }
 
-            StmtKind::LetPat { pat, ty, expr, else_block } => {
+            StmtKind::LetPat {
+                pat,
+                ty,
+                expr,
+                else_block,
+            } => {
                 let inferred = self.infer_expr(expr, scope);
                 let final_ty = if let Some(ann) = ty.as_ref() {
                     self.validate_ty(ann);
@@ -978,7 +998,10 @@ impl TypeChecker {
 
             Pat::Range { .. } => {
                 if !is_integer(scrutinee_ty) {
-                    self.err(format!("range pattern on non-integer `{}`", ty_display(scrutinee_ty)));
+                    self.err(format!(
+                        "range pattern on non-integer `{}`",
+                        ty_display(scrutinee_ty)
+                    ));
                 }
             }
 
@@ -1042,7 +1065,10 @@ impl TypeChecker {
                                     self.bind_pat_vars(sub_pat, ty, scope);
                                 }
                             }
-                            (PatBindings::Named(fields, _has_rest), VariantFields::Named(decl_fields)) => {
+                            (
+                                PatBindings::Named(fields, _has_rest),
+                                VariantFields::Named(decl_fields),
+                            ) => {
                                 for (field_name, binding) in fields {
                                     if let Some(df) =
                                         decl_fields.iter().find(|f| f.name == *field_name)
@@ -1073,7 +1099,9 @@ impl TypeChecker {
                             if let Some(f) = sdecl.fields.iter().find(|f| f.name == *field_name) {
                                 scope.insert(binding.clone(), f.ty.clone(), false);
                             } else {
-                                self.err(format!("no field `{field_name}` in struct `{type_name}`"));
+                                self.err(format!(
+                                    "no field `{field_name}` in struct `{type_name}`"
+                                ));
                             }
                         }
                     }
@@ -1124,7 +1152,11 @@ impl TypeChecker {
                     }
                     then_ty
                 }
-                StmtKind::Match { expr, arms, scrutinee_ty } => {
+                StmtKind::Match {
+                    expr,
+                    arms,
+                    scrutinee_ty,
+                } => {
                     let sc_ty = self.infer_expr(expr, &block_scope);
                     *scrutinee_ty = Some(sc_ty.clone());
                     let mut result_ty: Option<Ty> = None;
@@ -1493,10 +1525,7 @@ impl TypeChecker {
                             }
                         }
                         _ => {
-                            self.err(format!(
-                                "tuple index on non-tuple `{}`",
-                                ty_display(&ty)
-                            ));
+                            self.err(format!("tuple index on non-tuple `{}`", ty_display(&ty)));
                             Ty::Unit
                         }
                     }
@@ -1754,7 +1783,11 @@ impl TypeChecker {
                 then_ty
             }
 
-            ExprKind::Match { expr, arms, scrutinee_ty } => {
+            ExprKind::Match {
+                expr,
+                arms,
+                scrutinee_ty,
+            } => {
                 let sc_ty = self.infer_expr(expr, scope);
                 *scrutinee_ty = Some(sc_ty.clone());
                 let mut result_ty: Option<Ty> = None;
@@ -1777,7 +1810,7 @@ impl TypeChecker {
 
             ExprKind::Loop { body, result_ty } => {
                 // Infer loop type from `break val` — scan body for first `break val`.
-                fn find_break_expr<'a>(stmts: &'a mut [Stmt]) -> Option<&'a mut Expr> {
+                fn find_break_expr(stmts: &mut [Stmt]) -> Option<&mut Expr> {
                     for s in stmts {
                         match &mut s.kind {
                             StmtKind::Break(Some(v)) => return Some(v),
@@ -2272,7 +2305,9 @@ impl BorrowChecker {
                 self.check_block(body, scope);
             }
 
-            StmtKind::For { var, iter: _, body, .. } => {
+            StmtKind::For {
+                var, iter: _, body, ..
+            } => {
                 scope.insert(
                     var.clone(),
                     BVar {
@@ -2345,10 +2380,7 @@ impl BorrowChecker {
             }
 
             StmtKind::WhileLet {
-                pat,
-                expr,
-                body,
-                ..
+                pat, expr, body, ..
             } => {
                 self.check_expr(expr, scope, false);
                 let mut body_scope = scope.clone();
@@ -2445,7 +2477,9 @@ impl BorrowChecker {
                 }
             }
 
-            StmtKind::LetPat { expr, else_block, .. } => {
+            StmtKind::LetPat {
+                expr, else_block, ..
+            } => {
                 self.check_expr(expr, scope, false);
                 if let Some(else_block) = else_block {
                     self.check_block(else_block, scope);

@@ -9,6 +9,16 @@ use crate::loc::Loc;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
+fn starts_uppercase(s: &str) -> bool {
+    s.chars().next().is_some_and(|c| c.is_uppercase())
+}
+
+fn starts_lowercase(s: &str) -> bool {
+    s.chars()
+        .next()
+        .is_some_and(|c| c.is_lowercase() || c == '_')
+}
+
 pub struct Parser {
     tokens: Vec<Token>,
     pos: usize,
@@ -36,11 +46,12 @@ impl Parser {
 
     /// Scan from `start` up to the matching `}` at depth 0 and collect the
     /// names of all top-level `fn`, `struct`, `enum`, and `type` declarations.
-    fn collect_mod_local_names(&self, start: usize) -> HashSet<String> {
+    fn collect_mod_local_names(&self, start: usize, end: Option<usize>) -> HashSet<String> {
         let mut names = HashSet::new();
         let mut depth: usize = 0;
         let mut i = start;
-        while i < self.tokens.len() {
+        let limit = end.unwrap_or(self.tokens.len());
+        while i < limit {
             match &self.tokens[i].kind {
                 TokenKind::LBrace => {
                     depth += 1;
@@ -54,60 +65,15 @@ impl Parser {
                     i += 1;
                 }
                 TokenKind::Fn
-                    | TokenKind::Struct
-                    | TokenKind::Enum
-                    | TokenKind::Type
-                    | TokenKind::Const
-                    | TokenKind::Static
+                | TokenKind::Struct
+                | TokenKind::Enum
+                | TokenKind::Type
+                | TokenKind::Const
+                | TokenKind::Static
                     if depth == 0 =>
                 {
                     i += 1;
                     // Skip optional `pub`
-                    if matches!(self.tokens.get(i).map(|t| &t.kind), Some(TokenKind::Pub)) {
-                        i += 1;
-                    }
-                    if let Some(TokenKind::Ident(name)) = self.tokens.get(i).map(|t| &t.kind) {
-                        names.insert(name.clone());
-                    }
-                    i += 1;
-                }
-                _ => {
-                    i += 1;
-                }
-            }
-        }
-        names
-    }
-
-    /// Scan tokens from `start` up to (but not including) `end_pos` and collect
-    /// the names of all top-level `fn`, `struct`, `enum`, and `type` declarations.
-    /// Used for file-based modules where there is no enclosing `}`.
-    fn collect_mod_local_names_bounded(&self, start: usize, end_pos: usize) -> HashSet<String> {
-        let mut names = HashSet::new();
-        let mut depth: usize = 0;
-        let mut i = start;
-        while i < end_pos {
-            match &self.tokens[i].kind {
-                TokenKind::LBrace => {
-                    depth += 1;
-                    i += 1;
-                }
-                TokenKind::RBrace => {
-                    if depth == 0 {
-                        break;
-                    }
-                    depth -= 1;
-                    i += 1;
-                }
-                TokenKind::Fn
-                    | TokenKind::Struct
-                    | TokenKind::Enum
-                    | TokenKind::Type
-                    | TokenKind::Const
-                    | TokenKind::Static
-                    if depth == 0 =>
-                {
-                    i += 1;
                     if matches!(self.tokens.get(i).map(|t| &t.kind), Some(TokenKind::Pub)) {
                         i += 1;
                     }
@@ -168,7 +134,7 @@ impl Parser {
         let saved_dir = std::mem::replace(&mut self.source_dir, new_source_dir);
 
         // Pre-scan only the spliced token range to avoid reading into parent tokens.
-        let local_names = self.collect_mod_local_names_bounded(self.pos, end_pos);
+        let local_names = self.collect_mod_local_names(self.pos, Some(end_pos));
         self.mod_stack.push(name.to_string());
         let saved_names = std::mem::replace(&mut self.mod_local_names, local_names);
         let saved_aliases = std::mem::replace(&mut self.use_aliases, HashMap::new());
@@ -416,7 +382,12 @@ impl Parser {
                 self.expect(&TokenKind::Eq)?;
                 let expr = self.parse_expr()?;
                 self.expect(&TokenKind::Semicolon)?;
-                Ok(Item::Const { name, ty, expr, is_pub })
+                Ok(Item::Const {
+                    name,
+                    ty,
+                    expr,
+                    is_pub,
+                })
             }
             TokenKind::Static => {
                 self.advance();
@@ -432,7 +403,13 @@ impl Parser {
                 self.expect(&TokenKind::Eq)?;
                 let expr = self.parse_expr()?;
                 self.expect(&TokenKind::Semicolon)?;
-                Ok(Item::Static { name, ty, expr, mutable, is_pub })
+                Ok(Item::Static {
+                    name,
+                    ty,
+                    expr,
+                    mutable,
+                    is_pub,
+                })
             }
             TokenKind::Use => {
                 self.advance();
@@ -461,7 +438,7 @@ impl Parser {
 
                 self.expect(&TokenKind::LBrace)?;
                 // Pre-scan the token stream for names declared inside this mod.
-                let local_names = self.collect_mod_local_names(self.pos);
+                let local_names = self.collect_mod_local_names(self.pos, None);
                 // Push onto the module stack and parse items.
                 self.mod_stack.push(name.clone());
                 let saved_names = std::mem::replace(&mut self.mod_local_names, local_names);
@@ -1187,10 +1164,7 @@ impl Parser {
                 })
             }
             TokenKind::Ident(name)
-                if (name == "println"
-                    || name == "print"
-                    || name == "eprintln"
-                    || name == "eprint")
+                if matches!(name.as_str(), "println" | "print" | "eprintln" | "eprint")
                     && self
                         .tokens
                         .get(self.pos + 1)
@@ -1247,7 +1221,7 @@ impl Parser {
         // Check for pattern syntax: `let (a, b) = ...` or `let Point(x, y) = ...`
         let is_tuple_pat = self.peek().kind == TokenKind::LParen;
         let is_tuple_struct_pat = matches!(&self.peek().kind,
-            TokenKind::Ident(n) if n.chars().next().is_some_and(|c| c.is_uppercase()));
+            TokenKind::Ident(n) if starts_uppercase(n));
 
         if (is_tuple_pat || is_tuple_struct_pat) && !mutable {
             // Parse a full pattern
@@ -1266,13 +1240,23 @@ impl Parser {
                 let else_block = self.parse_block()?;
                 self.expect(&TokenKind::Semicolon)?;
                 return Ok(Stmt {
-                    kind: StmtKind::LetPat { pat, ty, expr, else_block: Some(else_block) },
+                    kind: StmtKind::LetPat {
+                        pat,
+                        ty,
+                        expr,
+                        else_block: Some(else_block),
+                    },
                     loc,
                 });
             }
             self.expect(&TokenKind::Semicolon)?;
             return Ok(Stmt {
-                kind: StmtKind::LetPat { pat, ty, expr, else_block: None },
+                kind: StmtKind::LetPat {
+                    pat,
+                    ty,
+                    expr,
+                    else_block: None,
+                },
                 loc,
             });
         }
@@ -1523,7 +1507,13 @@ impl Parser {
         let iter = self.parse_expr()?;
         let body = self.parse_block()?;
         Ok(Stmt {
-            kind: StmtKind::For { var, iter, body, elem_ty: None, iter_ty: None },
+            kind: StmtKind::For {
+                var,
+                iter,
+                body,
+                elem_ty: None,
+                iter_ty: None,
+            },
             loc,
         })
     }
@@ -1563,7 +1553,11 @@ impl Parser {
         }
         self.expect(&TokenKind::RBrace)?;
         Ok(Stmt {
-            kind: StmtKind::Match { expr, arms, scrutinee_ty: None },
+            kind: StmtKind::Match {
+                expr,
+                arms,
+                scrutinee_ty: None,
+            },
             loc,
         })
     }
@@ -1655,15 +1649,13 @@ impl Parser {
                 self.advance();
                 Ok(Pat::Wildcard)
             }
-            TokenKind::Ident(name)
-                if name.chars().next().is_some_and(|c| c.is_lowercase() || c == '_') =>
-            {
+            TokenKind::Ident(name) if starts_lowercase(name) => {
                 // Binding pattern: `x` -- binds the matched value to a variable.
                 let name = name.clone();
                 self.advance();
                 Ok(Pat::Binding(name))
             }
-            TokenKind::Ident(name) if name.chars().next().is_some_and(|c| c.is_uppercase()) => {
+            TokenKind::Ident(name) if starts_uppercase(name) => {
                 let type_name = name.clone();
                 self.advance();
 
@@ -1821,7 +1813,10 @@ impl Parser {
                         self.advance();
                         return Ok(Pat::Range { lo: n, hi });
                     }
-                    return Err(Error::new(tok.loc, "expected integer after `..=` in range pattern"));
+                    return Err(Error::new(
+                        tok.loc,
+                        "expected integer after `..=` in range pattern",
+                    ));
                 }
                 Ok(Pat::Int(n))
             }
@@ -1837,7 +1832,10 @@ impl Parser {
                             self.advance();
                             return Ok(Pat::Range { lo, hi });
                         }
-                        return Err(Error::new(tok.loc, "expected integer after `..=` in range pattern"));
+                        return Err(Error::new(
+                            tok.loc,
+                            "expected integer after `..=` in range pattern",
+                        ));
                     }
                     Ok(Pat::Int(lo))
                 } else {
@@ -1940,207 +1938,98 @@ impl Parser {
     }
 
     fn parse_or(&mut self) -> Result<Expr, Error> {
-        let mut lhs = self.parse_and()?;
-        while self.peek().kind == TokenKind::PipePipe {
-            let loc = lhs.loc;
-            self.advance();
-            lhs = Expr {
-                kind: ExprKind::BinOp {
-                    op: BinOp::Or,
-                    lhs: Box::new(lhs),
-                    rhs: Box::new(self.parse_and()?),
-                },
-                loc,
-            };
-        }
-        Ok(lhs)
+        self.parse_binop_left_assoc(Self::parse_and, |t| {
+            matches!(t, TokenKind::PipePipe).then_some(BinOp::Or)
+        })
     }
 
     /// Like `parse_or` but does NOT consume `&&` (stops before it).
     /// Used for the scrutinee expression in `if let pat = expr && cond`.
     fn parse_if_let_expr(&mut self) -> Result<Expr, Error> {
-        let mut lhs = self.parse_equality()?;
-        while self.peek().kind == TokenKind::PipePipe {
-            let loc = lhs.loc;
-            self.advance();
-            lhs = Expr {
-                kind: ExprKind::BinOp {
-                    op: BinOp::Or,
-                    lhs: Box::new(lhs),
-                    rhs: Box::new(self.parse_equality()?),
-                },
-                loc,
-            };
-        }
-        Ok(lhs)
+        self.parse_binop_left_assoc(Self::parse_equality, |t| {
+            matches!(t, TokenKind::PipePipe).then_some(BinOp::Or)
+        })
     }
 
     fn parse_and(&mut self) -> Result<Expr, Error> {
-        let mut lhs = self.parse_equality()?;
-        while self.peek().kind == TokenKind::AmpAmp {
-            let loc = lhs.loc;
-            self.advance();
-            lhs = Expr {
-                kind: ExprKind::BinOp {
-                    op: BinOp::And,
-                    lhs: Box::new(lhs),
-                    rhs: Box::new(self.parse_equality()?),
-                },
-                loc,
-            };
-        }
-        Ok(lhs)
+        self.parse_binop_left_assoc(Self::parse_equality, |t| {
+            matches!(t, TokenKind::AmpAmp).then_some(BinOp::And)
+        })
     }
 
     fn parse_equality(&mut self) -> Result<Expr, Error> {
-        let mut lhs = self.parse_relational()?;
-        loop {
-            let op = match self.peek().kind {
-                TokenKind::EqEq => BinOp::Eq,
-                TokenKind::BangEq => BinOp::Ne,
-                _ => break,
-            };
-            let loc = lhs.loc;
-            self.advance();
-            lhs = Expr {
-                kind: ExprKind::BinOp {
-                    op,
-                    lhs: Box::new(lhs),
-                    rhs: Box::new(self.parse_relational()?),
-                },
-                loc,
-            };
-        }
-        Ok(lhs)
+        self.parse_binop_left_assoc(Self::parse_relational, |t| match t {
+            TokenKind::EqEq => Some(BinOp::Eq),
+            TokenKind::BangEq => Some(BinOp::Ne),
+            _ => None,
+        })
     }
 
     fn parse_relational(&mut self) -> Result<Expr, Error> {
-        let mut lhs = self.parse_bitor()?;
-        loop {
-            let op = match self.peek().kind {
-                TokenKind::Lt => BinOp::Lt,
-                TokenKind::Gt => BinOp::Gt,
-                TokenKind::Le => BinOp::Le,
-                TokenKind::Ge => BinOp::Ge,
-                _ => break,
-            };
-            let loc = lhs.loc;
-            self.advance();
-            lhs = Expr {
-                kind: ExprKind::BinOp {
-                    op,
-                    lhs: Box::new(lhs),
-                    rhs: Box::new(self.parse_bitor()?),
-                },
-                loc,
-            };
-        }
-        Ok(lhs)
+        self.parse_binop_left_assoc(Self::parse_bitor, |t| match t {
+            TokenKind::Lt => Some(BinOp::Lt),
+            TokenKind::Gt => Some(BinOp::Gt),
+            TokenKind::Le => Some(BinOp::Le),
+            TokenKind::Ge => Some(BinOp::Ge),
+            _ => None,
+        })
     }
 
     fn parse_bitor(&mut self) -> Result<Expr, Error> {
-        let mut lhs = self.parse_bitxor()?;
-        while self.peek().kind == TokenKind::Pipe {
-            let loc = lhs.loc;
-            self.advance();
-            lhs = Expr {
-                kind: ExprKind::BinOp {
-                    op: BinOp::BitOr,
-                    lhs: Box::new(lhs),
-                    rhs: Box::new(self.parse_bitxor()?),
-                },
-                loc,
-            };
-        }
-        Ok(lhs)
+        self.parse_binop_left_assoc(Self::parse_bitxor, |t| {
+            matches!(t, TokenKind::Pipe).then_some(BinOp::BitOr)
+        })
     }
 
     fn parse_bitxor(&mut self) -> Result<Expr, Error> {
-        let mut lhs = self.parse_bitand()?;
-        while self.peek().kind == TokenKind::Caret {
-            let loc = lhs.loc;
-            self.advance();
-            lhs = Expr {
-                kind: ExprKind::BinOp {
-                    op: BinOp::BitXor,
-                    lhs: Box::new(lhs),
-                    rhs: Box::new(self.parse_bitand()?),
-                },
-                loc,
-            };
-        }
-        Ok(lhs)
+        self.parse_binop_left_assoc(Self::parse_bitand, |t| {
+            matches!(t, TokenKind::Caret).then_some(BinOp::BitXor)
+        })
     }
 
     fn parse_bitand(&mut self) -> Result<Expr, Error> {
-        let mut lhs = self.parse_shift()?;
-        while self.peek().kind == TokenKind::Amp {
-            let loc = lhs.loc;
-            self.advance();
-            lhs = Expr {
-                kind: ExprKind::BinOp {
-                    op: BinOp::BitAnd,
-                    lhs: Box::new(lhs),
-                    rhs: Box::new(self.parse_shift()?),
-                },
-                loc,
-            };
-        }
-        Ok(lhs)
+        self.parse_binop_left_assoc(Self::parse_shift, |t| {
+            matches!(t, TokenKind::Amp).then_some(BinOp::BitAnd)
+        })
     }
 
     fn parse_shift(&mut self) -> Result<Expr, Error> {
-        let mut lhs = self.parse_additive()?;
-        loop {
-            let op = match self.peek().kind {
-                TokenKind::Shl => BinOp::Shl,
-                TokenKind::Shr => BinOp::Shr,
-                _ => break,
-            };
-            let loc = lhs.loc;
-            self.advance();
-            lhs = Expr {
-                kind: ExprKind::BinOp {
-                    op,
-                    lhs: Box::new(lhs),
-                    rhs: Box::new(self.parse_additive()?),
-                },
-                loc,
-            };
-        }
-        Ok(lhs)
+        self.parse_binop_left_assoc(Self::parse_additive, |t| match t {
+            TokenKind::Shl => Some(BinOp::Shl),
+            TokenKind::Shr => Some(BinOp::Shr),
+            _ => None,
+        })
     }
 
     fn parse_additive(&mut self) -> Result<Expr, Error> {
-        let mut lhs = self.parse_multiplicative()?;
-        loop {
-            let op = match self.peek().kind {
-                TokenKind::Plus => BinOp::Add,
-                TokenKind::Minus => BinOp::Sub,
-                _ => break,
-            };
-            let loc = lhs.loc;
-            self.advance();
-            lhs = Expr {
-                kind: ExprKind::BinOp {
-                    op,
-                    lhs: Box::new(lhs),
-                    rhs: Box::new(self.parse_multiplicative()?),
-                },
-                loc,
-            };
-        }
-        Ok(lhs)
+        self.parse_binop_left_assoc(Self::parse_multiplicative, |t| match t {
+            TokenKind::Plus => Some(BinOp::Add),
+            TokenKind::Minus => Some(BinOp::Sub),
+            _ => None,
+        })
     }
 
     fn parse_multiplicative(&mut self) -> Result<Expr, Error> {
-        let mut lhs = self.parse_cast()?;
+        self.parse_binop_left_assoc(Self::parse_cast, |t| match t {
+            TokenKind::Star => Some(BinOp::Mul),
+            TokenKind::Slash => Some(BinOp::Div),
+            TokenKind::Percent => Some(BinOp::Rem),
+            _ => None,
+        })
+    }
+
+    /// Build a left-associative binary expression chain.
+    /// `next` parses the next-higher-precedence level; `to_op` maps a token to
+    /// its `BinOp` (returning `None` means "stop the loop").
+    fn parse_binop_left_assoc(
+        &mut self,
+        next: fn(&mut Self) -> Result<Expr, Error>,
+        to_op: fn(&TokenKind) -> Option<BinOp>,
+    ) -> Result<Expr, Error> {
+        let mut lhs = next(self)?;
         loop {
-            let op = match self.peek().kind {
-                TokenKind::Star => BinOp::Mul,
-                TokenKind::Slash => BinOp::Div,
-                TokenKind::Percent => BinOp::Rem,
-                _ => break,
+            let Some(op) = to_op(&self.peek().kind) else {
+                break;
             };
             let loc = lhs.loc;
             self.advance();
@@ -2148,7 +2037,7 @@ impl Parser {
                 kind: ExprKind::BinOp {
                     op,
                     lhs: Box::new(lhs),
-                    rhs: Box::new(self.parse_cast()?),
+                    rhs: Box::new(next(self)?),
                 },
                 loc,
             };
@@ -2319,9 +2208,7 @@ impl Parser {
         // Check uppercase using the last underscore-delimited segment, since resolved
         // names are mangled (e.g., "geom_Point" — the type segment is "Point").
         let last_seg = name.rsplit('_').next().unwrap_or(&name);
-        if self.peek().kind == TokenKind::LBrace
-            && last_seg.chars().next().is_some_and(|c| c.is_uppercase())
-        {
+        if self.peek().kind == TokenKind::LBrace && starts_uppercase(last_seg) {
             self.advance();
             let mut fields = Vec::new();
             while self.peek().kind != TokenKind::RBrace && !self.at_eof() {
@@ -2542,9 +2429,7 @@ impl Parser {
                             loc,
                         })
                     }
-                } else if self.peek().kind == TokenKind::LBrace
-                    && name.chars().next().is_some_and(|c| c.is_uppercase())
-                {
+                } else if self.peek().kind == TokenKind::LBrace && starts_uppercase(&name) {
                     // Struct literal: resolve via alias table + module qualification.
                     let name = self.resolve_name(name);
                     self.advance();
@@ -2701,7 +2586,10 @@ impl Parser {
                 self.advance(); // consume `loop`
                 let block = self.parse_block()?;
                 Ok(Expr {
-                    kind: ExprKind::Loop { body: block, result_ty: None },
+                    kind: ExprKind::Loop {
+                        body: block,
+                        result_ty: None,
+                    },
                     loc,
                 })
             }
