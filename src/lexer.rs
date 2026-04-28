@@ -52,6 +52,17 @@ pub enum TokenKind {
     Tilde,
     Shl,
     Shr,
+    // Compound assignment operators
+    PlusEq,
+    MinusEq,
+    StarEq,
+    SlashEq,
+    PercentEq,
+    AmpEq,
+    PipeEq,
+    CaretEq,
+    ShlEq,
+    ShrEq,
     // Comparison operators
     EqEq,
     BangEq,
@@ -272,7 +283,12 @@ impl Lexer {
                     TokenKind::Le
                 } else if self.peek() == Some(b'<') {
                     self.advance();
-                    TokenKind::Shl
+                    if self.peek() == Some(b'=') {
+                        self.advance();
+                        TokenKind::ShlEq
+                    } else {
+                        TokenKind::Shl
+                    }
                 } else {
                     TokenKind::Lt
                 }
@@ -284,7 +300,12 @@ impl Lexer {
                     TokenKind::Ge
                 } else if self.peek() == Some(b'>') {
                     self.advance();
-                    TokenKind::Shr
+                    if self.peek() == Some(b'=') {
+                        self.advance();
+                        TokenKind::ShrEq
+                    } else {
+                        TokenKind::Shr
+                    }
                 } else {
                     TokenKind::Gt
                 }
@@ -294,6 +315,9 @@ impl Lexer {
                 if self.peek() == Some(b'&') {
                     self.advance();
                     TokenKind::AmpAmp
+                } else if self.peek() == Some(b'=') {
+                    self.advance();
+                    TokenKind::AmpEq
                 } else {
                     TokenKind::Amp
                 }
@@ -303,38 +327,69 @@ impl Lexer {
                 if self.peek() == Some(b'|') {
                     self.advance();
                     TokenKind::PipePipe
+                } else if self.peek() == Some(b'=') {
+                    self.advance();
+                    TokenKind::PipeEq
                 } else {
                     TokenKind::Pipe
                 }
             }
             b'+' => {
                 self.advance();
-                TokenKind::Plus
+                if self.peek() == Some(b'=') {
+                    self.advance();
+                    TokenKind::PlusEq
+                } else {
+                    TokenKind::Plus
+                }
             }
             b'-' => {
                 self.advance();
                 if self.peek() == Some(b'>') {
                     self.advance();
                     TokenKind::Arrow
+                } else if self.peek() == Some(b'=') {
+                    self.advance();
+                    TokenKind::MinusEq
                 } else {
                     TokenKind::Minus
                 }
             }
             b'*' => {
                 self.advance();
-                TokenKind::Star
+                if self.peek() == Some(b'=') {
+                    self.advance();
+                    TokenKind::StarEq
+                } else {
+                    TokenKind::Star
+                }
             }
             b'/' => {
                 self.advance();
-                TokenKind::Slash
+                if self.peek() == Some(b'=') {
+                    self.advance();
+                    TokenKind::SlashEq
+                } else {
+                    TokenKind::Slash
+                }
             }
             b'%' => {
                 self.advance();
-                TokenKind::Percent
+                if self.peek() == Some(b'=') {
+                    self.advance();
+                    TokenKind::PercentEq
+                } else {
+                    TokenKind::Percent
+                }
             }
             b'^' => {
                 self.advance();
-                TokenKind::Caret
+                if self.peek() == Some(b'=') {
+                    self.advance();
+                    TokenKind::CaretEq
+                } else {
+                    TokenKind::Caret
+                }
             }
             b'~' => {
                 self.advance();
@@ -370,7 +425,9 @@ impl Lexer {
                     Some(b'\\') => s.push('\\'),
                     Some(b'"') => s.push('"'),
                     Some(b'0') => s.push('\0'),
-                    Some(c) => return Err(Error::new(loc, format!("unknown escape '\\{}'", c as char))),
+                    Some(c) => {
+                        return Err(Error::new(loc, format!("unknown escape '\\{}'", c as char)));
+                    }
                     None => return Err(Error::new(loc, "unterminated escape sequence")),
                 },
                 Some(c) => s.push(c as char),

@@ -32,7 +32,7 @@ fn main() {
         .parent()
         .unwrap_or_else(|| Path::new("."))
         .to_path_buf();
-    let file = parser::Parser::new(tokens, source_dir)
+    let mut file = parser::Parser::new(tokens, source_dir)
         .parse_file()
         .unwrap_or_else(|e| {
             eprintln!("{}", e);
@@ -40,7 +40,7 @@ fn main() {
         });
 
     // Type and borrow check
-    let tc_errors = type_checker::check(&file);
+    let tc_errors = type_checker::check(&mut file);
     if !tc_errors.is_empty() {
         for e in &tc_errors {
             eprintln!("{}", e);

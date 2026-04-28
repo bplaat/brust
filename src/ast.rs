@@ -216,8 +216,13 @@ pub struct Stmt {
 
 /// All statement forms.
 pub enum StmtKind {
-    /// `println!("format", args...);`
-    Println { format: String, args: Vec<Expr> },
+    /// `println!("fmt", args...)` / `print!("fmt", args...)` / `eprintln!` / `eprint!`
+    Println {
+        format: String,
+        args: Vec<Expr>,
+        newline: bool,
+        stderr: bool,
+    },
     /// `let [mut] name [: ty] = expr;`
     Let {
         name: String,
@@ -227,11 +232,20 @@ pub enum StmtKind {
     },
     /// `name = expr;` (also used for field/index assignment via BinOp::Eq in lvalue position)
     Assign { name: String, expr: Expr },
+    /// `lhs op= rhs;` — compound assignment for complex lvalue targets (arrays, fields)
+    CompoundAssign { op: BinOp, lhs: Expr, rhs: Expr },
     /// `return [expr];` or implicit tail-expression return.
     Return(Option<Expr>),
     /// `if expr { ... } [else { ... }]`
     If {
         cond: Expr,
+        then_block: Block,
+        else_block: Option<Block>,
+    },
+    /// `if let pat = expr { ... } [else { ... }]`
+    IfLet {
+        pat: Pat,
+        expr: Expr,
         then_block: Block,
         else_block: Option<Block>,
     },
@@ -245,8 +259,8 @@ pub enum StmtKind {
         iter: Expr,
         body: Block,
     },
-    /// `break` — exit the nearest enclosing loop
-    Break,
+    /// `break [expr]` — exit the nearest enclosing loop, optionally with a value
+    Break(Option<Expr>),
     /// `continue` — skip to the next iteration of the nearest enclosing loop
     Continue,
     /// `match expr { pat => { ... }, ... }`
@@ -257,6 +271,7 @@ pub enum StmtKind {
 
 pub struct MatchArm {
     pub pat: Pat,
+    pub guard: Option<Expr>,
     pub body: Block,
     pub loc: Loc,
 }
@@ -266,6 +281,10 @@ pub enum Pat {
     Wildcard,
     Bool(bool),
     Int(i64),
+    /// Binding pattern: `x` — binds the matched value to a variable name.
+    Binding(String),
+    /// `Pat1 | Pat2 | ...` — or-pattern (each alternative must be the same kind)
+    Or(Vec<Pat>),
     EnumVariant {
         type_name: String,
         variant: String,
@@ -364,6 +383,21 @@ pub enum ExprKind {
     },
     /// `unsafe { stmts }` -- unsafe block (emitted as a plain block in C)
     Unsafe(Block),
+    /// `{ stmts; expr }` -- block used as a value-producing expression
+    Block(Block),
+    /// `if cond { then } [else { else }]` used in expression position
+    If {
+        cond: Box<Expr>,
+        then_block: Block,
+        else_block: Option<Block>,
+    },
+    /// `match expr { arms }` used in expression position
+    Match {
+        expr: Box<Expr>,
+        arms: Vec<MatchArm>,
+    },
+    /// `loop { stmts }` used in expression position (value via `break val`)
+    Loop(Block),
 }
 
 #[derive(Clone, Copy)]

@@ -223,7 +223,8 @@ impl TyEnv {
                     // They are always accessible and always require `unsafe` to call.
                     for f in fns {
                         let params = f.params.iter().map(|p| p.ty.clone()).collect();
-                        self.fns.insert(f.name.clone(), (params, f.return_ty.clone()));
+                        self.fns
+                            .insert(f.name.clone(), (params, f.return_ty.clone()));
                         self.extern_fns.insert(f.name.clone());
                         if f.is_variadic {
                             self.variadic_fns.insert(f.name.clone());
@@ -392,9 +393,9 @@ impl TypeChecker {
     // -----------------------------------------------------------------------
 
     /// Entry point: validate item declarations then type-check all function bodies.
-    fn check_file(&mut self, file: &File) {
+    fn check_file(&mut self, file: &mut File) {
         self.validate_items(&file.items, "");
-        self.check_items(&file.items, "");
+        self.check_items(&mut file.items, "");
     }
 
     /// Walk all item declarations and verify that every named type reference
@@ -542,8 +543,8 @@ impl TypeChecker {
     /// Recursively type-check all function bodies in `items`.
     /// `prefix` is the current module path (e.g. `"math_"`), stored in `cur_mod`
     /// so that visibility checks know what module is doing the calling.
-    fn check_items(&mut self, items: &[Item], prefix: &str) {
-        for item in items {
+    fn check_items(&mut self, items: &mut [Item], prefix: &str) {
+        for item in items.iter_mut() {
             match item {
                 Item::Fn(f) => {
                     let saved = std::mem::replace(&mut self.cur_mod, prefix.to_string());
@@ -553,8 +554,8 @@ impl TypeChecker {
                 Item::Impl(imp) => {
                     let type_name = format!("{prefix}{}", imp.type_name);
                     let saved = std::mem::replace(&mut self.cur_mod, prefix.to_string());
-                    for m in &imp.methods {
-                        self.check_fn(m, Some(&type_name.clone()), "");
+                    for m in imp.methods.iter_mut() {
+                        self.check_fn(m, Some(&type_name), "");
                     }
                     self.cur_mod = saved;
                 }
@@ -565,7 +566,7 @@ impl TypeChecker {
                 } => {
                     self.check_items(mod_items, &format!("{prefix}{name}_"));
                 }
-                _ => {} // traits, structs, enums, type aliases are pure declarations
+                _ => {}
             }
         }
     }
@@ -578,7 +579,7 @@ impl TypeChecker {
     /// `impl_type` is the mangled name of the implementing type for methods (used to
     /// resolve `Self` and insert the `self` receiver into scope).
     /// `prefix` is the module prefix used for name resolution within the body.
-    fn check_fn(&mut self, f: &FnDecl, impl_type: Option<&str>, prefix: &str) {
+    fn check_fn(&mut self, f: &mut FnDecl, impl_type: Option<&str>, prefix: &str) {
         let mut scope = Scope::new();
         // Each function starts outside any unsafe block.
         self.in_unsafe = false;
@@ -606,8 +607,8 @@ impl TypeChecker {
             scope.insert(p.name.clone(), ty, false);
         }
 
-        let _ = prefix; // name mangling handled by TyEnv
-        self.check_block_stmts(&f.body.stmts, &mut scope, &return_ty);
+        let _ = prefix;
+        self.check_block_stmts(&mut f.body.stmts, &mut scope, &return_ty);
 
         // All-paths-return check for non-void functions.
         if return_ty != Ty::Unit && return_ty != Ty::Never && !block_definitely_returns(&f.body) {
@@ -621,23 +622,24 @@ impl TypeChecker {
     }
 
     /// Type-check a block, pushing and popping a scope frame around it.
-    fn check_block(&mut self, block: &Block, scope: &mut Scope, return_ty: &Ty) {
+    fn check_block(&mut self, block: &mut Block, scope: &mut Scope, return_ty: &Ty) {
         scope.push();
-        self.check_block_stmts(&block.stmts, scope, return_ty);
+        self.check_block_stmts(&mut block.stmts, scope, return_ty);
         scope.pop();
     }
 
     /// Type-check a list of statements.
     /// The final bare `Expr` statement is treated as an implicit return and is
     /// checked against `return_ty` directly.
-    fn check_block_stmts(&mut self, stmts: &[Stmt], scope: &mut Scope, return_ty: &Ty) {
-        for (i, stmt) in stmts.iter().enumerate() {
-            let is_last = i + 1 == stmts.len();
+    fn check_block_stmts(&mut self, stmts: &mut [Stmt], scope: &mut Scope, return_ty: &Ty) {
+        let len = stmts.len();
+        for (i, stmt) in stmts.iter_mut().enumerate() {
+            let is_last = i + 1 == len;
             // Last bare Expr is an implicit return — type-check it against return_ty.
             if is_last
                 && return_ty != &Ty::Unit
                 && return_ty != &Ty::Never
-                && let StmtKind::Expr(expr) = &stmt.kind
+                && let StmtKind::Expr(expr) = &mut stmt.kind
             {
                 self.cur_loc = stmt.loc;
                 let ty = self.infer_expr(expr, scope);
@@ -658,9 +660,9 @@ impl TypeChecker {
     // Statement checking
     // -----------------------------------------------------------------------
 
-    fn check_stmt(&mut self, stmt: &Stmt, scope: &mut Scope, return_ty: &Ty) {
+    fn check_stmt(&mut self, stmt: &mut Stmt, scope: &mut Scope, return_ty: &Ty) {
         self.cur_loc = stmt.loc;
-        match &stmt.kind {
+        match &mut stmt.kind {
             StmtKind::Let {
                 name,
                 mutable,
@@ -668,7 +670,7 @@ impl TypeChecker {
                 expr,
             } => {
                 let inferred = self.infer_expr(expr, scope);
-                let final_ty = if let Some(ann) = ty {
+                let final_ty = if let Some(ann) = ty.as_ref() {
                     // Validate the annotation refers to a real type.
                     self.validate_ty(ann);
                     if !self.compat(&inferred, ann) {
@@ -682,12 +684,15 @@ impl TypeChecker {
                 } else {
                     inferred
                 };
+                if ty.is_none() {
+                    *ty = Some(final_ty.clone());
+                }
                 scope.insert(name.clone(), final_ty, *mutable);
             }
 
             StmtKind::Assign { name, expr } => {
                 let rhs = self.infer_expr(expr, scope);
-                match scope.lookup(name) {
+                match scope.lookup(name.as_str()) {
                     None => self.err(format!("undefined variable `{name}`")),
                     Some(vi) => {
                         if !vi.mutable {
@@ -759,52 +764,81 @@ impl TypeChecker {
             }
 
             StmtKind::For { var, iter, body } => {
-                // Infer element type from the array/slice expression.
                 let iter_ty = self.infer_expr(iter, scope);
                 let elem_ty = match &iter_ty {
                     Ty::Array(elem, _) => *elem.clone(),
-                    _ => Ty::I64, // fallback for unknown iterables
+                    _ => Ty::I64,
                 };
                 scope.push();
                 scope.insert(var.clone(), elem_ty, false);
-                self.check_block_stmts(&body.stmts, scope, return_ty);
+                self.check_block_stmts(&mut body.stmts, scope, return_ty);
                 scope.pop();
             }
 
-            StmtKind::Break | StmtKind::Continue => {
-                // Valid inside loops; no further type checking needed here.
+            StmtKind::Break(val) => {
+                if let Some(e) = val {
+                    self.infer_expr(e, scope);
+                }
             }
+
+            StmtKind::Continue => {}
 
             StmtKind::Match { expr, arms } => {
                 let scrutinee = self.infer_expr(expr, scope);
-                for arm in arms {
+                for arm in arms.iter_mut() {
                     self.check_arm(arm, &scrutinee, scope, return_ty);
                 }
             }
 
             StmtKind::Println { args, .. } => {
-                for a in args {
+                for a in args.iter_mut() {
                     self.infer_expr(a, scope);
                 }
             }
 
-            StmtKind::Expr(expr) => {
-                // Assignments are encoded as `BinOp { Eq, lhs, rhs }` for complex lvalues.
-                if let ExprKind::BinOp {
-                    op: BinOp::Eq,
-                    lhs,
-                    rhs,
-                } = &expr.kind
+            StmtKind::CompoundAssign { lhs, rhs, .. } => {
+                let rhs_ty = self.infer_expr(rhs, scope);
+                if let Some(lhs_ty) = self.infer_lvalue(lhs, scope)
+                    && !ty_compat(&rhs_ty, &lhs_ty)
                 {
-                    let rhs_ty = self.infer_expr(rhs, scope);
-                    if let Some(lhs_ty) = self.infer_lvalue(lhs, scope)
-                        && !ty_compat(&rhs_ty, &lhs_ty)
-                    {
-                        self.err(format!(
-                            "assignment: expected `{}`, found `{}`",
-                            ty_display(&lhs_ty),
-                            ty_display(&rhs_ty)
-                        ));
+                    self.err(format!(
+                        "compound assignment: expected `{}`, found `{}`",
+                        ty_display(&lhs_ty),
+                        ty_display(&rhs_ty)
+                    ));
+                }
+            }
+
+            StmtKind::IfLet {
+                pat,
+                expr,
+                then_block,
+                else_block,
+            } => {
+                let expr_ty = self.infer_expr(expr, scope);
+                scope.push();
+                self.bind_pat_vars(pat, &expr_ty, scope);
+                self.check_block_stmts(&mut then_block.stmts, scope, return_ty);
+                scope.pop();
+                if let Some(eb) = else_block {
+                    self.check_block(eb, scope, return_ty);
+                }
+            }
+
+            StmtKind::Expr(expr) => {
+                let is_assign = matches!(&expr.kind, ExprKind::BinOp { op: BinOp::Eq, .. });
+                if is_assign {
+                    if let ExprKind::BinOp { lhs, rhs, .. } = &mut expr.kind {
+                        let rhs_ty = self.infer_expr(rhs, scope);
+                        if let Some(lhs_ty) = self.infer_lvalue(lhs, scope)
+                            && !ty_compat(&rhs_ty, &lhs_ty)
+                        {
+                            self.err(format!(
+                                "assignment: expected `{}`, found `{}`",
+                                ty_display(&lhs_ty),
+                                ty_display(&rhs_ty)
+                            ));
+                        }
                     }
                 } else {
                     self.infer_expr(expr, scope);
@@ -815,11 +849,38 @@ impl TypeChecker {
 
     /// Type-check a single match arm: bind pattern variables into a new scope frame
     /// and check the arm body's statements against `return_ty`.
-    fn check_arm(&mut self, arm: &MatchArm, scrutinee_ty: &Ty, scope: &mut Scope, return_ty: &Ty) {
+    fn check_arm(
+        &mut self,
+        arm: &mut MatchArm,
+        scrutinee_ty: &Ty,
+        scope: &mut Scope,
+        return_ty: &Ty,
+    ) {
         scope.push();
+        self.bind_pat_vars(&arm.pat, scrutinee_ty, scope);
+        // Type-check optional guard as bool.
+        if let Some(guard) = &mut arm.guard {
+            let gt = self.infer_expr(guard, scope);
+            if !self.compat(&gt, &Ty::Bool) {
+                self.err(format!(
+                    "match guard must be `bool`, found `{}`",
+                    ty_display(&gt)
+                ));
+            }
+        }
+        self.check_block_stmts(&mut arm.body.stmts, scope, return_ty);
+        scope.pop();
+    }
 
-        match &arm.pat {
+    /// Bind pattern variables into the current scope frame. Also type-checks the pattern.
+    fn bind_pat_vars(&mut self, pat: &Pat, scrutinee_ty: &Ty, scope: &mut Scope) {
+        match pat {
             Pat::Wildcard => {}
+
+            Pat::Binding(name) => {
+                // Bind the whole scrutinee value to `name`.
+                scope.insert(name.clone(), scrutinee_ty.clone(), false);
+            }
 
             Pat::Bool(_) => {
                 if scrutinee_ty != &Ty::Bool {
@@ -830,6 +891,12 @@ impl TypeChecker {
             Pat::Int(_) => {
                 if !is_integer(scrutinee_ty) {
                     self.err(format!("integer pattern on `{}`", ty_display(scrutinee_ty)));
+                }
+            }
+
+            Pat::Or(alternatives) => {
+                for alt in alternatives {
+                    self.bind_pat_vars(alt, scrutinee_ty, scope);
                 }
             }
 
@@ -891,9 +958,146 @@ impl TypeChecker {
                 // If the enum isn't found, it may be a plain (non-data) enum — skip.
             }
         }
+    }
 
-        self.check_block_stmts(&arm.body.stmts, scope, return_ty);
-        scope.pop();
+    // -----------------------------------------------------------------------
+    // Block / if / match expression helpers
+    // -----------------------------------------------------------------------
+
+    /// Infer the value type of a block used in expression position.
+    /// Checks all non-tail statements, then infers the tail expression type.
+    fn infer_block_value_ty(&mut self, block: &mut Block, scope: &Scope) -> Ty {
+        let mut block_scope = scope.clone();
+        if let Some((last, rest)) = block.stmts.split_last_mut() {
+            for stmt in rest.iter_mut() {
+                self.check_stmt(stmt, &mut block_scope, &Ty::Unit);
+            }
+            match &mut last.kind {
+                StmtKind::Expr(e) | StmtKind::Return(Some(e)) => self.infer_expr(e, &block_scope),
+                // A tail if/match statement also produces a value.
+                StmtKind::If {
+                    cond,
+                    then_block,
+                    else_block,
+                } => {
+                    let ct = self.infer_expr(cond, &block_scope);
+                    if !self.compat(&ct, &Ty::Bool) {
+                        self.err(format!(
+                            "if condition must be `bool`, found `{}`",
+                            ty_display(&ct)
+                        ));
+                    }
+                    let then_ty = self.infer_block_value_ty(then_block, &block_scope);
+                    let else_ty = else_block
+                        .as_mut()
+                        .map(|b| self.infer_block_value_ty(b, &block_scope))
+                        .unwrap_or(Ty::Unit);
+                    if !ty_compat(&then_ty, &else_ty) && !ty_compat(&else_ty, &then_ty) {
+                        self.err(format!(
+                            "if/else branch type mismatch: `{}` vs `{}`",
+                            ty_display(&then_ty),
+                            ty_display(&else_ty)
+                        ));
+                    }
+                    then_ty
+                }
+                StmtKind::Match { expr, arms } => {
+                    let scrutinee_ty = self.infer_expr(expr, &block_scope);
+                    let mut result_ty: Option<Ty> = None;
+                    for arm in arms.iter_mut() {
+                        let arm_ty = self.infer_arm_value_ty(arm, &scrutinee_ty, &block_scope);
+                        if let Some(ref rt) = result_ty {
+                            if !ty_compat(&arm_ty, rt) && !ty_compat(rt, &arm_ty) {
+                                self.err(format!(
+                                    "match arms have incompatible types: `{}` vs `{}`",
+                                    ty_display(rt),
+                                    ty_display(&arm_ty)
+                                ));
+                            }
+                        } else {
+                            result_ty = Some(arm_ty);
+                        }
+                    }
+                    result_ty.unwrap_or(Ty::Unit)
+                }
+                StmtKind::Loop(body) => {
+                    fn find_break_ty(
+                        tc: &mut TypeChecker,
+                        stmts: &mut [Stmt],
+                        scope: &Scope,
+                    ) -> Option<Ty> {
+                        for s in stmts {
+                            match &mut s.kind {
+                                StmtKind::Break(Some(v)) => return Some(tc.infer_expr(v, scope)),
+                                StmtKind::If {
+                                    then_block,
+                                    else_block,
+                                    ..
+                                } => {
+                                    if let Some(t) = find_break_ty(tc, &mut then_block.stmts, scope)
+                                    {
+                                        return Some(t);
+                                    }
+                                    if let Some(eb) = else_block {
+                                        if let Some(t) = find_break_ty(tc, &mut eb.stmts, scope) {
+                                            return Some(t);
+                                        }
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                        None
+                    }
+                    find_break_ty(self, &mut body.stmts, &block_scope).unwrap_or(Ty::Unit)
+                }
+                _ => {
+                    self.check_stmt(last, &mut block_scope, &Ty::Unit);
+                    Ty::Unit
+                }
+            }
+        } else {
+            Ty::Unit
+        }
+    }
+
+    /// Infer the value type of a match arm body, adding pattern bindings to scope.
+    fn infer_arm_value_ty(&mut self, arm: &mut MatchArm, scrutinee_ty: &Ty, scope: &Scope) -> Ty {
+        let mut arm_scope = scope.clone();
+        arm_scope.push();
+        if let Pat::EnumVariant {
+            type_name,
+            variant,
+            bindings,
+        } = &arm.pat
+        {
+            if let Some(edecl) = self.env.enums.get(type_name).cloned() {
+                if let Some(ev) = edecl.variants.iter().find(|v| v.name == *variant) {
+                    match (bindings, &ev.fields) {
+                        (PatBindings::Tuple(names), VariantFields::Tuple(tys)) => {
+                            for (name, ty) in names.iter().zip(tys.iter()) {
+                                if name != "_" {
+                                    arm_scope.insert(name.clone(), ty.clone(), false);
+                                }
+                            }
+                        }
+                        (PatBindings::Named(fields), VariantFields::Named(decl_fields)) => {
+                            for (field_name, binding) in fields {
+                                if let Some(df) = decl_fields.iter().find(|f| f.name == *field_name)
+                                {
+                                    arm_scope.insert(binding.clone(), df.ty.clone(), false);
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        let _ = scrutinee_ty;
+        let ty = self.infer_block_value_ty(&mut arm.body, &arm_scope);
+        arm_scope.pop();
+        ty
     }
 
     // -----------------------------------------------------------------------
@@ -904,9 +1108,9 @@ impl TypeChecker {
     /// named item referenced (struct, function, field). Errors are accumulated via
     /// `self.err()`; on error, a best-effort fallback type (`Ty::Unit`) is returned
     /// so checking can continue and collect multiple errors in one pass.
-    fn infer_expr(&mut self, expr: &Expr, scope: &Scope) -> Ty {
+    fn infer_expr(&mut self, expr: &mut Expr, scope: &Scope) -> Ty {
         self.cur_loc = expr.loc;
-        match &expr.kind {
+        match &mut expr.kind {
             // Literals: integer/float literals use canonical types that are
             // widened by ty_compat to any compatible integer/float type.
             ExprKind::Int(_) => Ty::I64,
@@ -937,16 +1141,19 @@ impl TypeChecker {
                 }
             }
 
-            ExprKind::Tuple(elems) => {
-                Ty::Tuple(elems.iter().map(|e| self.infer_expr(e, scope)).collect())
-            }
+            ExprKind::Tuple(elems) => Ty::Tuple(
+                elems
+                    .iter_mut()
+                    .map(|e| self.infer_expr(e, scope))
+                    .collect(),
+            ),
 
             ExprKind::ArrayLit(elems) => {
                 if elems.is_empty() {
                     return Ty::Array(Box::new(Ty::Unit), 0);
                 }
-                let first = self.infer_expr(&elems[0], scope);
-                for e in &elems[1..] {
+                let first = self.infer_expr(&mut elems[0], scope);
+                for e in &mut elems[1..] {
                     let t = self.infer_expr(e, scope);
                     if !ty_compat(&t, &first) {
                         self.err(format!(
@@ -961,7 +1168,7 @@ impl TypeChecker {
 
             ExprKind::Index { expr, index } => {
                 // Range index `arr[lo..hi]` produces a slice.
-                if let ExprKind::Range { start, end } = &index.kind {
+                if let ExprKind::Range { start, end } = &mut index.kind {
                     if let Some(e) = start {
                         self.infer_expr(e, scope);
                     }
@@ -1006,9 +1213,9 @@ impl TypeChecker {
 
             ExprKind::StructLit { name, fields } => {
                 self.check_item_visibility(name);
-                if let Some(s) = self.env.structs.get(name).cloned() {
-                    let provided: HashSet<&str> = fields.iter().map(|(n, _)| n.as_str()).collect();
-                    for (fname, fexpr) in fields {
+                if let Some(s) = self.env.structs.get(name.as_str()).cloned() {
+                    let provided: HashSet<String> = fields.iter().map(|(n, _)| n.clone()).collect();
+                    for (fname, fexpr) in fields.iter_mut() {
                         let got = self.infer_expr(fexpr, scope);
                         // Check field visibility on construction.
                         self.check_field_visibility(name, fname);
@@ -1026,12 +1233,12 @@ impl TypeChecker {
                     }
                     // Check for missing required fields.
                     for df in &s.fields {
-                        if !provided.contains(df.name.as_str()) {
+                        if !provided.contains(&df.name) {
                             self.err(format!("missing field `{}` in `{name}`", df.name));
                         }
                     }
                 } else {
-                    for (_, e) in fields {
+                    for (_, e) in fields.iter_mut() {
                         self.infer_expr(e, scope);
                     }
                     self.err(format!("unknown struct `{name}`"));
@@ -1045,13 +1252,13 @@ impl TypeChecker {
                 fields,
             } => {
                 let mangled = format!("{type_name}_{variant}");
-                if let Some(edecl) = self.env.enums.get(type_name).cloned() {
+                if let Some(edecl) = self.env.enums.get(type_name.as_str()).cloned() {
                     // Typed enum variant: Type::Variant { ... }
                     if let Some(ev) = edecl.variants.iter().find(|v| v.name == *variant) {
                         if let VariantFields::Named(decl_fields) = &ev.fields {
-                            let provided: HashSet<&str> =
-                                fields.iter().map(|(n, _)| n.as_str()).collect();
-                            for (fname, fexpr) in fields {
+                            let provided: HashSet<String> =
+                                fields.iter().map(|(n, _)| n.clone()).collect();
+                            for (fname, fexpr) in fields.iter_mut() {
                                 let got = self.infer_expr(fexpr, scope);
                                 if let Some(df) = decl_fields.iter().find(|f| f.name == *fname) {
                                     if !self.compat(&got, &df.ty) {
@@ -1070,7 +1277,7 @@ impl TypeChecker {
                             }
                             // Missing fields check.
                             for df in decl_fields.clone().iter() {
-                                if !provided.contains(df.name.as_str()) {
+                                if !provided.contains(&df.name) {
                                     self.err(format!(
                                         "missing field `{}` in `{type_name}::{variant}`",
                                         df.name
@@ -1078,12 +1285,12 @@ impl TypeChecker {
                                 }
                             }
                         } else {
-                            for (_, e) in fields {
+                            for (_, e) in fields.iter_mut() {
                                 self.infer_expr(e, scope);
                             }
                         }
                     } else {
-                        for (_, e) in fields {
+                        for (_, e) in fields.iter_mut() {
                             self.infer_expr(e, scope);
                         }
                         self.err(format!("no variant `{variant}` in enum `{type_name}`"));
@@ -1092,8 +1299,8 @@ impl TypeChecker {
                 } else if let Some(s) = self.env.structs.get(&mangled).cloned() {
                     // Module-qualified struct literal: mod::Struct { ... }
                     self.check_item_visibility(&mangled);
-                    let provided: HashSet<&str> = fields.iter().map(|(n, _)| n.as_str()).collect();
-                    for (fname, fexpr) in fields {
+                    let provided: HashSet<String> = fields.iter().map(|(n, _)| n.clone()).collect();
+                    for (fname, fexpr) in fields.iter_mut() {
                         let got = self.infer_expr(fexpr, scope);
                         self.check_field_visibility(&mangled, fname);
                         if let Some(fd) = s.fields.iter().find(|f| f.name == *fname) {
@@ -1109,13 +1316,13 @@ impl TypeChecker {
                         }
                     }
                     for df in &s.fields {
-                        if !provided.contains(df.name.as_str()) {
+                        if !provided.contains(&df.name) {
                             self.err(format!("missing field `{}` in `{mangled}`", df.name));
                         }
                     }
                     Ty::Named(mangled)
                 } else {
-                    for (_, e) in fields {
+                    for (_, e) in fields.iter_mut() {
                         self.infer_expr(e, scope);
                     }
                     self.err(format!("unknown enum `{type_name}` or struct `{mangled}`"));
@@ -1176,7 +1383,7 @@ impl TypeChecker {
                         self.check_call_args(name, args, &params, scope);
                         *ret
                     } else {
-                        for a in args {
+                        for a in args.iter_mut() {
                             self.infer_expr(a, scope);
                         }
                         self.err(format!(
@@ -1186,7 +1393,7 @@ impl TypeChecker {
                         Ty::Unit
                     }
                 } else {
-                    for a in args {
+                    for a in args.iter_mut() {
                         self.infer_expr(a, scope);
                     }
                     self.err(format!("undefined function `{name}`"));
@@ -1212,7 +1419,7 @@ impl TypeChecker {
                     // Unit enum variant used as a value: MyEnum::Variant
                     Ty::Named(type_name.clone())
                 } else {
-                    for a in args {
+                    for a in args.iter_mut() {
                         self.infer_expr(a, scope);
                     }
                     self.err(format!(
@@ -1231,12 +1438,12 @@ impl TypeChecker {
                     if let Some(tr) = self.env.traits.get(&trait_name).cloned()
                         && let Some(sig) = tr.methods.iter().find(|m| m.name == *method)
                     {
-                        for a in args {
+                        for a in args.iter_mut() {
                             self.infer_expr(a, scope);
                         }
                         return sig.return_ty.clone();
                     }
-                    for a in args {
+                    for a in args.iter_mut() {
                         self.infer_expr(a, scope);
                     }
                     self.err(format!("no method `{method}` on `dyn {trait_name}`"));
@@ -1249,14 +1456,14 @@ impl TypeChecker {
                         self.check_call_args(&mangled, args, &param_tys, scope);
                         ret_ty
                     } else {
-                        for a in args {
+                        for a in args.iter_mut() {
                             self.infer_expr(a, scope);
                         }
                         self.err(format!("no method `{method}` on `{}`", ty_display(&recv)));
                         Ty::Unit
                     }
                 } else {
-                    for a in args {
+                    for a in args.iter_mut() {
                         self.infer_expr(a, scope);
                     }
                     self.err(format!(
@@ -1339,14 +1546,14 @@ impl TypeChecker {
                 // Save and restore `in_unsafe` to handle nested unsafe blocks correctly.
                 let saved_unsafe = std::mem::replace(&mut self.in_unsafe, true);
                 let mut inner_scope = scope.clone();
-                let result_ty = if let Some((last, rest)) = block.stmts.split_last() {
-                    for stmt in rest {
+                let result_ty = if let Some((last, rest)) = block.stmts.split_last_mut() {
+                    for stmt in rest.iter_mut() {
                         self.check_stmt(stmt, &mut inner_scope, &Ty::Unit);
                     }
                     // Tail expressions appear as either bare Expr or implicit Return.
-                    let tail_expr = match &last.kind {
-                        StmtKind::Expr(expr) => Some(expr),
-                        StmtKind::Return(Some(expr)) => Some(expr),
+                    let tail_expr = match &mut last.kind {
+                        StmtKind::Expr(expr) => Some(expr as &mut Expr),
+                        StmtKind::Return(Some(expr)) => Some(expr as &mut Expr),
                         _ => None,
                     };
                     if let Some(expr) = tail_expr {
@@ -1362,6 +1569,88 @@ impl TypeChecker {
                 self.in_unsafe = saved_unsafe;
                 result_ty
             }
+
+            ExprKind::Block(block) => self.infer_block_value_ty(block, scope),
+
+            ExprKind::If {
+                cond,
+                then_block,
+                else_block,
+            } => {
+                let ct = self.infer_expr(cond, scope);
+                if !self.compat(&ct, &Ty::Bool) {
+                    self.err(format!(
+                        "if condition must be `bool`, found `{}`",
+                        ty_display(&ct)
+                    ));
+                }
+                let then_ty = self.infer_block_value_ty(then_block, scope);
+                let else_ty = else_block
+                    .as_mut()
+                    .map(|b| self.infer_block_value_ty(b, scope))
+                    .unwrap_or(Ty::Unit);
+                if !ty_compat(&then_ty, &else_ty) && !ty_compat(&else_ty, &then_ty) {
+                    self.err(format!(
+                        "if/else branch type mismatch: `{}` vs `{}`",
+                        ty_display(&then_ty),
+                        ty_display(&else_ty)
+                    ));
+                }
+                then_ty
+            }
+
+            ExprKind::Match { expr, arms } => {
+                let scrutinee_ty = self.infer_expr(expr, scope);
+                let mut result_ty: Option<Ty> = None;
+                for arm in arms.iter_mut() {
+                    let arm_ty = self.infer_arm_value_ty(arm, &scrutinee_ty, scope);
+                    if let Some(ref rt) = result_ty {
+                        if !ty_compat(&arm_ty, rt) && !ty_compat(rt, &arm_ty) {
+                            self.err(format!(
+                                "match arms have incompatible types: `{}` vs `{}`",
+                                ty_display(rt),
+                                ty_display(&arm_ty)
+                            ));
+                        }
+                    } else {
+                        result_ty = Some(arm_ty);
+                    }
+                }
+                result_ty.unwrap_or(Ty::Unit)
+            }
+
+            ExprKind::Loop(body) => {
+                // Infer loop type from `break val` — scan body for first `break val`.
+                fn find_break_expr<'a>(stmts: &'a mut [Stmt]) -> Option<&'a mut Expr> {
+                    for s in stmts {
+                        match &mut s.kind {
+                            StmtKind::Break(Some(v)) => return Some(v),
+                            StmtKind::If {
+                                then_block,
+                                else_block,
+                                ..
+                            } => {
+                                if let Some(e) = find_break_expr(&mut then_block.stmts) {
+                                    return Some(e);
+                                }
+                                if let Some(eb) = else_block {
+                                    if let Some(e) = find_break_expr(&mut eb.stmts) {
+                                        return Some(e);
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    None
+                }
+                // Check the body in a temporary scope so bindings don't leak.
+                let mut inner_scope = scope.clone();
+                self.check_block(body, &mut inner_scope, &Ty::Unit);
+                find_break_expr(&mut body.stmts)
+                    .map(|v| self.infer_expr(v, scope))
+                    .unwrap_or(Ty::Unit)
+            }
         }
     }
 
@@ -1369,7 +1658,7 @@ impl TypeChecker {
     /// For variadic extern fns, at least `param_tys.len()` args must be provided;
     /// extra arguments beyond that are accepted without type checking.
     /// Arguments are inferred even on arity mismatch so subsequent errors are still caught.
-    fn check_call_args(&mut self, name: &str, args: &[Expr], param_tys: &[Ty], scope: &Scope) {
+    fn check_call_args(&mut self, name: &str, args: &mut [Expr], param_tys: &[Ty], scope: &Scope) {
         let is_variadic = self.env.variadic_fns.contains(name);
         let arity_ok = if is_variadic {
             args.len() >= param_tys.len()
@@ -1386,13 +1675,13 @@ impl TypeChecker {
                 "`{name}` expects {expected} argument(s), found {}",
                 args.len()
             ));
-            for a in args {
+            for a in args.iter_mut() {
                 self.infer_expr(a, scope);
             }
             return;
         }
         // Type-check the fixed parameters; variadic extra args are inferred without checking.
-        for (i, (arg, param_ty)) in args.iter().zip(param_tys.iter()).enumerate() {
+        for (i, (arg, param_ty)) in args.iter_mut().zip(param_tys.iter()).enumerate() {
             let got = self.infer_expr(arg, scope);
             if !self.compat(&got, param_ty) {
                 self.err(format!(
@@ -1404,7 +1693,7 @@ impl TypeChecker {
             }
         }
         // Infer types of extra variadic args (for side-effects, e.g. nested calls).
-        for arg in args.iter().skip(param_tys.len()) {
+        for arg in args.iter_mut().skip(param_tys.len()) {
             self.infer_expr(arg, scope);
         }
     }
@@ -1436,8 +1725,8 @@ impl TypeChecker {
 
     /// Infer the type of an lvalue expression (for compound assignment type checking).
     /// Returns `None` for expressions that are not valid lvalues.
-    fn infer_lvalue(&mut self, expr: &Expr, scope: &Scope) -> Option<Ty> {
-        match &expr.kind {
+    fn infer_lvalue(&mut self, expr: &mut Expr, scope: &Scope) -> Option<Ty> {
+        match &mut expr.kind {
             ExprKind::Var(name) => scope.lookup(name).map(|vi| vi.ty.clone()),
             ExprKind::Field { expr, field } => {
                 let ty = self.infer_expr(expr, scope);
@@ -1550,6 +1839,9 @@ fn block_definitely_returns(block: &Block) -> bool {
         Some(StmtKind::Match { arms, .. }) => {
             !arms.is_empty() && arms.iter().all(|arm| block_definitely_returns(&arm.body))
         }
+        // A `loop` always terminates (via break or infinitely), so it definitely
+        // produces a value for any function that ends with one.
+        Some(StmtKind::Loop(_)) => true,
         _ => false,
     }
 }
@@ -1835,7 +2127,62 @@ impl BorrowChecker {
                 self.check_block(body, scope);
             }
 
-            StmtKind::Break | StmtKind::Continue => {}
+            StmtKind::Break(val) => {
+                if let Some(e) = val {
+                    self.check_expr(e, scope, false);
+                }
+            }
+
+            StmtKind::Continue => {}
+
+            StmtKind::CompoundAssign { lhs, rhs, .. } => {
+                self.check_expr(rhs, scope, false);
+                self.check_lvalue_mut(lhs, scope);
+            }
+
+            StmtKind::IfLet {
+                pat,
+                expr,
+                then_block,
+                else_block,
+            } => {
+                self.check_expr(expr, scope, false);
+                let mut then_scope = scope.clone();
+                // Add pattern bindings with placeholder types.
+                if let Pat::EnumVariant { bindings, .. } = pat {
+                    match bindings {
+                        PatBindings::Tuple(names) => {
+                            for n in names {
+                                then_scope.insert(
+                                    n.clone(),
+                                    BVar {
+                                        ty: Ty::Unit,
+                                        mutable: false,
+                                        moved: false,
+                                    },
+                                );
+                            }
+                        }
+                        PatBindings::Named(fields) => {
+                            for (_, binding) in fields {
+                                then_scope.insert(
+                                    binding.clone(),
+                                    BVar {
+                                        ty: Ty::Unit,
+                                        mutable: false,
+                                        moved: false,
+                                    },
+                                );
+                            }
+                        }
+                        PatBindings::None => {}
+                    }
+                }
+                self.check_block(then_block, &mut then_scope);
+                if let Some(eb) = else_block {
+                    self.check_block(eb, scope);
+                }
+            }
 
             StmtKind::Match { expr, arms } => {
                 self.check_expr(expr, scope, true);
@@ -2032,6 +2379,29 @@ impl BorrowChecker {
             }
             ExprKind::Unsafe(block) => {
                 self.check_stmts(&block.stmts, scope);
+            }
+            ExprKind::Block(block) => {
+                self.check_stmts(&block.stmts, scope);
+            }
+            ExprKind::If {
+                cond,
+                then_block,
+                else_block,
+            } => {
+                self.check_expr(cond, scope, false);
+                self.check_stmts(&then_block.stmts, scope);
+                if let Some(b) = else_block {
+                    self.check_stmts(&b.stmts, scope);
+                }
+            }
+            ExprKind::Match { expr, arms } => {
+                self.check_expr(expr, scope, false);
+                for arm in arms {
+                    self.check_stmts(&arm.body.stmts, scope);
+                }
+            }
+            ExprKind::Loop(body) => {
+                self.check_stmts(&body.stmts, scope);
             }
             _ => {} // literals have no sub-expressions
         }
@@ -2288,7 +2658,7 @@ pub fn ty_display(ty: &Ty) -> String {
 // Public entry point
 // ===========================================================================
 
-pub fn check(file: &File) -> Vec<Error> {
+pub fn check(file: &mut File) -> Vec<Error> {
     let env = TyEnv::build(file);
     let mut errors = Vec::new();
 
