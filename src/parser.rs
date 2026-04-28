@@ -53,7 +53,12 @@ impl Parser {
                     depth -= 1;
                     i += 1;
                 }
-                TokenKind::Fn | TokenKind::Struct | TokenKind::Enum | TokenKind::Type
+                TokenKind::Fn
+                    | TokenKind::Struct
+                    | TokenKind::Enum
+                    | TokenKind::Type
+                    | TokenKind::Const
+                    | TokenKind::Static
                     if depth == 0 =>
                 {
                     i += 1;
@@ -94,7 +99,12 @@ impl Parser {
                     depth -= 1;
                     i += 1;
                 }
-                TokenKind::Fn | TokenKind::Struct | TokenKind::Enum | TokenKind::Type
+                TokenKind::Fn
+                    | TokenKind::Struct
+                    | TokenKind::Enum
+                    | TokenKind::Type
+                    | TokenKind::Const
+                    | TokenKind::Static
                     if depth == 0 =>
                 {
                     i += 1;
@@ -398,6 +408,32 @@ impl Parser {
                 self.expect(&TokenKind::Semicolon)?;
                 Ok(Item::TypeAlias { name, ty, is_pub })
             }
+            TokenKind::Const => {
+                self.advance();
+                let name = self.expect_ident()?;
+                self.expect(&TokenKind::Colon)?;
+                let ty = self.parse_ty()?;
+                self.expect(&TokenKind::Eq)?;
+                let expr = self.parse_expr()?;
+                self.expect(&TokenKind::Semicolon)?;
+                Ok(Item::Const { name, ty, expr, is_pub })
+            }
+            TokenKind::Static => {
+                self.advance();
+                let mutable = if self.peek().kind == TokenKind::Mut {
+                    self.advance();
+                    true
+                } else {
+                    false
+                };
+                let name = self.expect_ident()?;
+                self.expect(&TokenKind::Colon)?;
+                let ty = self.parse_ty()?;
+                self.expect(&TokenKind::Eq)?;
+                let expr = self.parse_expr()?;
+                self.expect(&TokenKind::Semicolon)?;
+                Ok(Item::Static { name, ty, expr, mutable, is_pub })
+            }
             TokenKind::Use => {
                 self.advance();
                 self.parse_use_path(&[])?;
@@ -674,6 +710,52 @@ impl Parser {
         let loc = self.loc();
         self.expect(&TokenKind::Struct)?;
         let name = self.expect_ident()?;
+
+        // Unit struct: `struct Foo;`
+        if self.peek().kind == TokenKind::Semicolon {
+            self.advance();
+            return Ok(StructDecl {
+                name,
+                fields: Vec::new(),
+                is_pub,
+                is_tuple: false,
+                loc,
+            });
+        }
+
+        // Tuple struct: `struct Foo(T0, T1, ...);`
+        if self.peek().kind == TokenKind::LParen {
+            self.advance();
+            let mut fields = Vec::new();
+            while self.peek().kind != TokenKind::RParen && !self.at_eof() {
+                if !fields.is_empty() {
+                    self.expect(&TokenKind::Comma)?;
+                    if self.peek().kind == TokenKind::RParen {
+                        break;
+                    }
+                }
+                let field_pub = self.peek().kind == TokenKind::Pub;
+                if field_pub {
+                    self.advance();
+                }
+                let ty = self.parse_ty()?;
+                fields.push(FieldDecl {
+                    name: format!("_{}", fields.len()),
+                    ty,
+                    is_pub: field_pub,
+                });
+            }
+            self.expect(&TokenKind::RParen)?;
+            self.expect(&TokenKind::Semicolon)?;
+            return Ok(StructDecl {
+                name,
+                fields,
+                is_pub,
+                is_tuple: true,
+                loc,
+            });
+        }
+
         self.expect(&TokenKind::LBrace)?;
         let mut fields = Vec::new();
         while self.peek().kind != TokenKind::RBrace && !self.at_eof() {
@@ -700,6 +782,7 @@ impl Parser {
             name,
             fields,
             is_pub,
+            is_tuple: false,
             loc,
         })
     }
@@ -919,7 +1002,7 @@ impl Parser {
                 self.advance();
                 let tok2 = self.peek().clone();
                 match &tok2.kind {
-                    TokenKind::Ident(kw) if kw == "const" => {
+                    TokenKind::Const => {
                         self.advance();
                         Ok(Ty::RawConst(Box::new(self.parse_ty()?)))
                     }
@@ -1160,6 +1243,40 @@ impl Parser {
         } else {
             false
         };
+
+        // Check for pattern syntax: `let (a, b) = ...` or `let Point(x, y) = ...`
+        let is_tuple_pat = self.peek().kind == TokenKind::LParen;
+        let is_tuple_struct_pat = matches!(&self.peek().kind,
+            TokenKind::Ident(n) if n.chars().next().is_some_and(|c| c.is_uppercase()));
+
+        if (is_tuple_pat || is_tuple_struct_pat) && !mutable {
+            // Parse a full pattern
+            let pat = self.parse_single_pat()?;
+            let ty = if self.peek().kind == TokenKind::Colon {
+                self.advance();
+                Some(self.parse_ty()?)
+            } else {
+                None
+            };
+            self.expect(&TokenKind::Eq)?;
+            let expr = self.parse_expr()?;
+            // `let pat = expr else { ... };`
+            if self.peek().kind == TokenKind::Else {
+                self.advance();
+                let else_block = self.parse_block()?;
+                self.expect(&TokenKind::Semicolon)?;
+                return Ok(Stmt {
+                    kind: StmtKind::LetPat { pat, ty, expr, else_block: Some(else_block) },
+                    loc,
+                });
+            }
+            self.expect(&TokenKind::Semicolon)?;
+            return Ok(Stmt {
+                kind: StmtKind::LetPat { pat, ty, expr, else_block: None },
+                loc,
+            });
+        }
+
         let name = self.expect_ident()?;
         let ty = if self.peek().kind == TokenKind::Colon {
             self.advance();
@@ -1169,6 +1286,23 @@ impl Parser {
         };
         self.expect(&TokenKind::Eq)?;
         let expr = self.parse_expr()?;
+
+        // `let name = expr else { ... };` -- binding let-else (refutable pattern)
+        if self.peek().kind == TokenKind::Else {
+            self.advance();
+            let else_block = self.parse_block()?;
+            self.expect(&TokenKind::Semicolon)?;
+            return Ok(Stmt {
+                kind: StmtKind::LetPat {
+                    pat: Pat::Binding(name),
+                    ty,
+                    expr,
+                    else_block: Some(else_block),
+                },
+                loc,
+            });
+        }
+
         self.expect(&TokenKind::Semicolon)?;
         Ok(Stmt {
             kind: StmtKind::Let {
@@ -1294,12 +1428,18 @@ impl Parser {
     fn parse_if(&mut self) -> Result<Stmt, Error> {
         let loc = self.loc();
         self.expect(&TokenKind::If)?;
-        // `if let pat = expr { ... } [else { ... }]`
+        // `if let pat = expr [&& extra] { ... } [else { ... }]`
         if self.peek().kind == TokenKind::Let {
             self.advance();
             let pat = self.parse_pat()?;
             self.expect(&TokenKind::Eq)?;
-            let expr = self.parse_expr()?;
+            let expr = self.parse_if_let_expr()?;
+            let and_cond = if self.peek().kind == TokenKind::AmpAmp {
+                self.advance();
+                Some(self.parse_expr()?)
+            } else {
+                None
+            };
             let then_block = self.parse_block()?;
             let else_block = if self.peek().kind == TokenKind::Else {
                 self.advance();
@@ -1317,6 +1457,7 @@ impl Parser {
                     pat,
                     expr,
                     expr_ty: None,
+                    and_cond,
                     then_block,
                     else_block,
                 },
@@ -1514,8 +1655,10 @@ impl Parser {
                 self.advance();
                 Ok(Pat::Wildcard)
             }
-            TokenKind::Ident(name) if name.chars().next().is_some_and(|c| c.is_lowercase()) => {
-                // Binding pattern: `x` — binds the matched value to a variable.
+            TokenKind::Ident(name)
+                if name.chars().next().is_some_and(|c| c.is_lowercase() || c == '_') =>
+            {
+                // Binding pattern: `x` -- binds the matched value to a variable.
                 let name = name.clone();
                 self.advance();
                 Ok(Pat::Binding(name))
@@ -1523,6 +1666,64 @@ impl Parser {
             TokenKind::Ident(name) if name.chars().next().is_some_and(|c| c.is_uppercase()) => {
                 let type_name = name.clone();
                 self.advance();
+
+                // Tuple-struct pattern: `Point(x, y)` -- no `::` before `(`
+                if self.peek().kind == TokenKind::LParen {
+                    self.advance();
+                    let mut fields = Vec::new();
+                    while self.peek().kind != TokenKind::RParen && !self.at_eof() {
+                        if !fields.is_empty() {
+                            self.expect(&TokenKind::Comma)?;
+                            if self.peek().kind == TokenKind::RParen {
+                                break;
+                            }
+                        }
+                        fields.push(self.parse_single_pat()?);
+                    }
+                    self.expect(&TokenKind::RParen)?;
+                    return Ok(Pat::TupleStruct {
+                        type_name: self.resolve_name(type_name),
+                        fields,
+                    });
+                }
+
+                // Struct pattern: `Point { x, y, .. }` -- `{` directly after name
+                if self.peek().kind == TokenKind::LBrace {
+                    self.advance();
+                    let mut binds = Vec::new();
+                    let mut has_rest = false;
+                    while self.peek().kind != TokenKind::RBrace && !self.at_eof() {
+                        if !binds.is_empty() {
+                            self.expect(&TokenKind::Comma)?;
+                        }
+                        if self.peek().kind == TokenKind::RBrace {
+                            break;
+                        }
+                        if self.peek().kind == TokenKind::DotDot {
+                            self.advance();
+                            has_rest = true;
+                            break;
+                        }
+                        let field = self.expect_ident()?;
+                        let binding = if self.peek().kind == TokenKind::Colon {
+                            self.advance();
+                            self.expect_ident()?
+                        } else {
+                            field.clone()
+                        };
+                        binds.push((field, binding));
+                    }
+                    self.expect(&TokenKind::RBrace)?;
+                    // Emit as EnumVariant with the struct name as both type and "variant" (unit).
+                    // For plain struct patterns, use type_name as variant with named bindings.
+                    let resolved = self.resolve_name(type_name.clone());
+                    return Ok(Pat::EnumVariant {
+                        type_name: resolved.clone(),
+                        variant: resolved,
+                        bindings: PatBindings::Named(binds, has_rest),
+                    });
+                }
+
                 self.expect(&TokenKind::ColonColon)?;
                 let part2 = self.expect_ident()?;
 
@@ -1541,19 +1742,29 @@ impl Parser {
                     while self.peek().kind != TokenKind::RParen && !self.at_eof() {
                         if !binds.is_empty() {
                             self.expect(&TokenKind::Comma)?;
+                            if self.peek().kind == TokenKind::RParen {
+                                break;
+                            }
                         }
-                        binds.push(self.expect_ident()?);
+                        binds.push(self.parse_single_pat()?);
                     }
                     self.expect(&TokenKind::RParen)?;
                     PatBindings::Tuple(binds)
                 } else if self.peek().kind == TokenKind::LBrace {
                     self.advance();
                     let mut binds = Vec::new();
+                    let mut has_rest = false;
                     while self.peek().kind != TokenKind::RBrace && !self.at_eof() {
                         if !binds.is_empty() {
                             self.expect(&TokenKind::Comma)?;
                         }
                         if self.peek().kind == TokenKind::RBrace {
+                            break;
+                        }
+                        // `..` rest pattern inside named bindings
+                        if self.peek().kind == TokenKind::DotDot {
+                            self.advance();
+                            has_rest = true;
                             break;
                         }
                         let field = self.expect_ident()?;
@@ -1566,7 +1777,7 @@ impl Parser {
                         binds.push((field, binding));
                     }
                     self.expect(&TokenKind::RBrace)?;
-                    PatBindings::Named(binds)
+                    PatBindings::Named(binds, has_rest)
                 } else {
                     PatBindings::None
                 };
@@ -1575,6 +1786,22 @@ impl Parser {
                     variant,
                     bindings,
                 })
+            }
+            // Tuple pattern: `(a, b, ...)`
+            TokenKind::LParen => {
+                self.advance();
+                let mut pats = Vec::new();
+                while self.peek().kind != TokenKind::RParen && !self.at_eof() {
+                    if !pats.is_empty() {
+                        self.expect(&TokenKind::Comma)?;
+                        if self.peek().kind == TokenKind::RParen {
+                            break;
+                        }
+                    }
+                    pats.push(self.parse_single_pat()?);
+                }
+                self.expect(&TokenKind::RParen)?;
+                Ok(Pat::Tuple(pats))
             }
             TokenKind::True => {
                 self.advance();
@@ -1587,13 +1814,32 @@ impl Parser {
             TokenKind::IntLit(n) => {
                 let n = *n;
                 self.advance();
+                // Range pattern: `lo..=hi`
+                if self.peek().kind == TokenKind::DotDotEq {
+                    self.advance();
+                    if let TokenKind::IntLit(hi) = self.peek().kind.clone() {
+                        self.advance();
+                        return Ok(Pat::Range { lo: n, hi });
+                    }
+                    return Err(Error::new(tok.loc, "expected integer after `..=` in range pattern"));
+                }
                 Ok(Pat::Int(n))
             }
             TokenKind::Minus => {
                 self.advance();
                 if let TokenKind::IntLit(n) = self.peek().kind.clone() {
                     self.advance();
-                    Ok(Pat::Int(-n))
+                    let lo = -n;
+                    // Range pattern starting with negative: `-lo..=hi`
+                    if self.peek().kind == TokenKind::DotDotEq {
+                        self.advance();
+                        if let TokenKind::IntLit(hi) = self.peek().kind.clone() {
+                            self.advance();
+                            return Ok(Pat::Range { lo, hi });
+                        }
+                        return Err(Error::new(tok.loc, "expected integer after `..=` in range pattern"));
+                    }
+                    Ok(Pat::Int(lo))
                 } else {
                     Err(Error::new(tok.loc, "expected integer after `-` in pattern"))
                 }
@@ -1703,6 +1949,25 @@ impl Parser {
                     op: BinOp::Or,
                     lhs: Box::new(lhs),
                     rhs: Box::new(self.parse_and()?),
+                },
+                loc,
+            };
+        }
+        Ok(lhs)
+    }
+
+    /// Like `parse_or` but does NOT consume `&&` (stops before it).
+    /// Used for the scrutinee expression in `if let pat = expr && cond`.
+    fn parse_if_let_expr(&mut self) -> Result<Expr, Error> {
+        let mut lhs = self.parse_equality()?;
+        while self.peek().kind == TokenKind::PipePipe {
+            let loc = lhs.loc;
+            self.advance();
+            lhs = Expr {
+                kind: ExprKind::BinOp {
+                    op: BinOp::Or,
+                    lhs: Box::new(lhs),
+                    rhs: Box::new(self.parse_equality()?),
                 },
                 loc,
             };

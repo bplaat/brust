@@ -33,6 +33,8 @@ pub enum TokenKind {
     Use,
     Extern,
     Super,
+    Const,
+    Static,
     // Identifiers and literals
     Ident(String),
     IntLit(i64),
@@ -84,6 +86,7 @@ pub enum TokenKind {
     Comma,
     Dot,
     DotDot,
+    DotDotEq,
     DotDotDot,
     Colon,
     ColonColon,
@@ -236,7 +239,10 @@ impl Lexer {
                 self.advance();
                 if self.peek() == Some(b'.') {
                     self.advance();
-                    if self.peek() == Some(b'.') {
+                    if self.peek() == Some(b'=') {
+                        self.advance();
+                        TokenKind::DotDotEq
+                    } else if self.peek() == Some(b'.') {
                         self.advance();
                         TokenKind::DotDotDot
                     } else {
@@ -634,6 +640,8 @@ impl Lexer {
             "use" => TokenKind::Use,
             "extern" => TokenKind::Extern,
             "super" => TokenKind::Super,
+            "const" => TokenKind::Const,
+            "static" => TokenKind::Static,
             _ => TokenKind::Ident(name),
         }
     }

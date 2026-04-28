@@ -25,6 +25,21 @@ pub enum Item {
     },
     /// `extern "C" { fn name(params) -> RetTy; ... }` -- FFI function declarations.
     ExternBlock(Vec<ExternFnDecl>),
+    /// `const NAME: Ty = expr;`
+    Const {
+        name: String,
+        ty: Ty,
+        expr: Expr,
+        is_pub: bool,
+    },
+    /// `static [mut] NAME: Ty = expr;`
+    Static {
+        name: String,
+        ty: Ty,
+        expr: Expr,
+        mutable: bool,
+        is_pub: bool,
+    },
     /// Discarded item: `use ...;`, `extern crate ...;`, etc.
     Skip,
 }
@@ -34,6 +49,7 @@ pub struct StructDecl {
     pub name: String,
     pub fields: Vec<FieldDecl>,
     pub is_pub: bool,
+    pub is_tuple: bool,
     pub loc: Loc,
 }
 
@@ -247,6 +263,8 @@ pub enum StmtKind {
         pat: Pat,
         expr: Expr,
         expr_ty: Option<Ty>,
+        /// Optional extra condition after `&&`: `if let pat = e && extra_cond { ... }`
+        and_cond: Option<Expr>,
         then_block: Block,
         else_block: Option<Block>,
     },
@@ -280,6 +298,13 @@ pub enum StmtKind {
         arms: Vec<MatchArm>,
         scrutinee_ty: Option<Ty>,
     },
+    /// `let pat = expr;` or `let pat = expr else { diverge };`
+    LetPat {
+        pat: Pat,
+        ty: Option<Ty>,
+        expr: Expr,
+        else_block: Option<Block>,
+    },
     /// Expression used as a statement (calls, assignments via BinOp::Eq, unsafe blocks).
     Expr(Expr),
 }
@@ -296,10 +321,16 @@ pub enum Pat {
     Wildcard,
     Bool(bool),
     Int(i64),
-    /// Binding pattern: `x` — binds the matched value to a variable name.
+    /// `lo..=hi` inclusive range pattern.
+    Range { lo: i64, hi: i64 },
+    /// Binding pattern: `x` -- binds the matched value to a variable name.
     Binding(String),
-    /// `Pat1 | Pat2 | ...` — or-pattern (each alternative must be the same kind)
+    /// `Pat1 | Pat2 | ...` -- or-pattern (each alternative must be the same kind)
     Or(Vec<Pat>),
+    /// `(pat0, pat1, ...)` -- tuple destructure pattern
+    Tuple(Vec<Pat>),
+    /// `TypeName(pat0, pat1, ...)` -- tuple-struct pattern
+    TupleStruct { type_name: String, fields: Vec<Pat> },
     EnumVariant {
         type_name: String,
         variant: String,
@@ -309,9 +340,9 @@ pub enum Pat {
 
 /// Bindings introduced by a match pattern.
 pub enum PatBindings {
-    None,                         // unit variant: no bindings
-    Tuple(Vec<String>),           // Variant(a, b, _)
-    Named(Vec<(String, String)>), // Variant { field: binding } or shorthand { x }
+    None,                               // unit variant: no bindings
+    Tuple(Vec<Pat>),                    // Variant(a, b, _) -- each element is a sub-pattern
+    Named(Vec<(String, String)>, bool), // Variant { field: binding }, bool = has `..` rest
 }
 
 /// An expression node with its source location.

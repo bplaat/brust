@@ -69,6 +69,10 @@ pub struct TyEnv {
     pub extern_fns: HashSet<String>,
     /// Names of variadic extern functions -- allowed to have more args than declared params.
     pub variadic_fns: HashSet<String>,
+    /// Global const/static names -> their type.
+    pub consts: HashMap<String, Ty>,
+    /// Names of tuple structs (for constructor and pattern handling).
+    pub tuple_structs: HashSet<String>,
 }
 
 impl TyEnv {
@@ -85,6 +89,8 @@ impl TyEnv {
             pub_fields: HashMap::new(),
             extern_fns: HashSet::new(),
             variadic_fns: HashSet::new(),
+            consts: HashMap::new(),
+            tuple_structs: HashSet::new(),
         };
         env.collect_items(&file.items, "");
         env
@@ -114,6 +120,12 @@ impl TyEnv {
                         .map(|f| f.name.clone())
                         .collect();
                     self.pub_fields.insert(full.clone(), pub_set);
+                    // Register tuple struct constructors as functions.
+                    if s.is_tuple {
+                        self.tuple_structs.insert(full.clone());
+                        let params: Vec<Ty> = s.fields.iter().map(|f| f.ty.clone()).collect();
+                        self.fns.insert(full.clone(), (params, Ty::Named(full.clone())));
+                    }
                     self.structs.insert(full, s.clone());
                 }
                 Item::Enum(e) => {
@@ -230,6 +242,26 @@ impl TyEnv {
                             self.variadic_fns.insert(f.name.clone());
                         }
                     }
+                }
+                Item::Const { name, ty, is_pub, .. } => {
+                    let full = format!("{prefix}{name}");
+                    if in_mod {
+                        self.item_module.insert(full.clone(), prefix.to_string());
+                        if *is_pub {
+                            self.pub_items.insert(full.clone());
+                        }
+                    }
+                    self.consts.insert(full, ty.clone());
+                }
+                Item::Static { name, ty, is_pub, .. } => {
+                    let full = format!("{prefix}{name}");
+                    if in_mod {
+                        self.item_module.insert(full.clone(), prefix.to_string());
+                        if *is_pub {
+                            self.pub_items.insert(full.clone());
+                        }
+                    }
+                    self.consts.insert(full, ty.clone());
                 }
                 Item::Skip => {}
             }
@@ -497,6 +529,9 @@ impl TypeChecker {
                     }
                 }
                 Item::Skip => {}
+                Item::Const { ty, .. } | Item::Static { ty, .. } => {
+                    self.validate_ty(ty);
+                }
             }
         }
         self.cur_mod = saved_cur_mod;
@@ -816,6 +851,7 @@ impl TypeChecker {
                 pat,
                 expr,
                 expr_ty,
+                and_cond,
                 then_block,
                 else_block,
             } => {
@@ -823,6 +859,15 @@ impl TypeChecker {
                 *expr_ty = Some(inferred_expr_ty.clone());
                 scope.push();
                 self.bind_pat_vars(pat, &inferred_expr_ty, scope);
+                if let Some(cond) = and_cond {
+                    let ct = self.infer_expr(cond, scope);
+                    if !self.compat(&ct, &Ty::Bool) {
+                        self.err(format!(
+                            "if-let chain condition must be `bool`, found `{}`",
+                            ty_display(&ct)
+                        ));
+                    }
+                }
                 self.check_block_stmts(&mut then_block.stmts, scope, return_ty);
                 scope.pop();
                 if let Some(eb) = else_block {
@@ -862,6 +907,24 @@ impl TypeChecker {
                 } else {
                     self.infer_expr(expr, scope);
                 }
+            }
+
+            StmtKind::LetPat { pat, ty, expr, else_block } => {
+                let inferred = self.infer_expr(expr, scope);
+                let final_ty = if let Some(ann) = ty.as_ref() {
+                    self.validate_ty(ann);
+                    ann.clone()
+                } else {
+                    inferred.clone()
+                };
+                if ty.is_none() {
+                    *ty = Some(final_ty.clone());
+                }
+                // If there's an else block, check it (must diverge).
+                if let Some(else_block) = else_block {
+                    self.check_block(else_block, scope, return_ty);
+                }
+                self.bind_pat_vars(pat, &inferred, scope);
             }
         }
     }
@@ -913,6 +976,36 @@ impl TypeChecker {
                 }
             }
 
+            Pat::Range { .. } => {
+                if !is_integer(scrutinee_ty) {
+                    self.err(format!("range pattern on non-integer `{}`", ty_display(scrutinee_ty)));
+                }
+            }
+
+            Pat::Tuple(pats) => {
+                if let Ty::Tuple(tys) = scrutinee_ty {
+                    for (p, ty) in pats.iter().zip(tys.iter()) {
+                        self.bind_pat_vars(p, ty, scope);
+                    }
+                }
+                // Accept even without a known tuple type (let destructuring with inference).
+            }
+
+            Pat::TupleStruct { type_name, fields } => {
+                if let Some(sdecl) = self.env.structs.get(type_name).cloned() {
+                    for (i, pat) in fields.iter().enumerate() {
+                        let field_ty = sdecl
+                            .fields
+                            .get(i)
+                            .map(|f| f.ty.clone())
+                            .unwrap_or(Ty::Unit);
+                        self.bind_pat_vars(pat, &field_ty, scope);
+                    }
+                } else {
+                    self.err(format!("unknown struct `{type_name}` in pattern"));
+                }
+            }
+
             Pat::Or(alternatives) => {
                 for alt in alternatives {
                     self.bind_pat_vars(alt, scrutinee_ty, scope);
@@ -936,22 +1029,20 @@ impl TypeChecker {
                     if let Some(ev) = edecl.variants.iter().find(|v| v.name == *variant) {
                         match (bindings, &ev.fields) {
                             (PatBindings::None, _) => {} // unit or ignored
-                            (PatBindings::Tuple(names), VariantFields::Tuple(tys)) => {
-                                if names.len() > tys.len() {
+                            (PatBindings::Tuple(pats), VariantFields::Tuple(tys)) => {
+                                if pats.len() > tys.len() {
                                     self.err(format!(
                                         "too many bindings for `{type_name}::{variant}`: \
                                          expected {}, found {}",
                                         tys.len(),
-                                        names.len()
+                                        pats.len()
                                     ));
                                 }
-                                for (name, ty) in names.iter().zip(tys.iter()) {
-                                    if name != "_" {
-                                        scope.insert(name.clone(), ty.clone(), false);
-                                    }
+                                for (sub_pat, ty) in pats.iter().zip(tys.iter()) {
+                                    self.bind_pat_vars(sub_pat, ty, scope);
                                 }
                             }
-                            (PatBindings::Named(fields), VariantFields::Named(decl_fields)) => {
+                            (PatBindings::Named(fields, _has_rest), VariantFields::Named(decl_fields)) => {
                                 for (field_name, binding) in fields {
                                     if let Some(df) =
                                         decl_fields.iter().find(|f| f.name == *field_name)
@@ -973,8 +1064,21 @@ impl TypeChecker {
                     } else {
                         self.err(format!("no variant `{variant}` in enum `{type_name}`"));
                     }
+                } else if type_name == variant
+                    && let Some(sdecl) = self.env.structs.get(type_name).cloned()
+                {
+                    // Struct pattern: `Point { x, y, .. }` -- type_name and variant are the same.
+                    if let PatBindings::Named(fields, _has_rest) = bindings {
+                        for (field_name, binding) in fields {
+                            if let Some(f) = sdecl.fields.iter().find(|f| f.name == *field_name) {
+                                scope.insert(binding.clone(), f.ty.clone(), false);
+                            } else {
+                                self.err(format!("no field `{field_name}` in struct `{type_name}`"));
+                            }
+                        }
+                    }
                 }
-                // If the enum isn't found, it may be a plain (non-data) enum — skip.
+                // If the enum/struct isn't found, skip -- error already reported by validate_items.
             }
         }
     }
@@ -1094,14 +1198,16 @@ impl TypeChecker {
             if let Some(edecl) = self.env.enums.get(type_name).cloned() {
                 if let Some(ev) = edecl.variants.iter().find(|v| v.name == *variant) {
                     match (bindings, &ev.fields) {
-                        (PatBindings::Tuple(names), VariantFields::Tuple(tys)) => {
-                            for (name, ty) in names.iter().zip(tys.iter()) {
-                                if name != "_" {
-                                    arm_scope.insert(name.clone(), ty.clone(), false);
+                        (PatBindings::Tuple(pats), VariantFields::Tuple(tys)) => {
+                            for (sub_pat, ty) in pats.iter().zip(tys.iter()) {
+                                if let Pat::Binding(name) = sub_pat {
+                                    if name != "_" {
+                                        arm_scope.insert(name.clone(), ty.clone(), false);
+                                    }
                                 }
                             }
                         }
-                        (PatBindings::Named(fields), VariantFields::Named(decl_fields)) => {
+                        (PatBindings::Named(fields, _), VariantFields::Named(decl_fields)) => {
                             for (field_name, binding) in fields {
                                 if let Some(df) = decl_fields.iter().find(|f| f.name == *field_name)
                                 {
@@ -1154,6 +1260,16 @@ impl TypeChecker {
                                 params: param_tys.clone(),
                                 ret: Box::new(ret_ty.clone()),
                             };
+                        }
+                        // Allow referencing global const/static.
+                        if let Some(ty) = self.env.consts.get(name) {
+                            return ty.clone();
+                        }
+                        // Unit struct used as a value: `Marker` or `Marker {}`
+                        if let Some(s) = self.env.structs.get(name) {
+                            if s.fields.is_empty() && !s.is_tuple {
+                                return Ty::Named(name.clone());
+                            }
                         }
                         self.err(format!("undefined variable `{name}`"));
                         Ty::Unit
@@ -1353,15 +1469,34 @@ impl TypeChecker {
             ExprKind::Field { expr, field } => {
                 let ty = self.infer_expr(expr, scope);
                 if field.chars().all(|c| c.is_ascii_digit()) {
-                    // Tuple field access: expr.0, expr.1 …
+                    // Tuple field access: expr.0, expr.1 ...
                     let idx: usize = field.parse().unwrap_or(usize::MAX);
-                    match ty {
-                        Ty::Tuple(tys) => tys.into_iter().nth(idx).unwrap_or_else(|| {
+                    match &ty {
+                        Ty::Tuple(tys) => tys.iter().nth(idx).cloned().unwrap_or_else(|| {
                             self.err(format!("tuple index {idx} out of range"));
                             Ty::Unit
                         }),
+                        Ty::Named(n) if self.env.tuple_structs.contains(n) => {
+                            // Tuple struct field access: Point.0 -> type of field _0
+                            if let Some(s) = self.env.structs.get(n) {
+                                let internal_name = format!("_{idx}");
+                                s.fields
+                                    .iter()
+                                    .find(|f| f.name == internal_name)
+                                    .map(|f| f.ty.clone())
+                                    .unwrap_or_else(|| {
+                                        self.err(format!("tuple index {idx} out of range"));
+                                        Ty::Unit
+                                    })
+                            } else {
+                                Ty::Unit
+                            }
+                        }
                         _ => {
-                            self.err(format!("tuple index on non-tuple `{}`", ty_display(&ty)));
+                            self.err(format!(
+                                "tuple index on non-tuple `{}`",
+                                ty_display(&ty)
+                            ));
                             Ty::Unit
                         }
                     }
@@ -2174,19 +2309,21 @@ impl BorrowChecker {
                 // Add pattern bindings with placeholder types.
                 if let Pat::EnumVariant { bindings, .. } = pat {
                     match bindings {
-                        PatBindings::Tuple(names) => {
-                            for n in names {
-                                then_scope.insert(
-                                    n.clone(),
-                                    BVar {
-                                        ty: Ty::Unit,
-                                        mutable: false,
-                                        moved: false,
-                                    },
-                                );
+                        PatBindings::Tuple(pats) => {
+                            for sub_pat in pats {
+                                if let Pat::Binding(n) = sub_pat {
+                                    then_scope.insert(
+                                        n.clone(),
+                                        BVar {
+                                            ty: Ty::Unit,
+                                            mutable: false,
+                                            moved: false,
+                                        },
+                                    );
+                                }
                             }
                         }
-                        PatBindings::Named(fields) => {
+                        PatBindings::Named(fields, _) => {
                             for (_, binding) in fields {
                                 then_scope.insert(
                                     binding.clone(),
@@ -2217,19 +2354,21 @@ impl BorrowChecker {
                 let mut body_scope = scope.clone();
                 if let Pat::EnumVariant { bindings, .. } = pat {
                     match bindings {
-                        PatBindings::Tuple(names) => {
-                            for n in names {
-                                body_scope.insert(
-                                    n.clone(),
-                                    BVar {
-                                        ty: Ty::Unit,
-                                        mutable: false,
-                                        moved: false,
-                                    },
-                                );
+                        PatBindings::Tuple(pats) => {
+                            for sub_pat in pats {
+                                if let Pat::Binding(n) = sub_pat {
+                                    body_scope.insert(
+                                        n.clone(),
+                                        BVar {
+                                            ty: Ty::Unit,
+                                            mutable: false,
+                                            moved: false,
+                                        },
+                                    );
+                                }
                             }
                         }
-                        PatBindings::Named(fields) => {
+                        PatBindings::Named(fields, _) => {
                             for (_, binding) in fields {
                                 body_scope.insert(
                                     binding.clone(),
@@ -2250,22 +2389,24 @@ impl BorrowChecker {
             StmtKind::Match { expr: _, arms, .. } => {
                 for arm in arms {
                     let mut arm_scope = scope.clone();
-                    // Add pattern bindings (type unknown here — use Unit).
+                    // Add pattern bindings (type unknown here -- use Unit).
                     if let Pat::EnumVariant { bindings, .. } = &arm.pat {
                         match bindings {
-                            PatBindings::Tuple(names) => {
-                                for n in names {
-                                    arm_scope.insert(
-                                        n.clone(),
-                                        BVar {
-                                            ty: Ty::Unit,
-                                            mutable: false,
-                                            moved: false,
-                                        },
-                                    );
+                            PatBindings::Tuple(pats) => {
+                                for sub_pat in pats {
+                                    if let Pat::Binding(n) = sub_pat {
+                                        arm_scope.insert(
+                                            n.clone(),
+                                            BVar {
+                                                ty: Ty::Unit,
+                                                mutable: false,
+                                                moved: false,
+                                            },
+                                        );
+                                    }
                                 }
                             }
-                            PatBindings::Named(fields) => {
+                            PatBindings::Named(fields, _) => {
                                 for (_, binding) in fields {
                                     arm_scope.insert(
                                         binding.clone(),
@@ -2301,6 +2442,13 @@ impl BorrowChecker {
                     self.check_lvalue_mut(lhs, scope);
                 } else {
                     self.check_expr(expr, scope, false);
+                }
+            }
+
+            StmtKind::LetPat { expr, else_block, .. } => {
+                self.check_expr(expr, scope, false);
+                if let Some(else_block) = else_block {
+                    self.check_block(else_block, scope);
                 }
             }
         }
