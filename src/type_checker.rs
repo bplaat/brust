@@ -763,14 +763,15 @@ impl TypeChecker {
                 self.check_block(body, scope, return_ty);
             }
 
-            StmtKind::For { var, iter, body } => {
+            StmtKind::For { var, iter, body, elem_ty } => {
                 let iter_ty = self.infer_expr(iter, scope);
-                let elem_ty = match &iter_ty {
+                let inferred_elem_ty = match &iter_ty {
                     Ty::Array(elem, _) => *elem.clone(),
                     _ => Ty::I64,
                 };
+                *elem_ty = Some(inferred_elem_ty.clone());
                 scope.push();
-                scope.insert(var.clone(), elem_ty, false);
+                scope.insert(var.clone(), inferred_elem_ty, false);
                 self.check_block_stmts(&mut body.stmts, scope, return_ty);
                 scope.pop();
             }
@@ -783,8 +784,9 @@ impl TypeChecker {
 
             StmtKind::Continue => {}
 
-            StmtKind::Match { expr, arms } => {
+            StmtKind::Match { expr, arms, scrutinee_ty } => {
                 let scrutinee = self.infer_expr(expr, scope);
+                *scrutinee_ty = Some(scrutinee.clone());
                 for arm in arms.iter_mut() {
                     self.check_arm(arm, &scrutinee, scope, return_ty);
                 }
@@ -812,12 +814,14 @@ impl TypeChecker {
             StmtKind::IfLet {
                 pat,
                 expr,
+                expr_ty,
                 then_block,
                 else_block,
             } => {
-                let expr_ty = self.infer_expr(expr, scope);
+                let inferred_expr_ty = self.infer_expr(expr, scope);
+                *expr_ty = Some(inferred_expr_ty.clone());
                 scope.push();
-                self.bind_pat_vars(pat, &expr_ty, scope);
+                self.bind_pat_vars(pat, &inferred_expr_ty, scope);
                 self.check_block_stmts(&mut then_block.stmts, scope, return_ty);
                 scope.pop();
                 if let Some(eb) = else_block {
@@ -1001,11 +1005,12 @@ impl TypeChecker {
                     }
                     then_ty
                 }
-                StmtKind::Match { expr, arms } => {
-                    let scrutinee_ty = self.infer_expr(expr, &block_scope);
+                StmtKind::Match { expr, arms, scrutinee_ty } => {
+                    let sc_ty = self.infer_expr(expr, &block_scope);
+                    *scrutinee_ty = Some(sc_ty.clone());
                     let mut result_ty: Option<Ty> = None;
                     for arm in arms.iter_mut() {
-                        let arm_ty = self.infer_arm_value_ty(arm, &scrutinee_ty, &block_scope);
+                        let arm_ty = self.infer_arm_value_ty(arm, &sc_ty, &block_scope);
                         if let Some(ref rt) = result_ty {
                             if !ty_compat(&arm_ty, rt) && !ty_compat(rt, &arm_ty) {
                                 self.err(format!(
@@ -1599,11 +1604,12 @@ impl TypeChecker {
                 then_ty
             }
 
-            ExprKind::Match { expr, arms } => {
-                let scrutinee_ty = self.infer_expr(expr, scope);
+            ExprKind::Match { expr, arms, scrutinee_ty } => {
+                let sc_ty = self.infer_expr(expr, scope);
+                *scrutinee_ty = Some(sc_ty.clone());
                 let mut result_ty: Option<Ty> = None;
                 for arm in arms.iter_mut() {
-                    let arm_ty = self.infer_arm_value_ty(arm, &scrutinee_ty, scope);
+                    let arm_ty = self.infer_arm_value_ty(arm, &sc_ty, scope);
                     if let Some(ref rt) = result_ty {
                         if !ty_compat(&arm_ty, rt) && !ty_compat(rt, &arm_ty) {
                             self.err(format!(
@@ -1619,7 +1625,7 @@ impl TypeChecker {
                 result_ty.unwrap_or(Ty::Unit)
             }
 
-            ExprKind::Loop(body) => {
+            ExprKind::Loop { body, result_ty } => {
                 // Infer loop type from `break val` — scan body for first `break val`.
                 fn find_break_expr<'a>(stmts: &'a mut [Stmt]) -> Option<&'a mut Expr> {
                     for s in stmts {
@@ -1647,9 +1653,11 @@ impl TypeChecker {
                 // Check the body in a temporary scope so bindings don't leak.
                 let mut inner_scope = scope.clone();
                 self.check_block(body, &mut inner_scope, &Ty::Unit);
-                find_break_expr(&mut body.stmts)
+                let ty = find_break_expr(&mut body.stmts)
                     .map(|v| self.infer_expr(v, scope))
-                    .unwrap_or(Ty::Unit)
+                    .unwrap_or(Ty::Unit);
+                *result_ty = Some(ty.clone());
+                ty
             }
         }
     }
@@ -2114,8 +2122,7 @@ impl BorrowChecker {
                 self.check_block(body, scope);
             }
 
-            StmtKind::For { var, iter, body } => {
-                self.check_expr(iter, scope, false);
+            StmtKind::For { var, iter, body, .. } => {
                 scope.insert(
                     var.clone(),
                     BVar {
@@ -2145,6 +2152,7 @@ impl BorrowChecker {
                 expr,
                 then_block,
                 else_block,
+                ..
             } => {
                 self.check_expr(expr, scope, false);
                 let mut then_scope = scope.clone();
@@ -2184,8 +2192,7 @@ impl BorrowChecker {
                 }
             }
 
-            StmtKind::Match { expr, arms } => {
-                self.check_expr(expr, scope, true);
+            StmtKind::Match { expr, arms, .. } => {
                 for arm in arms {
                     let mut arm_scope = scope.clone();
                     // Add pattern bindings (type unknown here — use Unit).
@@ -2394,13 +2401,12 @@ impl BorrowChecker {
                     self.check_stmts(&b.stmts, scope);
                 }
             }
-            ExprKind::Match { expr, arms } => {
-                self.check_expr(expr, scope, false);
+            ExprKind::Match { expr, arms, .. } => {
                 for arm in arms {
                     self.check_stmts(&arm.body.stmts, scope);
                 }
             }
-            ExprKind::Loop(body) => {
+            ExprKind::Loop { body, .. } => {
                 self.check_stmts(&body.stmts, scope);
             }
             _ => {} // literals have no sub-expressions

@@ -246,6 +246,7 @@ pub enum StmtKind {
     IfLet {
         pat: Pat,
         expr: Expr,
+        expr_ty: Option<Ty>,
         then_block: Block,
         else_block: Option<Block>,
     },
@@ -258,13 +259,18 @@ pub enum StmtKind {
         var: String,
         iter: Expr,
         body: Block,
+        elem_ty: Option<Ty>,
     },
     /// `break [expr]` — exit the nearest enclosing loop, optionally with a value
     Break(Option<Expr>),
     /// `continue` — skip to the next iteration of the nearest enclosing loop
     Continue,
     /// `match expr { pat => { ... }, ... }`
-    Match { expr: Expr, arms: Vec<MatchArm> },
+    Match {
+        expr: Expr,
+        arms: Vec<MatchArm>,
+        scrutinee_ty: Option<Ty>,
+    },
     /// Expression used as a statement (calls, assignments via BinOp::Eq, unsafe blocks).
     Expr(Expr),
 }
@@ -395,9 +401,13 @@ pub enum ExprKind {
     Match {
         expr: Box<Expr>,
         arms: Vec<MatchArm>,
+        scrutinee_ty: Option<Ty>,
     },
     /// `loop { stmts }` used in expression position (value via `break val`)
-    Loop(Block),
+    Loop {
+        body: Block,
+        result_ty: Option<Ty>,
+    },
 }
 
 #[derive(Clone, Copy)]
